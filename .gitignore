@@ -2,7 +2,12 @@ app/node_modules/
 app/dist/
 app/.vite/
 app/.cache/
+.vercel/
 *.log
 *.tmp
 .DS_Store
 Thumbs.db
+__pycache__/
+*.pyc
+.venv/
+data_store/
