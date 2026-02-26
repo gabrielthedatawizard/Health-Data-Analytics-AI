@@ -1,0 +1,13 @@
+.git/
+.github/
+app/node_modules/
+app/.vite/
+app/.cache/
+app/dist/
+frames/
+reference.mp4
+ref1.jpg
+ref2.png
+AI-ANALYTICS-ARCHITECTURE.md
+HealthAI-Product-Architecture.md
+REQUIREMENTS-DOCUMENTATION.md
