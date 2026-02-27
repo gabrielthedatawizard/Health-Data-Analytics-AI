@@ -31,6 +31,10 @@ def test_facts_async_enqueue(monkeypatch):
     assert resp.status_code in (200, 202)
     payload = resp.json()
     assert "job_id" in payload or "facts_bundle" in payload
+    if "job_id" in payload:
+        status = client.get(f"/jobs/{payload['job_id']}")
+        assert status.status_code == 200
+        assert status.json()["status"] in {"queued", "running", "succeeded", "failed", "completed"}
 
 
 def test_jobs_endpoint():

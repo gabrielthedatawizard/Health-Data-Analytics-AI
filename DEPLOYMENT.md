@@ -34,3 +34,40 @@ npm i -g vercel
 vercel
 vercel --prod
 ```
+
+## Local Docker Compose (API + Worker + Redis + Streamlit)
+
+This stack runs the Python MVP end-to-end with one command.
+
+### 1) Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Set your LLM credentials in `.env`:
+- Azure primary: `AI_PROVIDER=azure` plus `AZURE_OPENAI_*`
+- OpenAI fallback: `OPENAI_API_KEY` (and optional `OPENAI_MODEL`)
+
+### 2) Start all services
+
+```bash
+docker compose up --build
+```
+
+Services:
+- FastAPI: `http://localhost:8000`
+- Streamlit: `http://localhost:8501`
+- Redis: `localhost:6379`
+
+### 3) Stop services
+
+```bash
+docker compose down
+```
+
+### Notes
+
+- Persisted artifacts are mounted in `./data_store`.
+- Streamlit sends `X-API-Key` using `APP_API_KEY` for audit attribution.
+- Celery worker concurrency is set to `2` for both facts/report jobs.

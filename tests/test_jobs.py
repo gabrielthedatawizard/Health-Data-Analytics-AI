@@ -12,8 +12,8 @@ def test_job_lifecycle(tmp_path: Path) -> None:
     assert fetched is not None
     assert fetched["job_id"] == job["job_id"]
 
-    updated = update_job(job["job_id"], status="completed", result={"report": "ok"}, path=jobs_path)
-    assert updated["status"] == "completed"
+    updated = update_job(job["job_id"], status="succeeded", result={"report": "ok"}, path=jobs_path)
+    assert updated["status"] == "succeeded"
     assert updated["result"]["report"] == "ok"
 
     jobs = list_jobs(path=jobs_path)

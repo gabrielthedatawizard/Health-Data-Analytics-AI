@@ -117,7 +117,11 @@ def _set_query_param(key: str, value: str) -> None:
 
 def _api_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
     url = f"{API_BASE_URL}{path}"
-    response = requests.request(method=method, url=url, timeout=REQUEST_TIMEOUT, **kwargs)
+    headers = dict(kwargs.pop("headers", {}) or {})
+    api_key = st.session_state.get("api_key_value") or os.getenv("APP_API_KEY", "")
+    if api_key:
+        headers["X-API-Key"] = str(api_key)
+    response = requests.request(method=method, url=url, timeout=REQUEST_TIMEOUT, headers=headers, **kwargs)
     if response.status_code >= 400:
         detail = response.text
         try:
@@ -154,6 +158,16 @@ def _ensure_dataset_session() -> str:
 
 def _load_session_meta(dataset_id: str) -> dict[str, Any]:
     return _api_request("GET", f"/sessions/{dataset_id}")
+
+
+def _next_backoff_delay(key: str, start: int = 2, max_delay: int = 16) -> int:
+    current = int(st.session_state.get(key, start))
+    st.session_state[key] = min(current * 2, max_delay)
+    return current
+
+
+def _reset_backoff_delay(key: str, start: int = 2) -> None:
+    st.session_state[key] = start
 
 
 def _render_kpis(kpis: list[dict[str, Any]]) -> None:
@@ -273,14 +287,51 @@ st.markdown('<div class="app-title">AI Analytics -> Auto Dashboard</div>', unsaf
 st.markdown('<div class="app-subtitle">Healthcare-ready MVP with facts-first AI</div>', unsafe_allow_html=True)
 st.caption(f"Backend API: `{API_BASE_URL}`")
 
+dataset_id = _ensure_dataset_session()
+
+with st.sidebar:
+    st.subheader("Session")
+    api_key_default = st.session_state.get("api_key_value") or os.getenv("APP_API_KEY", "")
+    st.session_state.api_key_value = st.text_input("API key / user id", value=api_key_default, type="password")
+    st.code(dataset_id)
+    existing_id = st.text_input("Load existing dataset_id", key="existing_dataset_id")
+    if st.button("Load session"):
+        if existing_id.strip():
+            try:
+                _api_request("GET", f"/sessions/{existing_id.strip()}")
+                st.session_state.dataset_id = existing_id.strip()
+                _set_query_param("dataset_id", st.session_state.dataset_id)
+                _reset_backoff_delay("facts_poll_delay")
+                _reset_backoff_delay("report_poll_delay")
+                st.success("Session loaded.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        else:
+            st.error("Enter a dataset_id.")
+
+    if st.button("Create new session"):
+        created = _api_request("POST", "/sessions", json={"created_by": "streamlit_user"})
+        st.session_state.dataset_id = created["dataset_id"]
+        _set_query_param("dataset_id", st.session_state.dataset_id)
+        _reset_backoff_delay("facts_poll_delay")
+        _reset_backoff_delay("report_poll_delay")
+        st.success("New session created.")
+        st.rerun()
+
+session_meta: dict[str, Any] | None = None
+try:
+    session_meta = _load_session_meta(dataset_id)
+except Exception as exc:
+    st.error(f"Failed to load session metadata: {exc}")
+
 status_steps = [
-    ("Session", True),
-    ("Upload", bool(session_meta and session_meta.get("file"))),
+    ("Uploaded", bool(session_meta and session_meta.get("file"))),
     ("Profiled", "profile_data" in st.session_state),
     ("Facts Running", "facts_job_id" in st.session_state and "facts_bundle" not in st.session_state),
     ("Facts Ready", "facts_bundle" in st.session_state),
+    ("Dashboard Ready", "dashboard_spec" in st.session_state),
     ("Report Ready", "report_html" in st.session_state),
-    ("Audit", True),
 ]
 
 active_index = 0
@@ -332,43 +383,12 @@ if session_meta and session_meta.get("file"):
                 try:
                     job = _api_request("POST", f"/sessions/{dataset_id}/facts", params={"mode": "full"})
                     st.session_state.facts_job_id = job.get("job_id")
+                    _reset_backoff_delay("facts_poll_delay")
                     st.success(f"Full compute job queued: {st.session_state.facts_job_id}")
                 except Exception as exc:
                     st.error(f"Failed to queue full compute: {exc}")
     except Exception:
         pass
-
-dataset_id = _ensure_dataset_session()
-
-with st.sidebar:
-    st.subheader("Session")
-    st.code(dataset_id)
-    existing_id = st.text_input("Load existing dataset_id", key="existing_dataset_id")
-    if st.button("Load session"):
-        if existing_id.strip():
-            try:
-                _api_request("GET", f"/sessions/{existing_id.strip()}")
-                st.session_state.dataset_id = existing_id.strip()
-                _set_query_param("dataset_id", st.session_state.dataset_id)
-                st.success("Session loaded.")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-        else:
-            st.error("Enter a dataset_id.")
-
-    if st.button("Create new session"):
-        created = _api_request("POST", "/sessions", json={"created_by": "streamlit_user"})
-        st.session_state.dataset_id = created["dataset_id"]
-        _set_query_param("dataset_id", st.session_state.dataset_id)
-        st.success("New session created.")
-        st.rerun()
-
-session_meta: dict[str, Any] | None = None
-try:
-    session_meta = _load_session_meta(dataset_id)
-except Exception as exc:
-    st.error(f"Failed to load session metadata: {exc}")
 
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
 st.markdown('<div class="section-header">1) Upload dataset (CSV or XLSX)</div>', unsafe_allow_html=True)
@@ -418,6 +438,10 @@ if st.button("Upload file", disabled=uploaded_file is None):
             st.session_state.pop("dashboard_spec", None)
             st.session_state.pop("preview_rows", None)
             st.session_state.pop("report_html", None)
+            st.session_state.pop("facts_job_id", None)
+            st.session_state.pop("report_job_id", None)
+            _reset_backoff_delay("facts_poll_delay")
+            _reset_backoff_delay("report_poll_delay")
         except Exception as exc:
             st.error(f"Upload failed: {exc}")
 st.markdown("</div>", unsafe_allow_html=True)
@@ -485,6 +509,7 @@ if st.button("Generate facts bundle"):
             facts_response = _api_request("GET", f"/sessions/{dataset_id}/facts")
             if facts_response.get("queued"):
                 st.session_state.facts_job_id = facts_response.get("job_id")
+                _reset_backoff_delay("facts_poll_delay")
                 st.warning("Facts job queued. Check status below.")
             else:
                 st.session_state.facts_bundle = facts_response["facts_bundle"]
@@ -496,20 +521,23 @@ facts_bundle = st.session_state.get("facts_bundle")
 facts_job_id = st.session_state.get("facts_job_id")
 if facts_job_id:
     st.caption(f"Facts job: {facts_job_id}")
-    facts_auto_refresh = st.toggle("Auto-refresh facts job (every 5s)", value=False, key="auto_refresh_facts")
+    facts_auto_refresh = st.toggle("Auto-refresh facts job (2s to 16s backoff)", value=False, key="auto_refresh_facts")
     if st.button("Check facts job status") or facts_auto_refresh:
         try:
             status = _api_request("GET", f"/jobs/{facts_job_id}")
             st.write(status)
             if status.get("progress") is not None:
                 st.progress(float(status.get("progress", 0.0)))
-            if status.get("status") == "completed":
+            job_status = str(status.get("status", "")).lower()
+            if job_status in {"succeeded", "completed"}:
                 facts_response = _api_request("GET", f"/sessions/{dataset_id}/facts")
                 st.session_state.facts_bundle = facts_response.get("facts_bundle")
                 st.session_state.pop("facts_job_id", None)
+                _reset_backoff_delay("facts_poll_delay")
                 st.success("Facts ready.")
-            elif facts_auto_refresh and status.get("status") not in {"completed", "failed"}:
-                time.sleep(5)
+            elif facts_auto_refresh and job_status not in {"succeeded", "completed", "failed"}:
+                delay = _next_backoff_delay("facts_poll_delay")
+                time.sleep(delay)
                 st.rerun()
         except Exception as exc:
             st.error(f"Facts job check failed: {exc}")
@@ -554,7 +582,12 @@ st.markdown('<div class="section-header">5) Auto dashboard generation</div>', un
 if st.button("Generate dashboard spec"):
     with st.spinner("Generating dashboard spec..."):
         try:
-            spec_response = _api_request("GET", f"/sessions/{dataset_id}/dashboard-spec")
+            spec_response = _api_request(
+                "POST",
+                f"/sessions/{dataset_id}/dashboard-spec",
+                params={"use_llm": "true"},
+                json={"template": "health_core"},
+            )
             st.session_state.dashboard_spec = spec_response["dashboard_spec"]
             st.success("Dashboard spec generated.")
         except Exception as exc:
@@ -594,12 +627,13 @@ if st.button("Queue report generation"):
         try:
             queued = _api_request("POST", f"/sessions/{dataset_id}/report", json={})
             st.session_state.report_job_id = queued.get("job_id")
+            _reset_backoff_delay("report_poll_delay")
             st.success(f"Report job queued: {st.session_state.report_job_id}")
         except Exception as exc:
             st.error(f"Report queue failed: {exc}")
 
 job_id = st.session_state.get("report_job_id")
-auto_refresh = st.toggle("Auto-refresh job status (every 5s)", value=False, key="auto_refresh_job")
+auto_refresh = st.toggle("Auto-refresh report job (2s to 16s backoff)", value=False, key="auto_refresh_job")
 check_clicked = st.button("Check report job status")
 if job_id and (check_clicked or auto_refresh):
     with st.spinner("Checking job status..."):
@@ -609,14 +643,23 @@ if job_id and (check_clicked or auto_refresh):
             st.caption(f"Job status: {status.get('status')} | Updated: {status.get('updated_at')}")
             if status.get("progress") is not None:
                 st.progress(float(status.get("progress", 0.0)))
-            if status.get("status") == "completed":
-                response = requests.get(f"{API_BASE_URL}/sessions/{dataset_id}/report/html", timeout=REQUEST_TIMEOUT)
+            job_status = str(status.get("status", "")).lower()
+            if job_status in {"succeeded", "completed"}:
+                api_key = st.session_state.get("api_key_value") or os.getenv("APP_API_KEY", "")
+                headers = {"X-API-Key": api_key} if api_key else {}
+                response = requests.get(
+                    f"{API_BASE_URL}/sessions/{dataset_id}/report/html",
+                    timeout=REQUEST_TIMEOUT,
+                    headers=headers,
+                )
                 if response.status_code >= 400:
                     raise RuntimeError(response.text)
                 st.session_state.report_html = response.text
+                _reset_backoff_delay("report_poll_delay")
                 st.success("Report ready.")
-            elif auto_refresh and status.get("status") not in {"completed", "failed"}:
-                time.sleep(5)
+            elif auto_refresh and job_status not in {"succeeded", "completed", "failed"}:
+                delay = _next_backoff_delay("report_poll_delay")
+                time.sleep(delay)
                 st.rerun()
         except Exception as exc:
             st.error(f"Job status failed: {exc}")
@@ -632,8 +675,12 @@ if report_html:
     if st.button("Download report.pdf"):
         with st.spinner("Fetching PDF..."):
             try:
+                api_key = st.session_state.get("api_key_value") or os.getenv("APP_API_KEY", "")
+                headers = {"X-API-Key": api_key} if api_key else {}
                 pdf_response = requests.get(
-                    f"{API_BASE_URL}/sessions/{dataset_id}/report/pdf", timeout=REQUEST_TIMEOUT
+                    f"{API_BASE_URL}/sessions/{dataset_id}/report/pdf",
+                    timeout=REQUEST_TIMEOUT,
+                    headers=headers,
                 )
                 if pdf_response.status_code >= 400:
                     raise RuntimeError(pdf_response.text)

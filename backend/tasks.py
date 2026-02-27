@@ -11,9 +11,10 @@ from backend.main import (
     _build_dashboard_spec,
     _build_facts_bundle,
     _build_profile,
-    _deterministic_sample,
     _chart_images_base64,
+    _compute_schema_hash,
     _dashboard_spec_path,
+    _determine_sampling_strategy,
     _facts_path,
     _load_json,
     _load_meta,
@@ -24,9 +25,9 @@ from backend.main import (
     _report_path,
     _save_json,
     _save_meta,
+    _seed_from_dataset_hash,
     _apply_profile_masking,
     MID_COL_MAX,
-    MID_ROW_MAX,
     MID_ROW_THRESHOLD,
     SAMPLE_MAX_ROWS,
 )
@@ -105,7 +106,7 @@ def generate_report_task(job_id: str, dataset_id: str, template: str | None, sec
         result = {"report_html_path": str(html_path), "report_pdf_path": str(pdf_path)}
         update_job(
             job_id,
-            status="completed",
+            status="succeeded",
             progress=1.0,
             result=result,
             artifact_links={"report_html": str(html_path), "report_pdf": str(pdf_path)},
@@ -126,6 +127,9 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
         update_job(job_id, status="running", progress=0.1)
         df = _read_uploaded_file(meta)
         rows, cols = df.shape
+        file_hash = meta.get("file_hash", "")
+        schema_hash = meta.get("schema_hash") or _compute_schema_hash(df)
+        meta["schema_hash"] = schema_hash
 
         if mode == "auto":
             if rows > MID_ROW_THRESHOLD or cols > MID_COL_MAX:
@@ -133,15 +137,19 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
             else:
                 mode = "full"
 
+        sampling_seed = seed if seed else _seed_from_dataset_hash(file_hash)
         if mode == "sample":
-            sampled = _deterministic_sample(df, max_rows=SAMPLE_MAX_ROWS, seed=seed)
+            pre_profile = _build_profile(df)
+            sampled, sampling_method = _determine_sampling_strategy(
+                df, pre_profile, sampling_seed, SAMPLE_MAX_ROWS
+            )
             data_coverage = {
                 "mode": "sample",
                 "rows_total": rows,
                 "rows_used": int(len(sampled)),
-                "sampling_method": "seeded_sample",
-                "seed": seed,
-                "bias_notes": "Row-uniform sample; rare categories may be underrepresented.",
+                "sampling_method": sampling_method,
+                "seed": sampling_seed,
+                "bias_notes": "Sampled dataset used for speed; use full computation for final reporting.",
             }
             work_df = sampled
         else:
@@ -161,6 +169,7 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
 
         update_job(job_id, status="running", progress=0.7)
         facts_bundle = _build_facts_bundle(work_df, profile)
+        facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
         _save_json(_profile_path(dataset_id), profile)
         _save_json(_facts_path(dataset_id), facts_bundle)
 
@@ -172,7 +181,7 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
         result = {"facts_path": str(_facts_path(dataset_id)), "data_coverage": data_coverage}
         update_job(
             job_id,
-            status="completed",
+            status="succeeded",
             progress=1.0,
             result=result,
             artifact_links={"facts": str(_facts_path(dataset_id))},

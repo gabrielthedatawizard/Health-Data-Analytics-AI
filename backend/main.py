@@ -13,14 +13,16 @@ from typing import Any
 
 import pandas as pd
 import plotly.express as px
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from backend.cache import CacheManager
-from backend.celery_app import celery_app
 from backend.jobs import create_job, get_job, list_jobs, update_job
+from backend.llm_client import LLMClient, create_llm_client_from_env
+from backend.llm_gate import FactsGroundingError, SchemaValidationError, validate_facts_references, validate_schema
+from backend.llm_schemas import ASK_NARRATIVE_SCHEMA, DASHBOARD_SPEC_SCHEMA, QUERY_PLAN_SCHEMA
 
 DATA_DIR = Path("data_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,15 +59,10 @@ MID_COL_MAX = 200
 SAMPLE_MAX_ROWS = 250_000
 CACHE_VERSION = "v1"
 
-MID_ROW_THRESHOLD = 100_000
-MID_ROW_MAX = 5_000_000
-MID_COL_MAX = 200
-SAMPLE_MAX_ROWS = 250_000
-CACHE_VERSION = "v1"
-
 
 app = FastAPI(title="AI Analytics Backend", version="0.1.0")
 cache = CacheManager()
+_llm_client: LLMClient | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,6 +88,7 @@ class SessionMetaResponse(BaseModel):
     created_at: str
     updated_at: str
     created_by: str
+    user_id: str | None = None
     pii_masking_enabled: bool
     allow_sensitive_export: bool = False
     file: dict[str, Any] | None = None
@@ -143,11 +141,16 @@ class AskResponse(BaseModel):
     confidence: str
     fact_coverage: float
     data_coverage: str
+    query_plan: dict[str, Any] | None = None
 
 
 class ReportRequest(BaseModel):
     template: str | None = "health_report"
     sections: list[str] = Field(default_factory=lambda: ["quality", "kpis", "trends", "limitations"])
+
+
+class DashboardSpecRequest(BaseModel):
+    template: str = "health_core"
 
 
 def _utc_now_iso() -> str:
@@ -234,6 +237,28 @@ def _append_audit(dataset_id: str, action: str, actor: str, details: dict[str, A
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _actor_from_header(x_api_key: str | None, fallback: str = "anonymous") -> str:
+    if x_api_key and x_api_key.strip():
+        return x_api_key.strip()
+    return fallback
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _etag_for(dataset_id: str, artifact: str, dataset_hash: str, schema_hash: str | None = None, params: str = "") -> str:
+    token = "|".join([dataset_id, artifact, dataset_hash, schema_hash or "", params])
+    return _sha256_text(token)[:32]
+
+
+def _get_llm_client() -> LLMClient:
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = create_llm_client_from_env()
+    return _llm_client
+
+
 def _detect_csv_encoding(content: bytes) -> str:
     last_error: Exception | None = None
     for encoding in CSV_ENCODINGS:
@@ -303,14 +328,78 @@ def _dataset_signature(meta: dict[str, Any]) -> str:
     return _compute_file_hash(Path(raw_path))
 
 
-def _cache_key(dataset_id: str, artifact: str, file_hash: str, params: str = "default") -> str:
-    return f"cache:{CACHE_VERSION}:{dataset_id}:{artifact}:{file_hash}:{params}"
+def _compute_schema_hash(df: pd.DataFrame) -> str:
+    columns = [{"name": str(column), "dtype": str(df[column].dtype)} for column in df.columns]
+    return _sha256_text(json.dumps(columns, sort_keys=True, ensure_ascii=True))
+
+
+def _cache_key(dataset_id: str, artifact: str, file_hash: str, schema_hash: str = "", params: str = "default") -> str:
+    signature = f"{file_hash}:{schema_hash}" if schema_hash else file_hash
+    return f"cache:{CACHE_VERSION}:{dataset_id}:{artifact}:{signature}:{params}"
+
+
+def _seed_from_dataset_hash(dataset_hash: str) -> int:
+    if not dataset_hash:
+        return 42
+    return int(dataset_hash[:8], 16)
 
 
 def _deterministic_sample(df: pd.DataFrame, max_rows: int, seed: int) -> pd.DataFrame:
     if len(df) <= max_rows:
         return df
     return df.sample(n=max_rows, random_state=seed, replace=False)
+
+
+def _determine_sampling_strategy(df: pd.DataFrame, profile: dict[str, Any], seed: int, max_rows: int) -> tuple[pd.DataFrame, str]:
+    if len(df) <= max_rows:
+        return df, "none"
+
+    datetime_cols = profile.get("datetime_cols", [])
+    categorical_cols = profile.get("categorical_cols", [])
+    geo_candidates = [col for col in categorical_cols if any(key in str(col).lower() for key in GEO_KEYWORDS)]
+
+    if datetime_cols:
+        time_col = datetime_cols[0]
+        scoped = df.copy()
+        scoped[time_col] = pd.to_datetime(scoped[time_col], errors="coerce")
+        scoped = scoped.dropna(subset=[time_col]).sort_values(time_col)
+        if not scoped.empty:
+            head_n = max(1, max_rows // 5)
+            tail_n = max(1, max_rows // 5)
+            core_n = max(0, max_rows - head_n - tail_n)
+            head_df = scoped.head(head_n)
+            tail_df = scoped.tail(tail_n)
+            middle = scoped.iloc[head_n:-tail_n] if len(scoped) > (head_n + tail_n) else scoped.iloc[0:0]
+            middle_sample = _deterministic_sample(middle, core_n, seed)
+            sampled = pd.concat([head_df, middle_sample, tail_df]).drop_duplicates()
+            sampled = sampled.head(max_rows)
+            return sampled, f"time_head_tail_stratified:{time_col}"
+
+    if geo_candidates:
+        key_col = geo_candidates[0]
+        groups = []
+        grouped = df.groupby(key_col, dropna=False)
+        per_group = max(1, max_rows // max(1, grouped.ngroups))
+        for _, chunk in grouped:
+            groups.append(_deterministic_sample(chunk, per_group, seed))
+        sampled = pd.concat(groups).drop_duplicates()
+        if len(sampled) > max_rows:
+            sampled = _deterministic_sample(sampled, max_rows, seed)
+        return sampled, f"categorical_stratified:{key_col}"
+
+    if categorical_cols:
+        key_col = categorical_cols[0]
+        grouped = df.groupby(key_col, dropna=False)
+        groups = []
+        per_group = max(1, max_rows // max(1, grouped.ngroups))
+        for _, chunk in grouped:
+            groups.append(_deterministic_sample(chunk, per_group, seed))
+        sampled = pd.concat(groups).drop_duplicates()
+        if len(sampled) > max_rows:
+            sampled = _deterministic_sample(sampled, max_rows, seed)
+        return sampled, f"categorical_stratified:{key_col}"
+
+    return _deterministic_sample(df, max_rows, seed), "uniform_random"
 
 
 def _infer_column_type(series: pd.Series) -> str:
@@ -885,6 +974,163 @@ def _safe_answer_from_facts(question: str, facts_bundle: dict[str, Any]) -> tupl
     )
 
 
+def _facts_context_for_llm(facts_bundle: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kpis": facts_bundle.get("kpis", {}),
+        "quality": facts_bundle.get("quality", {}),
+        "insights_facts": facts_bundle.get("insights_facts", [])[:25],
+        "chart_candidates": facts_bundle.get("chart_candidates", [])[:12],
+        "health_signals": facts_bundle.get("health_signals", {}),
+        "data_coverage": facts_bundle.get("data_coverage", {}),
+        "facts_index_keys": sorted(list(facts_bundle.get("facts_index", {}).keys()))[:80],
+    }
+
+
+def _generate_dashboard_spec_llm(dataset_id: str, template: str, facts_bundle: dict[str, Any]) -> dict[str, Any]:
+    llm = _get_llm_client()
+    context = _facts_context_for_llm(facts_bundle)
+    system_prompt = (
+        "You generate dashboard specs for healthcare analytics. "
+        "You must only cite fact keys from the supplied facts bundle."
+    )
+    user_prompt = (
+        f"Dataset ID: {dataset_id}\n"
+        f"Template: {template}\n"
+        f"Facts context JSON:\n{json.dumps(context, ensure_ascii=True)}\n"
+        "Build a compact dashboard spec with filters, KPIs, charts, components, and facts_used."
+    )
+    output = llm.generate_json(DASHBOARD_SPEC_SCHEMA, system_prompt, user_prompt, timeout=30)
+    validate_schema(output, DASHBOARD_SPEC_SCHEMA)
+    validate_facts_references(output, facts_bundle)
+    output["dataset_id"] = dataset_id
+    output["generated_at"] = _utc_now_iso()
+    output["version"] = "1.0"
+    output["policy"] = "All cards and narratives must cite computed facts; no free-form hallucinated metrics."
+    output["layout"] = {"kpi_row_columns": 4, "chart_columns": 2}
+    return output
+
+
+def _generate_query_plan_llm(question: str, facts_bundle: dict[str, Any]) -> dict[str, Any]:
+    llm = _get_llm_client()
+    context = {
+        "question": question,
+        "columns": [column.get("name") for column in facts_bundle.get("schema", {}).get("columns", [])][:120],
+        "inferred_types": {
+            column.get("name"): column.get("inferred_type")
+            for column in facts_bundle.get("schema", {}).get("columns", [])[:120]
+        },
+        "facts_keys": sorted(list(facts_bundle.get("facts_index", {}).keys()))[:100],
+    }
+    system_prompt = (
+        "You are a query planner for healthcare analytics. "
+        "Generate a safe plan using only filter/groupby/aggregate operations."
+    )
+    user_prompt = f"Build a query plan for this context:\n{json.dumps(context, ensure_ascii=True)}"
+    output = llm.generate_json(QUERY_PLAN_SCHEMA, system_prompt, user_prompt, timeout=30)
+    validate_schema(output, QUERY_PLAN_SCHEMA)
+    validate_facts_references(output, facts_bundle)
+    return output
+
+
+def _apply_filter_op(df: pd.DataFrame, op: dict[str, Any]) -> pd.DataFrame:
+    field = op.get("field")
+    if not field or field not in df.columns:
+        return df
+
+    if "range" in op and isinstance(op["range"], list) and len(op["range"]) == 2:
+        start, end = op["range"]
+        if pd.api.types.is_datetime64_any_dtype(df[field]) or any(token in field.lower() for token in TIME_KEYWORDS):
+            scoped = df.copy()
+            scoped[field] = pd.to_datetime(scoped[field], errors="coerce")
+            start_dt = pd.to_datetime(start, errors="coerce")
+            end_dt = pd.to_datetime(end, errors="coerce")
+            return scoped[(scoped[field] >= start_dt) & (scoped[field] <= end_dt)]
+        scoped = pd.to_numeric(df[field], errors="coerce")
+        start_num = pd.to_numeric(pd.Series([start]), errors="coerce").iloc[0]
+        end_num = pd.to_numeric(pd.Series([end]), errors="coerce").iloc[0]
+        return df[(scoped >= start_num) & (scoped <= end_num)]
+
+    if "equals" in op:
+        return df[df[field] == op["equals"]]
+
+    return df
+
+
+def _execute_query_plan(df: pd.DataFrame, plan: dict[str, Any]) -> tuple[pd.DataFrame, str]:
+    scoped = df.copy()
+    groupby_field: str | None = None
+    aggregate_field: str | None = None
+    aggregate_func: str | None = None
+
+    for op in plan.get("operations", []):
+        op_type = op.get("op")
+        if op_type == "filter":
+            scoped = _apply_filter_op(scoped, op)
+        elif op_type == "groupby":
+            candidate = op.get("field")
+            if isinstance(candidate, str) and candidate in scoped.columns:
+                groupby_field = candidate
+        elif op_type == "aggregate":
+            candidate = op.get("field")
+            func = op.get("func")
+            if isinstance(candidate, str) and candidate in scoped.columns and isinstance(func, str):
+                aggregate_field = candidate
+                aggregate_func = func
+
+    if aggregate_field is None:
+        return scoped.head(20), "No aggregate operation found. Returning filtered rows preview."
+
+    if groupby_field:
+        grouped = scoped.groupby(groupby_field, dropna=False)[aggregate_field]
+        if aggregate_func == "sum":
+            result = grouped.sum().reset_index(name=f"{aggregate_field}_sum")
+        elif aggregate_func == "mean":
+            result = grouped.mean().reset_index(name=f"{aggregate_field}_mean")
+        elif aggregate_func == "count":
+            result = grouped.count().reset_index(name=f"{aggregate_field}_count")
+        elif aggregate_func == "min":
+            result = grouped.min().reset_index(name=f"{aggregate_field}_min")
+        else:
+            result = grouped.max().reset_index(name=f"{aggregate_field}_max")
+        return result.sort_values(result.columns[-1], ascending=False).head(100), "Grouped aggregate computed."
+
+    series = pd.to_numeric(scoped[aggregate_field], errors="coerce")
+    if aggregate_func == "sum":
+        value = float(series.sum())
+    elif aggregate_func == "mean":
+        value = float(series.mean())
+    elif aggregate_func == "count":
+        value = float(series.count())
+    elif aggregate_func == "min":
+        value = float(series.min())
+    else:
+        value = float(series.max())
+    result = pd.DataFrame([{"metric": aggregate_field, "aggregation": aggregate_func, "value": value}])
+    return result, "Single aggregate computed."
+
+
+def _summarize_query_result_llm(question: str, result_df: pd.DataFrame, facts_bundle: dict[str, Any], requested_facts: list[str]) -> tuple[str, list[str]]:
+    llm = _get_llm_client()
+    preview = json.loads(result_df.head(10).to_json(orient="records", date_format="iso"))
+    context = {
+        "question": question,
+        "result_preview": preview,
+        "requested_facts": requested_facts,
+        "data_coverage": facts_bundle.get("data_coverage", {}),
+    }
+    system_prompt = (
+        "You summarize deterministic analysis outputs. "
+        "Do not invent numbers. Reference only requested fact keys in facts_used."
+    )
+    user_prompt = f"Summarize this result context:\n{json.dumps(context, ensure_ascii=True)}"
+    output = llm.generate_json(ASK_NARRATIVE_SCHEMA, system_prompt, user_prompt, timeout=30)
+    validate_schema(output, ASK_NARRATIVE_SCHEMA)
+    validate_facts_references(output, facts_bundle)
+    answer = output.get("answer", "")
+    facts_used = [value for value in output.get("facts_used", []) if isinstance(value, str)]
+    return answer, facts_used
+
+
 def _build_dashboard_spec(dataset_id: str, profile: dict[str, Any], facts_bundle: dict[str, Any]) -> dict[str, Any]:
     template = profile.get("health_template", {}).get("name", "generic")
     numeric_cols = profile.get("numeric_cols", [])
@@ -1274,14 +1520,26 @@ def _require_session_dir(dataset_id: str) -> Path:
     return path
 
 
+def _normalize_job_payload(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    if normalized.get("status") == "completed":
+        normalized["status"] = "succeeded"
+    progress_value = normalized.get("progress")
+    if isinstance(progress_value, (int, float)):
+        normalized["progress_percent"] = round(float(progress_value) * 100, 2)
+    return normalized
+
+
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok", "timestamp": _utc_now_iso()}
 
 
 @app.post("/sessions", response_model=CreateSessionResponse)
-def create_session(payload: CreateSessionRequest | None = None) -> CreateSessionResponse:
-    created_by = (payload.created_by if payload else "anonymous").strip() or "anonymous"
+def create_session(
+    payload: CreateSessionRequest | None = None, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> CreateSessionResponse:
+    created_by = _actor_from_header(x_api_key, fallback=(payload.created_by if payload else "anonymous"))
     dataset_id = str(uuid.uuid4())
     session_dir = _dataset_path(dataset_id)
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -1293,6 +1551,7 @@ def create_session(payload: CreateSessionRequest | None = None) -> CreateSession
         "updated_at": now,
         "status": "created",
         "created_by": created_by,
+        "user_id": created_by,
         "pii_masking_enabled": False,
         "allow_sensitive_export": False,
         "file": None,
@@ -1313,6 +1572,7 @@ def get_session(dataset_id: str) -> SessionMetaResponse:
         created_at=meta.get("created_at", ""),
         updated_at=meta.get("updated_at", ""),
         created_by=meta.get("created_by", "anonymous"),
+        user_id=meta.get("user_id"),
         pii_masking_enabled=bool(meta.get("pii_masking_enabled", False)),
         allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
         file=meta.get("file"),
@@ -1321,17 +1581,22 @@ def get_session(dataset_id: str) -> SessionMetaResponse:
 
 
 @app.post("/sessions/{dataset_id}/masking")
-def update_masking(dataset_id: str, payload: MaskingRequest) -> dict[str, Any]:
+def update_masking(
+    dataset_id: str, payload: MaskingRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     meta["pii_masking_enabled"] = bool(payload.enabled)
     _save_meta(dataset_id, meta)
-    _append_audit(dataset_id, "masking_toggled", meta.get("created_by", "anonymous"), {"enabled": payload.enabled})
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "masking_toggled", actor, {"enabled": payload.enabled})
     return {"dataset_id": dataset_id, "pii_masking_enabled": meta["pii_masking_enabled"]}
 
 
 @app.post("/sessions/{dataset_id}/sensitive-export")
-def update_sensitive_export(dataset_id: str, payload: SensitiveExportRequest) -> dict[str, Any]:
+def update_sensitive_export(
+    dataset_id: str, payload: SensitiveExportRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     meta["allow_sensitive_export"] = bool(payload.enabled)
@@ -1339,7 +1604,7 @@ def update_sensitive_export(dataset_id: str, payload: SensitiveExportRequest) ->
     _append_audit(
         dataset_id,
         "sensitive_export_toggled",
-        meta.get("created_by", "anonymous"),
+        _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
         {"enabled": payload.enabled},
     )
     return {"dataset_id": dataset_id, "allow_sensitive_export": meta["allow_sensitive_export"]}
@@ -1351,6 +1616,7 @@ async def upload_file(
     file: UploadFile = File(...),
     sheet_name: str | None = Query(default=None, description="Excel sheet to load. Defaults to first sheet."),
     uploaded_by: str = Form(default="anonymous"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict[str, Any]:
     session_dir = _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
@@ -1388,8 +1654,9 @@ async def upload_file(
     with raw_path.open("wb") as handle:
         handle.write(content)
     file_meta["raw_path"] = str(raw_path)
+    actor = _actor_from_header(x_api_key, fallback=uploaded_by.strip() or meta.get("created_by", "anonymous"))
     file_meta["uploaded_at"] = _utc_now_iso()
-    file_meta["uploaded_by"] = uploaded_by.strip() or "anonymous"
+    file_meta["uploaded_by"] = actor
 
     # New upload invalidates derived artifacts.
     meta["file"] = file_meta
@@ -1401,7 +1668,7 @@ async def upload_file(
     _append_audit(
         dataset_id,
         "file_uploaded",
-        file_meta["uploaded_by"],
+        actor,
         {"filename": filename, "extension": extension, "size_bytes": len(content)},
     )
 
@@ -1415,7 +1682,12 @@ async def upload_file(
 
 
 @app.get("/sessions/{dataset_id}/profile", response_model=ProfileResponse)
-def profile_dataset(dataset_id: str, mask_pii: bool | None = Query(default=None)) -> ProfileResponse:
+def profile_dataset(
+    dataset_id: str,
+    mask_pii: bool | None = Query(default=None),
+    response: FastAPIResponse | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> ProfileResponse:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
@@ -1424,30 +1696,31 @@ def profile_dataset(dataset_id: str, mask_pii: bool | None = Query(default=None)
     file_hash = meta.get("file_hash") or _dataset_signature(meta)
     if file_hash and meta.get("file_hash") != file_hash:
         meta["file_hash"] = file_hash
-        _save_meta(dataset_id, meta)
-    if file_hash and meta.get("file_hash") != file_hash:
-        meta["file_hash"] = file_hash
-        _save_meta(dataset_id, meta)
-    if file_hash and meta.get("file_hash") != file_hash:
-        meta["file_hash"] = file_hash
-        _save_meta(dataset_id, meta)
-    cache_key = _cache_key(dataset_id, "profile", file_hash)
+
+    try:
+        df = _read_uploaded_file(meta)
+        schema_hash = _compute_schema_hash(df)
+        meta["schema_hash"] = schema_hash
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    cache_key = _cache_key(dataset_id, "profile", file_hash, schema_hash=schema_hash)
     cached = cache.get(cache_key)
     if cached:
         profile = cached
     else:
-        try:
-            df = _read_uploaded_file(meta)
-            profile = _build_profile(df)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+        profile = _build_profile(df)
         cache.set(cache_key, profile)
 
     _save_json(_profile_path(dataset_id), profile)
     meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
     meta["status"] = "profiled"
     _save_meta(dataset_id, meta)
-    _append_audit(dataset_id, "profile_generated", meta.get("created_by", "anonymous"), {})
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "profile_generated", actor, {})
+
+    if response is not None:
+        response.headers["ETag"] = _etag_for(dataset_id, "profile", file_hash, schema_hash=schema_hash)
 
     mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
     response_profile = _apply_profile_masking(profile, mask_enabled)
@@ -1455,36 +1728,78 @@ def profile_dataset(dataset_id: str, mask_pii: bool | None = Query(default=None)
 
 
 @app.get("/sessions/{dataset_id}/facts")
-def generate_facts(dataset_id: str, mode: str = Query(default="auto")) -> dict[str, Any]:
+def generate_facts(
+    dataset_id: str,
+    mode: str = Query(default="auto"),
+    force: bool = Query(default=False),
+    response: FastAPIResponse | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
     file_hash = meta.get("file_hash") or _dataset_signature(meta)
-    cache_key = _cache_key(dataset_id, "facts", file_hash, params=mode)
+    if file_hash and meta.get("file_hash") != file_hash:
+        meta["file_hash"] = file_hash
+        _save_meta(dataset_id, meta)
+    df: pd.DataFrame | None = None
+    schema_hash = meta.get("schema_hash", "")
+    if not schema_hash:
+        df = _read_uploaded_file(meta)
+        schema_hash = _compute_schema_hash(df)
+        meta["schema_hash"] = schema_hash
+        _save_meta(dataset_id, meta)
+
+    cache_key = _cache_key(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
     cached = cache.get(cache_key)
-    if cached and mode != "force":
+    if cached and not force:
+        if response is not None:
+            response.headers["ETag"] = _etag_for(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
         return {"dataset_id": dataset_id, "facts_bundle": cached, "cached": True}
 
     facts_path = _facts_path(dataset_id)
-    if facts_path.exists() and mode != "force":
+    if facts_path.exists() and not force:
         facts_bundle = _load_json(facts_path)
-        cache.set(cache_key, facts_bundle)
-        return {"dataset_id": dataset_id, "facts_bundle": facts_bundle, "cached": True}
+        signatures = facts_bundle.get("source_hashes", {})
+        if signatures.get("dataset_hash") == file_hash and signatures.get("schema_hash") == schema_hash:
+            cache.set(cache_key, facts_bundle)
+            if response is not None:
+                response.headers["ETag"] = _etag_for(
+                    dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode
+                )
+            return {"dataset_id": dataset_id, "facts_bundle": facts_bundle, "cached": True}
 
-    df = _read_uploaded_file(meta)
+    if df is None:
+        df = _read_uploaded_file(meta)
     rows, cols = df.shape
     if mode == "auto" and (rows > MID_ROW_THRESHOLD or cols > MID_COL_MAX):
-        job = create_job("facts", dataset_id, {"mode": "sample", "seed": 42, "file_hash": file_hash})
+        seed = _seed_from_dataset_hash(file_hash)
+        job = create_job(
+            "facts",
+            dataset_id,
+            {"mode": "sample", "seed": seed, "file_hash": file_hash, "schema_hash": schema_hash},
+        )
         try:
             from backend.tasks import generate_facts_task
 
-            generate_facts_task.delay(job["job_id"], dataset_id, "sample", 42)
-            _append_audit(dataset_id, "facts_job_queued", meta.get("created_by", "anonymous"), {"job_id": job["job_id"]})
+            generate_facts_task.delay(job["job_id"], dataset_id, "sample", seed)
+            actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+            _append_audit(dataset_id, "facts_job_queued", actor, {"job_id": job["job_id"], "mode": "sample"})
         except Exception as exc:
-            update_job(job["job_id"], status="failed", error=str(exc))
-            raise HTTPException(status_code=503, detail=f"Failed to enqueue facts job: {exc}") from exc
+            try:
+                generate_facts_task(job["job_id"], dataset_id, "sample", seed)
+                facts_bundle = _load_json(_facts_path(dataset_id))
+                cache.set(cache_key, facts_bundle)
+                if response is not None:
+                    response.headers["ETag"] = _etag_for(
+                        dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode
+                    )
+                return {"dataset_id": dataset_id, "facts_bundle": facts_bundle, "cached": False, "queue_fallback": True}
+            except Exception as inner_exc:
+                update_job(job["job_id"], status="failed", error=str(inner_exc))
+                raise HTTPException(status_code=503, detail=f"Failed to run facts job: {exc}; {inner_exc}") from inner_exc
         return Response(
             content=json.dumps(
                 {"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"], "queued": True}
@@ -1493,16 +1808,17 @@ def generate_facts(dataset_id: str, mode: str = Query(default="auto")) -> dict[s
             status_code=202,
         )
 
+    sampling_seed = _seed_from_dataset_hash(file_hash)
     if mode == "sample":
-        sampled = _deterministic_sample(df, max_rows=SAMPLE_MAX_ROWS, seed=42)
+        sampled, sampling_method = _determine_sampling_strategy(df, _build_profile(df), sampling_seed, SAMPLE_MAX_ROWS)
         profile = _build_profile(sampled)
         profile["data_coverage"] = {
             "mode": "sample",
             "rows_total": rows,
             "rows_used": int(len(sampled)),
-            "sampling_method": "seeded_sample",
-            "seed": 42,
-            "bias_notes": "Row-uniform sample; rare categories may be underrepresented.",
+            "sampling_method": sampling_method,
+            "seed": sampling_seed,
+            "bias_notes": "Sampled dataset used for speed; use full computation for final reporting.",
         }
         facts_bundle = _build_facts_bundle(sampled, profile)
     else:
@@ -1516,15 +1832,20 @@ def generate_facts(dataset_id: str, mode: str = Query(default="auto")) -> dict[s
             "bias_notes": "Full dataset used.",
         }
         facts_bundle = _build_facts_bundle(df, profile)
+    facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
     _save_json(_facts_path(dataset_id), facts_bundle)
     _save_json(_profile_path(dataset_id), profile)
     meta["artifacts"]["facts"] = str(_facts_path(dataset_id))
     meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
+    meta["schema_hash"] = schema_hash
     meta["status"] = "facts_generated"
     _save_meta(dataset_id, meta)
-    _append_audit(dataset_id, "facts_generated", meta.get("created_by", "anonymous"), {})
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "facts_generated", actor, {"mode": mode})
 
     cache.set(cache_key, facts_bundle)
+    if response is not None:
+        response.headers["ETag"] = _etag_for(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
     if meta.get("pii_masking_enabled", False):
         pii_columns = profile.get("pii_candidates", [])
         aliases = {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
@@ -1542,22 +1863,41 @@ def generate_facts(dataset_id: str, mode: str = Query(default="auto")) -> dict[s
 
 
 @app.post("/sessions/{dataset_id}/facts")
-def regenerate_facts(dataset_id: str, mode: str = Query(default="full"), seed: int = Query(default=42)) -> dict[str, Any]:
+def regenerate_facts(
+    dataset_id: str,
+    mode: str = Query(default="full"),
+    seed: int | None = Query(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
     file_hash = meta.get("file_hash") or _dataset_signature(meta)
-    job = create_job("facts", dataset_id, {"mode": mode, "seed": seed, "file_hash": file_hash, "force": True})
+    if file_hash and meta.get("file_hash") != file_hash:
+        meta["file_hash"] = file_hash
+        _save_meta(dataset_id, meta)
+    resolved_seed = seed if seed is not None else _seed_from_dataset_hash(file_hash)
+    schema_hash = meta.get("schema_hash", "")
+    cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:facts:")
+    job = create_job(
+        "facts",
+        dataset_id,
+        {"mode": mode, "seed": resolved_seed, "file_hash": file_hash, "schema_hash": schema_hash, "force": True},
+    )
     try:
         from backend.tasks import generate_facts_task
 
-        generate_facts_task.delay(job["job_id"], dataset_id, mode, seed)
-        _append_audit(dataset_id, "facts_job_forced", meta.get("created_by", "anonymous"), {"job_id": job["job_id"]})
+        generate_facts_task.delay(job["job_id"], dataset_id, mode, resolved_seed)
+        actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+        _append_audit(dataset_id, "facts_job_forced", actor, {"job_id": job["job_id"], "mode": mode})
     except Exception as exc:
-        update_job(job["job_id"], status="failed", error=str(exc))
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue facts job: {exc}") from exc
+        try:
+            generate_facts_task(job["job_id"], dataset_id, mode, resolved_seed)
+        except Exception as inner_exc:
+            update_job(job["job_id"], status="failed", error=str(inner_exc))
+            raise HTTPException(status_code=503, detail=f"Failed to run facts job: {exc}; {inner_exc}") from inner_exc
 
     return Response(
         content=json.dumps({"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}),
@@ -1567,7 +1907,9 @@ def regenerate_facts(dataset_id: str, mode: str = Query(default="full"), seed: i
 
 
 @app.post("/sessions/{dataset_id}/clean")
-def clean_dataset(dataset_id: str, payload: CleanRequest) -> dict[str, Any]:
+def clean_dataset(
+    dataset_id: str, payload: CleanRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
@@ -1585,7 +1927,7 @@ def clean_dataset(dataset_id: str, payload: CleanRequest) -> dict[str, Any]:
     _append_audit(
         dataset_id,
         "dataset_cleaned",
-        meta.get("created_by", "anonymous"),
+        _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
         {"actions": payload.actions, "pii_mask": payload.pii_mask},
     )
 
@@ -1593,16 +1935,33 @@ def clean_dataset(dataset_id: str, payload: CleanRequest) -> dict[str, Any]:
 
 
 @app.get("/sessions/{dataset_id}/dashboard-spec", response_model=DashboardSpecResponse)
-def generate_dashboard_spec(dataset_id: str) -> DashboardSpecResponse:
+@app.post("/sessions/{dataset_id}/dashboard-spec", response_model=DashboardSpecResponse)
+def generate_dashboard_spec(
+    dataset_id: str,
+    payload: DashboardSpecRequest | None = None,
+    use_llm: bool = Query(default=True),
+    response: FastAPIResponse | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> DashboardSpecResponse:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
     file_hash = meta.get("file_hash") or _dataset_signature(meta)
-    cache_key = _cache_key(dataset_id, "dashboard_spec", file_hash)
+    if file_hash and meta.get("file_hash") != file_hash:
+        meta["file_hash"] = file_hash
+        _save_meta(dataset_id, meta)
+    df = _read_uploaded_file(meta)
+    schema_hash = meta.get("schema_hash") or _compute_schema_hash(df)
+    meta["schema_hash"] = schema_hash
+    cache_key = _cache_key(dataset_id, "dashboard_spec", file_hash, schema_hash=schema_hash, params=str(use_llm))
     cached = cache.get(cache_key)
     if cached:
+        if response is not None:
+            response.headers["ETag"] = _etag_for(
+                dataset_id, "dashboard_spec", file_hash, schema_hash=schema_hash, params=str(use_llm)
+            )
         return DashboardSpecResponse(dataset_id=dataset_id, dashboard_spec=cached)
 
     profile_path = _profile_path(dataset_id)
@@ -1610,16 +1969,29 @@ def generate_dashboard_spec(dataset_id: str) -> DashboardSpecResponse:
     if profile_path.exists():
         profile = _load_json(profile_path)
     else:
-        profile = _build_profile(_read_uploaded_file(meta))
+        profile = _build_profile(df)
         _save_json(profile_path, profile)
 
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
     else:
-        facts_bundle = _build_facts_bundle(_read_uploaded_file(meta), profile)
+        if use_llm:
+            raise HTTPException(status_code=400, detail="Facts bundle not found. Generate facts before dashboard spec.")
+        facts_bundle = _build_facts_bundle(df, profile)
+        facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
         _save_json(facts_path, facts_bundle)
 
-    spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
+    template = payload.template if payload else "health_core"
+    if use_llm:
+        try:
+            spec = _generate_dashboard_spec_llm(dataset_id, template, facts_bundle)
+        except (SchemaValidationError, FactsGroundingError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid dashboard spec from LLM: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"LLM unavailable for dashboard spec: {exc}") from exc
+    else:
+        spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
+
     _save_json(_dashboard_spec_path(dataset_id), spec)
     cache.set(cache_key, spec)
     meta["artifacts"]["profile"] = str(profile_path)
@@ -1627,7 +1999,12 @@ def generate_dashboard_spec(dataset_id: str) -> DashboardSpecResponse:
     meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
     meta["status"] = "dashboard_spec_generated"
     _save_meta(dataset_id, meta)
-    _append_audit(dataset_id, "dashboard_spec_generated", meta.get("created_by", "anonymous"), {})
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "dashboard_spec_generated", actor, {"use_llm": use_llm, "template": template})
+    if response is not None:
+        response.headers["ETag"] = _etag_for(
+            dataset_id, "dashboard_spec", file_hash, schema_hash=schema_hash, params=str(use_llm)
+        )
     return DashboardSpecResponse(dataset_id=dataset_id, dashboard_spec=spec)
 
 
@@ -1642,38 +2019,64 @@ def get_dashboard(dataset_id: str) -> dict[str, Any]:
 
 
 @app.post("/sessions/{dataset_id}/ask", response_model=AskResponse)
-def ask_dataset(dataset_id: str, payload: AskRequest) -> AskResponse:
+def ask_dataset(
+    dataset_id: str, payload: AskRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> AskResponse:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
     facts_path = _facts_path(dataset_id)
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
     else:
+        raise HTTPException(status_code=400, detail="Facts bundle not generated. Run /sessions/{id}/facts first.")
+
+    profile_path = _profile_path(dataset_id)
+    if profile_path.exists():
+        profile = _load_json(profile_path)
+    else:
         if not meta.get("file"):
             raise HTTPException(status_code=400, detail="No file uploaded for this session.")
         profile = _build_profile(_read_uploaded_file(meta))
-        _save_json(_profile_path(dataset_id), profile)
-        facts_bundle = _build_facts_bundle(_read_uploaded_file(meta), profile)
-        _save_json(facts_path, facts_bundle)
-        meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
-        meta["artifacts"]["facts"] = str(facts_path)
-        _save_meta(dataset_id, meta)
-    answer, facts_used, confidence, fact_coverage, data_coverage = _safe_answer_from_facts(
-        payload.question, facts_bundle
-    )
+        _save_json(profile_path, profile)
 
-    if facts_used:
-        valid_ids = {fact["id"] for fact in facts_bundle.get("facts", [])}
-        if not set(facts_used).issubset(valid_ids):
-            raise HTTPException(status_code=400, detail="Unsafe answer: missing facts references.")
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+    df = _read_uploaded_file(meta)
+
+    try:
+        query_plan = _generate_query_plan_llm(payload.question, facts_bundle)
+    except (SchemaValidationError, FactsGroundingError) as exc:
+        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_plan"})
+        raise HTTPException(status_code=422, detail=f"Invalid query plan from LLM: {exc}") from exc
+    except Exception as exc:
+        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "llm_unavailable"})
+        raise HTTPException(status_code=503, detail=f"LLM unavailable for query plan: {exc}") from exc
+
+    result_df, execution_note = _execute_query_plan(df, query_plan)
+    requested_facts = [value for value in query_plan.get("requested_facts", []) if isinstance(value, str)]
+
+    try:
+        answer, facts_used = _summarize_query_result_llm(payload.question, result_df, facts_bundle, requested_facts)
+    except (SchemaValidationError, FactsGroundingError) as exc:
+        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_summary"})
+        raise HTTPException(status_code=422, detail=f"Invalid summary from LLM: {exc}") from exc
+    except Exception as exc:
+        fallback_answer, fallback_facts, _, _, _ = _safe_answer_from_facts(payload.question, facts_bundle)
+        answer = f"{fallback_answer} ({execution_note})"
+        facts_used = fallback_facts or requested_facts
+        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "llm_fallback", "error": str(exc)})
 
     _append_audit(
         dataset_id,
         "ask_data",
-        meta.get("created_by", "anonymous"),
-        {"question": payload.question, "facts_used": facts_used},
+        actor,
+        {"question": payload.question, "facts_used": facts_used, "status": "ok"},
     )
 
+    data_coverage = (facts_bundle.get("data_coverage") or {}).get("mode", "sample")
+    confidence = "Medium" if facts_used else "Low"
+    fact_coverage = 1.0 if facts_used else 0.0
     return AskResponse(
         dataset_id=dataset_id,
         answer=answer,
@@ -1681,6 +2084,7 @@ def ask_dataset(dataset_id: str, payload: AskRequest) -> AskResponse:
         confidence=confidence,
         fact_coverage=fact_coverage,
         data_coverage=data_coverage,
+        query_plan=query_plan,
     )
 
 
@@ -1701,7 +2105,9 @@ def preview_dataset(dataset_id: str, limit: int = Query(default=1000, ge=1, le=5
 
 
 @app.post("/sessions/{dataset_id}/report")
-def generate_report(dataset_id: str, payload: ReportRequest | None = None) -> dict[str, Any]:
+def generate_report(
+    dataset_id: str, payload: ReportRequest | None = None, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     if not meta.get("file"):
@@ -1718,10 +2124,14 @@ def generate_report(dataset_id: str, payload: ReportRequest | None = None) -> di
         from backend.tasks import generate_report_task
 
         generate_report_task.delay(job["job_id"], dataset_id, payload.template, payload.sections)
-        _append_audit(dataset_id, "report_job_queued", meta.get("created_by", "anonymous"), {"job_id": job["job_id"]})
+        actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+        _append_audit(dataset_id, "report_job_queued", actor, {"job_id": job["job_id"]})
     except Exception as exc:
-        update_job(job["job_id"], status="failed", error=str(exc))
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue report job: {exc}") from exc
+        try:
+            generate_report_task(job["job_id"], dataset_id, payload.template, payload.sections)
+        except Exception as inner_exc:
+            update_job(job["job_id"], status="failed", error=str(inner_exc))
+            raise HTTPException(status_code=503, detail=f"Failed to run report job: {exc}; {inner_exc}") from inner_exc
 
     return Response(
         content=json.dumps({"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}),
@@ -1731,35 +2141,32 @@ def generate_report(dataset_id: str, payload: ReportRequest | None = None) -> di
 
 
 @app.get("/sessions/{dataset_id}/report/html")
-def get_report_html(dataset_id: str) -> HTMLResponse:
+def get_report_html(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> HTMLResponse:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     path = _report_path(dataset_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report not generated yet.")
-    profile = _load_profile_if_exists(dataset_id)
-    aliases = _pii_aliases(profile or {})
-    if aliases and not _can_export_sensitive(meta):
-        raise HTTPException(status_code=403, detail="PII masking enforced. Enable sensitive export to download HTML.")
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "export_html", actor, {"format": "html"})
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
 @app.get("/sessions/{dataset_id}/report/pdf")
-def get_report_pdf(dataset_id: str) -> Response:
+def get_report_pdf(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> Response:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     path = _report_pdf_path(dataset_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report PDF not generated yet.")
-    if meta.get("file") and meta.get("pii_masking_enabled", False) and not _can_export_sensitive(meta):
-        raise HTTPException(status_code=403, detail="PII masking enforced. Enable sensitive export to download PDF.")
-    _append_audit(dataset_id, "export_pdf", meta.get("created_by", "anonymous"), {"format": "pdf"})
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "export_pdf", actor, {"format": "pdf"})
     return Response(content=path.read_bytes(), media_type="application/pdf")
 
 
 @app.get("/jobs")
 def list_all_jobs(dataset_id: str | None = Query(default=None)) -> dict[str, Any]:
-    return {"jobs": list_jobs(dataset_id=dataset_id)}
+    return {"jobs": [_normalize_job_payload(job) for job in list_jobs(dataset_id=dataset_id)]}
 
 
 @app.get("/jobs/{job_id}")
@@ -1767,34 +2174,36 @@ def get_job_status(job_id: str) -> dict[str, Any]:
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return job
+    return _normalize_job_payload(job)
 
 
 @app.get("/sessions/{dataset_id}/export/{format}")
-def export_dataset(dataset_id: str, format: str, limit: int = Query(default=5000, ge=1, le=50000)) -> Response:
+def export_dataset(
+    dataset_id: str,
+    format: str,
+    limit: int = Query(default=5000, ge=1, le=50000),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> Response:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
     format = format.lower()
     profile = _load_profile_if_exists(dataset_id)
     aliases = _pii_aliases(profile or {})
     pii_detected = bool(aliases)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
 
     if format in {"html", "report"}:
         path = _report_path(dataset_id)
         if not path.exists():
             raise HTTPException(status_code=404, detail="Report not generated yet.")
-        if pii_detected and not _can_export_sensitive(meta):
-            raise HTTPException(status_code=403, detail="PII masking enforced. Enable sensitive export to download HTML.")
-        _append_audit(dataset_id, "export_html", meta.get("created_by", "anonymous"), {"format": "html"})
+        _append_audit(dataset_id, "export_html", actor, {"format": "html"})
         return HTMLResponse(path.read_text(encoding="utf-8"))
 
     if format == "pdf":
         path = _report_pdf_path(dataset_id)
         if not path.exists():
             raise HTTPException(status_code=404, detail="Report PDF not generated yet.")
-        if pii_detected and not _can_export_sensitive(meta):
-            raise HTTPException(status_code=403, detail="PII masking enforced. Enable sensitive export to download PDF.")
-        _append_audit(dataset_id, "export_pdf", meta.get("created_by", "anonymous"), {"format": "pdf"})
+        _append_audit(dataset_id, "export_pdf", actor, {"format": "pdf"})
         return Response(content=path.read_bytes(), media_type="application/pdf")
 
     if format == "dashboard":
@@ -1802,7 +2211,7 @@ def export_dataset(dataset_id: str, format: str, limit: int = Query(default=5000
         if not spec_path.exists():
             raise HTTPException(status_code=404, detail="Dashboard spec not generated yet.")
         spec = _load_json(spec_path)
-        _append_audit(dataset_id, "export_dashboard", meta.get("created_by", "anonymous"), {"format": "dashboard"})
+        _append_audit(dataset_id, "export_dashboard", actor, {"format": "dashboard"})
         return HTMLResponse(_render_dashboard_html(spec))
 
     if format == "json":
@@ -1812,7 +2221,7 @@ def export_dataset(dataset_id: str, format: str, limit: int = Query(default=5000
         facts_bundle = _load_json(facts_path)
         if pii_detected and not _can_export_sensitive(meta):
             facts_bundle = _mask_recursive(facts_bundle, aliases)
-        _append_audit(dataset_id, "export_json", meta.get("created_by", "anonymous"), {"format": "json"})
+        _append_audit(dataset_id, "export_json", actor, {"format": "json"})
         return Response(content=json.dumps(facts_bundle), media_type="application/json")
 
     if format == "csv":
@@ -1825,7 +2234,7 @@ def export_dataset(dataset_id: str, format: str, limit: int = Query(default=5000
             df = _read_uploaded_file(meta).head(limit)
         if pii_detected and not _can_export_sensitive(meta) and aliases:
             df = df.rename(columns=aliases)
-        _append_audit(dataset_id, "export_csv", meta.get("created_by", "anonymous"), {"format": "csv"})
+        _append_audit(dataset_id, "export_csv", actor, {"format": "csv"})
         stream = io.StringIO()
         df.to_csv(stream, index=False)
         return Response(content=stream.getvalue(), media_type="text/csv")

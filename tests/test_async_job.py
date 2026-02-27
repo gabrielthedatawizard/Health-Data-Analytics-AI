@@ -26,4 +26,4 @@ def test_generate_facts_task():
     assert "facts_path" in result
     status = get_job(job["job_id"])
     assert status is not None
-    assert status["status"] == "completed"
+    assert status["status"] == "succeeded"
