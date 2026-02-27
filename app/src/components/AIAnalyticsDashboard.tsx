@@ -47,8 +47,15 @@ type AskPayload = {
 };
 
 const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
-const IS_LOCAL_HOST = typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
-const API_BASE = ENV_API_BASE || (IS_LOCAL_HOST ? 'http://localhost:8000' : '');
+function computeDefaultApiBase(): string {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  const { protocol, hostname } = window.location;
+  return `${protocol}//${hostname}:8000`;
+}
+
+const API_BASE = ENV_API_BASE || computeDefaultApiBase();
 
 async function readJson<T>(response: Response): Promise<T> {
   const rawBody = await response.text();
@@ -77,12 +84,12 @@ async function readJson<T>(response: Response): Promise<T> {
       typeof (payload as { detail?: unknown }).detail === 'string'
         ? (payload as { detail: string }).detail
         : `Request failed with HTTP ${response.status}.`;
-    throw new Error(detail);
+    throw new Error(`${detail} [${response.status} ${response.url}]`);
   }
 
   if (payload === null) {
     throw new Error(
-      `Empty response from API (HTTP ${response.status}). Verify backend is running at ${API_BASE || 'the current origin'}.`
+      `Empty response from API (HTTP ${response.status}) at ${response.url}. Verify backend is running at ${API_BASE}.`
     );
   }
 
@@ -214,6 +221,7 @@ export function AIAnalyticsDashboard() {
         <p className="mt-2 text-sm text-muted-foreground">
           Upload a dataset, generate facts/dashboard spec, then optionally run Claude-powered insights and ask-data.
         </p>
+        <p className="mt-1 text-xs text-muted-foreground">API target: {API_BASE}</p>
 
         <form className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center" onSubmit={handleUploadAndAnalyze}>
           <input
