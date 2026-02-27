@@ -41,9 +41,203 @@ warnings.filterwarnings("ignore")
 
 _MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
+SYSTEM_IDENTITY = """
+You are HealthIQ, an expert AI data analyst specializing in health sector analytics.
+You have the analytical depth of a senior WHO/USAID data analyst, the communication
+clarity of a medical communicator, and the technical precision of a biostatistician.
+
+Your core operating principles:
+1. FACTS FIRST - You ONLY produce claims grounded in the provided facts_bundle.
+   If a number is not in your facts, you do NOT produce it.
+2. DOMAIN AWARENESS - You understand OPD visits, ANC attendance, HMIS reporting,
+   DHIS2 indicators, facility-level data, and the health system hierarchy.
+3. UNCERTAINTY HONESTY - You express confidence levels and flag data quality issues.
+4. ACTION ORIENTATION - Every insight ends with a clear, actionable implication.
+5. CAUSAL HUMILITY - You NEVER claim causation. You say "is associated with",
+   "may indicate", "correlates with", "appears to suggest".
+"""
+
+DOMAIN_TEMPLATES = {
+    "hmis_monthly_review": """
+You are analyzing a monthly HMIS (Health Management Information System) report.
+Structure your analysis using this framework:
+1. SERVICE DELIVERY: OPD, ANC, Immunization, delivery counts vs targets
+2. DATA QUALITY: Completeness and timeliness of reporting
+3. TREND ANALYSIS: Month-over-month and year-over-year comparisons
+4. GEOGRAPHIC PERFORMANCE: District/facility rankings and outliers
+5. EQUITY FLAGS: Performance disparities across population groups
+6. PROGRAM ALERTS: Any indicator below 80% of national target
+Use health sector terminology: facilities, catchment populations, service coverage rates.
+""",
+    "disease_surveillance": """
+You are analyzing disease surveillance data. Apply epidemiological frameworks:
+- Calculate attack rates, case fatality ratios, and incidence rates where denominators exist
+- Identify epidemic curves if time series data is present
+- Flag geographic clustering if location data is present
+- Apply WHO outbreak thresholds where available in provided context
+- Express findings with appropriate epidemiological uncertainty
+- NEVER make clinical recommendations - refer to health authorities
+""",
+    "health_facility_assessment": """
+You are analyzing facility-level performance data. Apply WHO Health Systems Framework:
+- SERVICE DELIVERY: Volume, quality proxies, utilization rates
+- HEALTH WORKFORCE: Staff ratios, productivity metrics if available
+- HEALTH INFORMATION: Data completeness, reporting timeliness
+- MEDICAL PRODUCTS: Stock availability, stock-out rates
+- FINANCING: Cost per visit and financial efficiency metrics if available
+Compare facilities against national standards and peer facilities.
+""",
+    "general_analytics": """
+You are analyzing a dataset with no specific domain context detected.
+Apply standard analytics best practices:
+- Descriptive statistics with appropriate precision
+- Trend identification with conservative language
+- Segment comparisons with statistical context
+- Anomaly detection with severity rating
+Be domain-agnostic but precision-focused.
+""",
+}
+
 
 class ClaudeUnavailableError(RuntimeError):
     """Raised when Anthropic client cannot be used in the current environment."""
+
+
+class SmartMemory:
+    """
+    Persistent business context store.
+    In production: replace local JSON with Redis/Postgres.
+    """
+
+    def __init__(self, session_id: str, storage_path: str = "data_store/memory"):
+        self.session_id = session_id
+        self.path = Path(storage_path) / f"{session_id}_memory.json"
+        self._store = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {
+            "business_glossary": {},
+            "kpi_definitions": {},
+            "saved_segments": {},
+            "saved_queries": [],
+            "analysis_history": [],
+            "domain_context": "",
+        }
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self._store, indent=2), encoding="utf-8")
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._store))
+
+    def define(self, term: str, definition: str) -> None:
+        self._store["business_glossary"][term] = definition
+        self.save()
+
+    def define_kpi(
+        self,
+        name: str,
+        formula: str,
+        unit: str,
+        target: float | int | str | None = None,
+        direction: str = "higher_is_better",
+    ) -> None:
+        self._store["kpi_definitions"][name] = {
+            "formula": formula,
+            "unit": unit,
+            "target": target,
+            "direction": direction,
+        }
+        self.save()
+
+    def define_segment(self, name: str, criteria: str) -> None:
+        self._store["saved_segments"][name] = criteria
+        self.save()
+
+    def save_query(self, question: str, answer_summary: str, facts_keys: list[str] | None = None) -> dict[str, Any]:
+        query = {
+            "id": f"q_{len(self._store['saved_queries']) + 1:03d}",
+            "question": question,
+            "answer_summary": answer_summary,
+            "facts_keys": facts_keys or [],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._store["saved_queries"].append(query)
+        if len(self._store["saved_queries"]) > 50:
+            self._store["saved_queries"] = self._store["saved_queries"][-50:]
+        self.save()
+        return query
+
+    def add_history(self, question: str, answer_summary: str, confidence: str) -> None:
+        self._store["analysis_history"].append(
+            {
+                "question": question,
+                "answer_summary": answer_summary,
+                "confidence": confidence,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if len(self._store["analysis_history"]) > 30:
+            self._store["analysis_history"] = self._store["analysis_history"][-30:]
+        self.save()
+
+    def list_queries(self) -> list[dict[str, Any]]:
+        return list(self._store.get("saved_queries", []))
+
+    def get_query(self, query_id: str) -> dict[str, Any] | None:
+        for query in self._store.get("saved_queries", []):
+            if query.get("id") == query_id:
+                return query
+        return None
+
+    def as_context_string(self) -> str:
+        parts: list[str] = []
+        if self._store["business_glossary"]:
+            parts.append(f"GLOSSARY: {json.dumps(self._store['business_glossary'])}")
+        if self._store["kpi_definitions"]:
+            parts.append(f"KPI DEFINITIONS: {json.dumps(self._store['kpi_definitions'])}")
+        if self._store["saved_segments"]:
+            parts.append(f"NAMED SEGMENTS: {json.dumps(self._store['saved_segments'])}")
+        if self._store["domain_context"]:
+            parts.append(f"DOMAIN CONTEXT: {self._store['domain_context']}")
+
+        recent = self._store["analysis_history"][-3:]
+        if recent:
+            parts.append(f"RECENT ANALYSES: {json.dumps(recent)}")
+
+        if not parts:
+            return ""
+
+        return (
+            "\n=== YOUR SAVED BUSINESS CONTEXT ===\n"
+            + "\n".join(parts)
+            + "\n=== USE THESE DEFINITIONS IN YOUR ANALYSIS ===\n"
+        )
+
+
+def build_full_system_prompt(base_system: str, memory: SmartMemory | None, template_key: str) -> str:
+    memory_context = memory.as_context_string() if memory else ""
+    return "\n\n".join(
+        [
+            SYSTEM_IDENTITY,
+            memory_context,
+            DOMAIN_TEMPLATES.get(template_key, DOMAIN_TEMPLATES["general_analytics"]),
+            base_system,
+            """
+FINAL RULES (Non-negotiable):
+- NEVER produce a number not in the facts_bundle
+- ALWAYS cite fact_key paths for claim grounding when possible
+- ALWAYS include confidence rating
+- ALWAYS suggest follow-up analytical questions
+""",
+        ]
+    ).strip()
 
 
 def _get_client() -> Any:
@@ -538,26 +732,87 @@ Output a JSON object with keys:
 """
 
 
-def generate_insights(facts: dict) -> dict:
+def _select_domain_template(facts: dict, query_plan: dict[str, Any] | None = None) -> str:
+    if query_plan and query_plan.get("template") in DOMAIN_TEMPLATES:
+        return str(query_plan["template"])
+    hc = facts.get("health_context", {})
+    if hc.get("service_columns"):
+        return "hmis_monthly_review"
+    return "general_analytics"
+
+
+def generate_insights_v2(facts: dict, memory: SmartMemory | None = None) -> dict:
     """
-    Claude summarizes the facts bundle into structured insights.
-    Validator checks that every claim maps to a facts key.
+    Memory-injected, query-planned insight generation.
     """
-    # Strip large nested data to keep prompt focused
+    memory_context = memory.as_context_string() if memory else ""
     slim_facts = _slim_facts_for_prompt(facts)
 
-    raw = _claude(
-        system=_INSIGHT_SYSTEM,
-        user=f"Here is the facts_bundle:\n\n{json.dumps(slim_facts, indent=2)}\n\nGenerate insights.",
-    )
+    plan_system = build_full_system_prompt(_INSIGHT_SYSTEM, memory, "general_analytics")
+    plan_prompt = f"""
+{memory_context}
 
+Facts bundle:
+{json.dumps(slim_facts, indent=2)}
+
+Before generating insights, produce a query plan:
+- What are the 3 most analytically significant aspects of this dataset?
+- Which facts_bundle keys are most critical?
+- What domain template applies? (hmis_monthly_review / disease_surveillance / general_analytics)
+- What is the data quality situation?
+
+Output JSON: {{"intent":"...","critical_keys":[...],"template":"...","quality_flag":"..."}}
+"""
+    plan_raw = _claude(system=plan_system, user=plan_prompt, max_tokens=700)
+    plan_candidate = _safe_json_parse(plan_raw)
+    query_plan = plan_candidate if isinstance(plan_candidate, dict) else {}
+
+    template_key = _select_domain_template(facts, query_plan)
+    full_system = build_full_system_prompt(_INSIGHT_SYSTEM, memory, template_key)
+    insight_prompt = f"""
+{memory_context}
+
+Query Plan: {json.dumps(query_plan, indent=2)}
+
+Facts Bundle:
+{json.dumps(slim_facts, indent=2)}
+
+Generate full structured insights. Output JSON with:
+- "executive_summary": string
+- "key_findings": [{{"finding": str, "fact_key": str, "value": str, "action": str}}]
+- "proactive_alerts": [{{"type": str, "severity": str, "title": str, "detail": str}}]
+- "cohort_narrative": string (if time data exists)
+- "data_quality_notes": [str]
+- "limitations": [str]
+- "confidence": "High"|"Medium"|"Low"
+- "follow_up_questions": [str, str, str]
+"""
+    raw = _claude(system=full_system, user=insight_prompt)
     parsed = _safe_json_parse(raw)
-    if not parsed:
-        return {"error": "Failed to parse insight JSON", "raw": raw}
+    if not isinstance(parsed, dict):
+        return {"error": "Parse failed", "raw": raw}
 
-    # Validate: every numeric claim must trace to a fact key
-    validated = _validate_claims(parsed, facts)
-    return validated
+    parsed["query_plan"] = query_plan
+    parsed["memory_applied"] = bool(memory_context)
+
+    if memory and parsed.get("executive_summary"):
+        critical = query_plan.get("critical_keys", [])
+        memory.save_query(
+            "auto_insight_generation",
+            str(parsed.get("executive_summary", "")),
+            critical if isinstance(critical, list) else [],
+        )
+        memory.add_history(
+            "auto_insight_generation",
+            str(parsed.get("executive_summary", ""))[:200],
+            str(parsed.get("confidence", "Medium")),
+        )
+
+    return _validate_claims(parsed, facts)
+
+
+def generate_insights(facts: dict, memory: SmartMemory | None = None) -> dict:
+    return generate_insights_v2(facts, memory=memory)
 
 
 def _slim_facts_for_prompt(facts: dict) -> dict:
@@ -597,20 +852,20 @@ def _validate_claims(parsed: dict, facts: dict) -> dict:
     return parsed
 
 
-def _safe_json_parse(text: str) -> dict | None:
+def _safe_json_parse(text: str) -> Any | None:
     try:
-        # Strip markdown code fences
         text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to extract first JSON object
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            match = re.search(pattern, text, re.DOTALL)
+            if not match:
+                continue
             try:
                 return json.loads(match.group())
             except Exception:
-                return None
+                continue
     return None
 
 
@@ -636,23 +891,236 @@ Output JSON with keys:
 """
 
 
-def ask_data(question: str, facts: dict) -> dict:
+def ask_data_v2(question: str, facts: dict, memory: SmartMemory | None = None) -> dict:
     """
-    Natural language → answer grounded in facts bundle.
+    Memory + query-planned ask-your-data flow.
     """
+    memory_context = memory.as_context_string() if memory else ""
     slim_facts = _slim_facts_for_prompt(facts)
+    template_key = _select_domain_template(facts)
+    system = build_full_system_prompt(_ASK_SYSTEM, memory, template_key) + """
 
-    raw = _claude(
-        system=_ASK_SYSTEM,
-        user=f"Question: {question}\n\nFacts bundle:\n{json.dumps(slim_facts, indent=2)}",
-    )
+You are answering a specific analyst question. Follow this EXACT process:
+STEP 1: Classify intent (trend_analysis|comparison|outlier_detection|root_cause|forecast|cohort_analysis|kpi_check|definition_lookup)
+STEP 2: Map required facts_bundle keys
+STEP 3: Check if computation is needed - if yes, flag it
+STEP 4: Assess confidence
+STEP 5: Answer
+
+Output ONLY JSON:
+{
+  "query_plan": {"intent": str, "facts_keys_used": [...], "computation_required": bool, "confidence": str},
+  "answer": str,
+  "facts_used": [...],
+  "chart_recommendation": {"type": str, "title": str, "data_key": str},
+  "follow_up_questions": [str, str],
+  "action_implication": str,
+  "confidence": "High"|"Medium"|"Low",
+  "needs_analysis": bool
+}
+"""
+    user = f"""
+{memory_context}
+
+Question: {question}
+
+Facts bundle:
+{json.dumps(slim_facts, indent=2)}
+"""
+    raw = _claude(system=system, user=user)
 
     parsed = _safe_json_parse(raw)
-    if not parsed:
+    if not isinstance(parsed, dict):
         return {"answer": raw, "confidence": "Low", "facts_used": [], "needs_analysis": True}
 
     parsed["question"] = question
+
+    if memory and parsed.get("answer") and parsed.get("confidence") in ("High", "Medium"):
+        facts_used = parsed.get("facts_used", [])
+        memory.save_query(
+            question,
+            str(parsed["answer"])[:200],
+            facts_used if isinstance(facts_used, list) else [],
+        )
+        memory.add_history(question, str(parsed["answer"])[:200], str(parsed.get("confidence", "Medium")))
+
     return parsed
+
+
+def ask_data(question: str, facts: dict, memory: SmartMemory | None = None) -> dict:
+    return ask_data_v2(question, facts, memory=memory)
+
+
+def run_proactive_radar(facts: dict, memory: SmartMemory | None = None) -> dict:
+    """
+    Proactively scan facts and surface critical findings.
+    """
+    memory_context = memory.as_context_string() if memory else ""
+    slim = _slim_facts_for_prompt(facts)
+    template_key = _select_domain_template(facts)
+    system = build_full_system_prompt(
+        """
+You are proactively scanning a health dataset for the TOP 3 most important
+findings a program manager needs to know right now.
+
+Scan categories:
+- ANOMALY: metric >2 std devs from its trend
+- THRESHOLD_BREACH: KPI below national target or WHO benchmark
+- EARLY_WARNING: developing negative trend
+- WIN: significant positive improvement
+- DATA_QUALITY_ALERT: missing data patterns
+
+Output JSON array of findings:
+[
+  {
+    "type": "anomaly|threshold_breach|early_warning|win|data_quality",
+    "severity": "critical|warning|info",
+    "title": "Max 10 word headline",
+    "detail": "2-3 sentences with specific values from facts",
+    "fact_key": "facts_bundle.path.to.supporting.data",
+    "recommended_action": "One concrete next step",
+    "chart_type": "line|bar|kpi_card|table"
+  }
+]
+Only include findings backed by facts. Max 5 findings.
+""",
+        memory,
+        template_key,
+    )
+    user = f"""
+{memory_context}
+
+Facts bundle to scan:
+{json.dumps(slim, indent=2)}
+"""
+    raw = _claude(system=system, user=user, max_tokens=1600)
+    parsed = _safe_json_parse(raw)
+    if isinstance(parsed, list):
+        return {"alerts": parsed, "scanned_at": datetime.now(timezone.utc).isoformat()}
+    if isinstance(parsed, dict) and isinstance(parsed.get("alerts"), list):
+        parsed.setdefault("scanned_at", datetime.now(timezone.utc).isoformat())
+        return parsed
+    return {"alerts": [], "raw": raw, "scanned_at": datetime.now(timezone.utc).isoformat()}
+
+
+def build_cohort_analysis(df: pd.DataFrame, facts: dict, memory: SmartMemory | None = None) -> dict:
+    """
+    Build simple cohort curves from detected time and metric columns.
+    """
+    hc = facts.get("health_context", {})
+    time_cols = hc.get("time_columns", [])
+    categorical_cols = [c["name"] for c in facts.get("schema", []) if c.get("inferred_type") == "categorical"]
+    numeric_cols = [c["name"] for c in facts.get("schema", []) if c.get("inferred_type") == "numeric"]
+
+    if not time_cols or not numeric_cols:
+        return {"error": "No time or numeric columns found for cohort analysis"}
+
+    time_col = time_cols[0]
+    metric_col = numeric_cols[0]
+
+    cohort_df = df.copy()
+    cohort_df[time_col] = pd.to_datetime(cohort_df[time_col], errors="coerce")
+    cohort_df = cohort_df.dropna(subset=[time_col])
+    if cohort_df.empty:
+        return {"error": "No valid datetime values for cohort analysis"}
+
+    cohort_df["_cohort_period"] = cohort_df[time_col].dt.to_period("M")
+    cohort_data: dict[str, list[dict[str, Any]]] = {}
+
+    def _attach_retention(monthly_df: pd.DataFrame) -> pd.DataFrame:
+        monthly_df = monthly_df.copy()
+        if len(monthly_df) > 0 and monthly_df["value"].iloc[0] != 0:
+            baseline = monthly_df["value"].iloc[0]
+            monthly_df["retention_pct"] = (monthly_df["value"] / baseline * 100).round(1)
+        return monthly_df
+
+    if categorical_cols:
+        segment_col = categorical_cols[0]
+        for segment in cohort_df[segment_col].dropna().unique():
+            seg_df = cohort_df[cohort_df[segment_col] == segment]
+            monthly = seg_df.groupby("_cohort_period")[metric_col].sum().reset_index()
+            monthly.columns = ["period", "value"]
+            monthly["period"] = monthly["period"].astype(str)
+            monthly = _attach_retention(monthly)
+            cohort_data[str(segment)] = monthly.to_dict(orient="records")
+    else:
+        monthly = cohort_df.groupby("_cohort_period")[metric_col].sum().reset_index()
+        monthly.columns = ["period", "value"]
+        monthly["period"] = monthly["period"].astype(str)
+        monthly = _attach_retention(monthly)
+        cohort_data["overall"] = monthly.to_dict(orient="records")
+
+    memory_context = memory.as_context_string() if memory else ""
+    slim_cohort = {k: v[:12] for k, v in cohort_data.items()}
+    narrative_system = build_full_system_prompt(
+        "You narrate cohort analysis findings in 3-5 sentences using specific values.",
+        memory,
+        _select_domain_template(facts),
+    )
+    narrative_user = f"""
+{memory_context}
+
+Cohort data:
+{json.dumps(slim_cohort, indent=2)}
+
+Narrate key cohort insights and one action implication.
+"""
+    narrative_raw = _claude(system=narrative_system, user=narrative_user, max_tokens=700)
+    return {
+        "cohort_metric": metric_col,
+        "cohort_time_col": time_col,
+        "curves": cohort_data,
+        "narrative": narrative_raw,
+        "segments_analyzed": list(cohort_data.keys()),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def evaluate_answer_accuracy(question: str, ai_answer: str, ground_truth: dict[str, Any]) -> dict:
+    """
+    Evaluate answer quality against provided ground truth values.
+    """
+    system = build_full_system_prompt(
+        """
+You are evaluating whether an AI-generated analytics answer is accurate.
+Evaluate along 4 dimensions (0-100 each):
+1. factual_accuracy
+2. completeness
+3. reasoning_quality
+4. actionability
+
+For factual accuracy, flag every discrepancy:
+{
+  "claimed": "...",
+  "actual": "...",
+  "severity": "minor|major|critical"
+}
+
+Output JSON:
+{
+  "overall_score": 0-100,
+  "factual_accuracy": 0-100,
+  "completeness": 0-100,
+  "reasoning_quality": 0-100,
+  "actionability": 0-100,
+  "discrepancies": [...],
+  "verdict": "pass|needs_review|fail",
+  "correction": "string"
+}
+""",
+        None,
+        "general_analytics",
+    )
+    user = f"""
+Question: {question}
+AI Answer: {ai_answer}
+Ground Truth: {json.dumps(ground_truth, indent=2)}
+"""
+    raw = _claude(system=system, user=user, max_tokens=1200)
+    result = _safe_json_parse(raw)
+    if not isinstance(result, dict):
+        return {"verdict": "eval_failed", "raw": raw}
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -677,11 +1145,13 @@ Use cautious, professional language. Include uncertainty where relevant.
 """
 
 
-def generate_report(facts: dict, insights: dict) -> str:
+def generate_report(facts: dict, insights: dict, memory: SmartMemory | None = None) -> str:
     """
     Returns an HTML report string.
     """
     slim = _slim_facts_for_prompt(facts)
+    template_key = _select_domain_template(facts)
+    system_prompt = build_full_system_prompt(_REPORT_SYSTEM, memory, template_key)
 
     prompt = (
         f"Facts:\n{json.dumps(slim, indent=2)}\n\n"
@@ -689,7 +1159,7 @@ def generate_report(facts: dict, insights: dict) -> str:
         "Write the full HTML report body (no <html>/<head> wrapper, just the body content)."
     )
 
-    html_body = _claude(system=_REPORT_SYSTEM, user=prompt, max_tokens=4096)
+    html_body = _claude(system=system_prompt, user=prompt, max_tokens=4096)
 
     # Wrap in a minimal HTML shell
     full_html = f"""<!DOCTYPE html>
@@ -743,6 +1213,7 @@ class AIAnalyticsSession:
     def __init__(self):
         self.session_id = f"sess_{uuid.uuid4().hex[:8]}"
         self.results: dict = {}
+        self.memory = SmartMemory(session_id=self.session_id)
 
     def run(self, file_path: str, question: str | None = None) -> dict:
         """
@@ -767,15 +1238,15 @@ class AIAnalyticsSession:
         dash_spec  = build_dashboard_spec(facts, chart_recs)
 
         print(f"[{self.session_id}] 🤖 Generating AI insights (Claude)...")
-        insights   = generate_insights(facts)
+        insights   = generate_insights(facts, self.memory)
 
         print(f"[{self.session_id}] 📝 Generating report (Claude)...")
-        report_html = generate_report(facts, insights)
+        report_html = generate_report(facts, insights, self.memory)
 
         ask_result = None
         if question:
             print(f"[{self.session_id}] 💬 Answering: '{question}'...")
-            ask_result = ask_data(question, facts)
+            ask_result = ask_data(question, facts, self.memory)
 
         self.results = {
             "session_id":    self.session_id,

@@ -46,14 +46,46 @@ type AskPayload = {
   needs_analysis?: boolean;
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
+const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
+const IS_LOCAL_HOST = typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
+const API_BASE = ENV_API_BASE || (IS_LOCAL_HOST ? 'http://localhost:8000' : '');
 
 async function readJson<T>(response: Response): Promise<T> {
-  const payload = await response.json();
+  const rawBody = await response.text();
+  const trimmed = rawBody.trim();
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  let payload: unknown = null;
+
+  if (trimmed) {
+    const looksLikeJson = contentType.includes('application/json') || trimmed.startsWith('{') || trimmed.startsWith('[');
+    if (looksLikeJson) {
+      try {
+        payload = JSON.parse(trimmed);
+      } catch {
+        throw new Error(`Invalid JSON response (HTTP ${response.status}).`);
+      }
+    } else {
+      payload = { detail: trimmed };
+    }
+  }
+
   if (!response.ok) {
-    const detail = typeof payload?.detail === 'string' ? payload.detail : 'Request failed.';
+    const detail =
+      payload &&
+      typeof payload === 'object' &&
+      'detail' in payload &&
+      typeof (payload as { detail?: unknown }).detail === 'string'
+        ? (payload as { detail: string }).detail
+        : `Request failed with HTTP ${response.status}.`;
     throw new Error(detail);
   }
+
+  if (payload === null) {
+    throw new Error(
+      `Empty response from API (HTTP ${response.status}). Verify backend is running at ${API_BASE || 'the current origin'}.`
+    );
+  }
+
   return payload as T;
 }
 

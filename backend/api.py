@@ -4,6 +4,7 @@ FastAPI REST API for the AI analytics service from files (1).zip.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -17,20 +18,25 @@ from pydantic import BaseModel, Field
 from backend.ai_analytics_service import (
     AIAnalyticsSession,
     ClaudeUnavailableError,
+    SmartMemory,
     ask_data,
+    build_cohort_analysis,
     build_dashboard_spec,
     build_facts_bundle,
+    evaluate_answer_accuracy,
     generate_insights,
     generate_report,
     ingest_file,
     profile_dataset,
     recommend_charts,
+    run_proactive_radar,
 )
 
 router = APIRouter(tags=["ai-analytics-v1"])
 
 # In-memory session store (replace with Redis/Postgres in production)
 _SESSIONS: dict[str, dict[str, Any]] = {}
+_MEMORY_PATH = os.getenv("AI_MEMORY_PATH", "data_store/memory")
 
 
 class SessionCreate(BaseModel):
@@ -54,6 +60,25 @@ class ReportRequest(BaseModel):
     sections: list[str] = Field(default_factory=lambda: ["quality", "kpis", "trends", "limitations"])
 
 
+class MemoryDefineRequest(BaseModel):
+    term: str
+    definition: str
+
+
+class MemoryDefineKPIRequest(BaseModel):
+    name: str
+    formula: str
+    unit: str
+    target: float | str | None = None
+    direction: str = "higher_is_better"
+
+
+class EvalRequest(BaseModel):
+    question: str
+    ai_answer: str
+    ground_truth: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/api/v1/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok", "service": "ai-analytics", "version": "1.0.0"}
@@ -63,6 +88,7 @@ def health_check() -> dict[str, str]:
 def create_session(body: SessionCreate) -> dict[str, str]:
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
     dataset_id = f"ds_{uuid.uuid4().hex[:8]}"
+    memory = SmartMemory(session_id=session_id, storage_path=_MEMORY_PATH)
     _SESSIONS[session_id] = {
         "session_id": session_id,
         "dataset_id": dataset_id,
@@ -77,6 +103,7 @@ def create_session(body: SessionCreate) -> dict[str, str]:
         "dashboard_spec": None,
         "insights": None,
         "report_html": None,
+        "memory": memory,
     }
     return {"session_id": session_id, "dataset_id": dataset_id}
 
@@ -94,7 +121,10 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> dict[str
             tmp.write(await file.read())
             tmp_path = Path(tmp.name)
 
-        ingested = ingest_file(tmp_path)
+        try:
+            ingested = ingest_file(tmp_path)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"Failed to parse uploaded file: {exc}") from exc
         sess = _SESSIONS[session_id]
         sess["df"] = ingested["df"]
         sess["dataset_id"] = ingested["dataset_id"]
@@ -175,7 +205,8 @@ def get_dashboard(session_id: str) -> dict[str, Any]:
 def create_insights(session_id: str) -> dict[str, Any]:
     sess = _assert_session_with_data(session_id)
     _ensure_facts(sess, session_id)
-    insights = _run_llm(generate_insights, sess["facts"])
+    memory = _get_memory(sess, session_id)
+    insights = _run_llm(generate_insights, sess["facts"], memory)
     sess["insights"] = insights
     sess["state"] = "insights_generated"
     return {"session_id": session_id, "insights": insights}
@@ -186,7 +217,8 @@ def ask_question(session_id: str, body: AskRequest) -> dict[str, Any]:
     _ = body.mode
     sess = _assert_session_with_data(session_id)
     _ensure_facts(sess, session_id)
-    result = _run_llm(ask_data, body.question, sess["facts"])
+    memory = _get_memory(sess, session_id)
+    result = _run_llm(ask_data, body.question, sess["facts"], memory)
     return {"session_id": session_id, "question": body.question, **result}
 
 
@@ -195,9 +227,10 @@ def create_report(session_id: str, body: ReportRequest) -> dict[str, Any]:
     _ = body.template, body.sections
     sess = _assert_session_with_data(session_id)
     _ensure_facts(sess, session_id)
+    memory = _get_memory(sess, session_id)
     if not sess.get("insights"):
-        sess["insights"] = _run_llm(generate_insights, sess["facts"])
-    report_html = _run_llm(generate_report, sess["facts"], sess["insights"])
+        sess["insights"] = _run_llm(generate_insights, sess["facts"], memory)
+    report_html = _run_llm(generate_report, sess["facts"], sess["insights"], memory)
     sess["report_html"] = report_html
     sess["state"] = "report_generated"
     return {"session_id": session_id, "status": "generated", "report_html": report_html}
@@ -211,11 +244,88 @@ def view_report(session_id: str) -> HTMLResponse:
     return HTMLResponse(content=sess["report_html"])
 
 
+@router.get("/api/v1/sessions/{session_id}/memory")
+def get_memory(session_id: str) -> dict[str, Any]:
+    sess = _assert_session(session_id)
+    memory = _get_memory(sess, session_id)
+    return {"session_id": session_id, "memory": memory.to_dict()}
+
+
+@router.post("/api/v1/sessions/{session_id}/memory/define")
+def define_memory_term(session_id: str, body: MemoryDefineRequest) -> dict[str, Any]:
+    sess = _assert_session(session_id)
+    memory = _get_memory(sess, session_id)
+    memory.define(body.term, body.definition)
+    return {"session_id": session_id, "status": "saved", "memory": memory.to_dict()}
+
+
+@router.post("/api/v1/sessions/{session_id}/memory/define-kpi")
+def define_memory_kpi(session_id: str, body: MemoryDefineKPIRequest) -> dict[str, Any]:
+    sess = _assert_session(session_id)
+    memory = _get_memory(sess, session_id)
+    memory.define_kpi(
+        name=body.name,
+        formula=body.formula,
+        unit=body.unit,
+        target=body.target,
+        direction=body.direction,
+    )
+    return {"session_id": session_id, "status": "saved", "memory": memory.to_dict()}
+
+
+@router.get("/api/v1/sessions/{session_id}/radar")
+def proactive_radar(session_id: str) -> dict[str, Any]:
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    memory = _get_memory(sess, session_id)
+    radar = _run_llm(run_proactive_radar, sess["facts"], memory)
+    return {"session_id": session_id, **radar}
+
+
+@router.get("/api/v1/sessions/{session_id}/cohorts")
+def cohort_analysis(session_id: str) -> dict[str, Any]:
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    memory = _get_memory(sess, session_id)
+    cohort = _run_llm(build_cohort_analysis, sess["df"], sess["facts"], memory)
+    return {"session_id": session_id, "cohort_analysis": cohort}
+
+
+@router.post("/api/v1/sessions/{session_id}/eval")
+def eval_answer(session_id: str, body: EvalRequest) -> dict[str, Any]:
+    _assert_session(session_id)
+    result = _run_llm(evaluate_answer_accuracy, body.question, body.ai_answer, body.ground_truth)
+    return {"session_id": session_id, "evaluation": result}
+
+
+@router.get("/api/v1/sessions/{session_id}/queries")
+def list_saved_queries(session_id: str) -> dict[str, Any]:
+    sess = _assert_session(session_id)
+    memory = _get_memory(sess, session_id)
+    return {"session_id": session_id, "saved_queries": memory.list_queries()}
+
+
+@router.post("/api/v1/sessions/{session_id}/queries/{query_id}/rerun")
+def rerun_saved_query(session_id: str, query_id: str) -> dict[str, Any]:
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    memory = _get_memory(sess, session_id)
+    query = memory.get_query(query_id)
+    if not query:
+        raise HTTPException(status_code=404, detail=f"Query '{query_id}' not found.")
+    question = str(query.get("question", "")).strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Saved query has no question text.")
+    result = _run_llm(ask_data, question, sess["facts"], memory)
+    return {"session_id": session_id, "query_id": query_id, "question": question, "result": result}
+
+
 @router.post("/api/v1/sessions/{session_id}/run-full-pipeline")
 def run_full_pipeline(session_id: str, question: str | None = None) -> dict[str, Any]:
     sess = _assert_session_with_data(session_id)
     df = sess["df"]
     dataset_id = sess["dataset_id"]
+    memory = _get_memory(sess, session_id)
 
     profile = profile_dataset(df)
     sess["profile"] = profile
@@ -229,13 +339,13 @@ def run_full_pipeline(session_id: str, question: str | None = None) -> dict[str,
     dash_spec = build_dashboard_spec(facts, chart_recs)
     sess["dashboard_spec"] = dash_spec
 
-    insights = _run_llm(generate_insights, facts)
+    insights = _run_llm(generate_insights, facts, memory)
     sess["insights"] = insights
 
-    report_html = _run_llm(generate_report, facts, insights)
+    report_html = _run_llm(generate_report, facts, insights, memory)
     sess["report_html"] = report_html
 
-    ask_result = _run_llm(ask_data, question, facts) if question else None
+    ask_result = _run_llm(ask_data, question, facts, memory) if question else None
     sess["state"] = "complete"
 
     return {
@@ -285,6 +395,15 @@ def _assert_session_with_data(session_id: str) -> dict[str, Any]:
     return sess
 
 
+def _get_memory(sess: dict[str, Any], session_id: str) -> SmartMemory:
+    memory = sess.get("memory")
+    if isinstance(memory, SmartMemory):
+        return memory
+    memory = SmartMemory(session_id=session_id, storage_path=_MEMORY_PATH)
+    sess["memory"] = memory
+    return memory
+
+
 def _ensure_facts(sess: dict[str, Any], session_id: str) -> None:
     if not sess.get("profile"):
         sess["profile"] = profile_dataset(sess["df"])
@@ -322,4 +441,3 @@ def build_standalone_app() -> FastAPI:
 
 
 app = build_standalone_app()
-
