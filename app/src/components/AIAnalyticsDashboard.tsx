@@ -51,11 +51,39 @@ function computeDefaultApiBase(): string {
   if (typeof window === 'undefined') {
     return '';
   }
-  const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:8000`;
+  const { hostname } = window.location;
+  if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    return 'http://localhost:8000';
+  }
+  return '';
 }
 
 const API_BASE = ENV_API_BASE || computeDefaultApiBase();
+const API_TARGET_LABEL = API_BASE || 'same-origin /api (set VITE_API_BASE_URL on Vercel)';
+
+function apiUrl(path: string): string {
+  return `${API_BASE}${path}`;
+}
+
+async function fetchApi(path: string, init?: RequestInit, timeoutMs = 15000): Promise<Response> {
+  const url = apiUrl(path);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(
+        `Request timed out for ${url}. If you are on Vercel, set VITE_API_BASE_URL to your deployed backend API.`,
+      );
+    }
+    throw new Error(
+      `Could not reach API at ${url}. If you are on Vercel, set VITE_API_BASE_URL to your deployed backend API.`,
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function readJson<T>(response: Response): Promise<T> {
   const rawBody = await response.text();
@@ -135,7 +163,7 @@ export function AIAnalyticsDashboard() {
     resetData();
 
     try {
-      const createResponse = await fetch(`${API_BASE}/api/v1/sessions`, {
+      const createResponse = await fetchApi('/api/v1/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: file.name }),
@@ -146,21 +174,21 @@ export function AIAnalyticsDashboard() {
 
       const form = new FormData();
       form.append('file', file);
-      const uploadResponse = await fetch(`${API_BASE}/api/v1/sessions/${created.session_id}/upload`, {
+      const uploadResponse = await fetchApi(`/api/v1/sessions/${created.session_id}/upload`, {
         method: 'POST',
         body: form,
       });
       await readJson<Record<string, unknown>>(uploadResponse);
 
-      const profileResponse = await fetch(`${API_BASE}/api/v1/sessions/${created.session_id}/profile`);
+      const profileResponse = await fetchApi(`/api/v1/sessions/${created.session_id}/profile`);
       const profilePayload = await readJson<{ profile: ProfilePayload }>(profileResponse);
       setProfile(profilePayload.profile);
 
-      const factsResponse = await fetch(`${API_BASE}/api/v1/sessions/${created.session_id}/facts`);
+      const factsResponse = await fetchApi(`/api/v1/sessions/${created.session_id}/facts`);
       const factsPayload = await readJson<{ facts_bundle: FactsPayload }>(factsResponse);
       setFacts(factsPayload.facts_bundle);
 
-      const specResponse = await fetch(`${API_BASE}/api/v1/sessions/${created.session_id}/dashboard-spec`, {
+      const specResponse = await fetchApi(`/api/v1/sessions/${created.session_id}/dashboard-spec`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ template: 'auto', include: ['kpi', 'trend', 'bar'] }),
@@ -181,7 +209,7 @@ export function AIAnalyticsDashboard() {
     setError(null);
     setIsGeneratingInsights(true);
     try {
-      const insightsResponse = await fetch(`${API_BASE}/api/v1/sessions/${sessionId}/insights`, {
+      const insightsResponse = await fetchApi(`/api/v1/sessions/${sessionId}/insights`, {
         method: 'POST',
       });
       const insightsPayload = await readJson<{ insights: InsightPayload }>(insightsResponse);
@@ -200,7 +228,7 @@ export function AIAnalyticsDashboard() {
     setError(null);
     setIsAsking(true);
     try {
-      const askResponse = await fetch(`${API_BASE}/api/v1/sessions/${sessionId}/ask`, {
+      const askResponse = await fetchApi(`/api/v1/sessions/${sessionId}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: askQuestion.trim(), mode: 'safe' }),
@@ -221,7 +249,7 @@ export function AIAnalyticsDashboard() {
         <p className="mt-2 text-sm text-muted-foreground">
           Upload a dataset, generate facts/dashboard spec, then optionally run Claude-powered insights and ask-data.
         </p>
-        <p className="mt-1 text-xs text-muted-foreground">API target: {API_BASE}</p>
+        <p className="mt-1 text-xs text-muted-foreground">API target: {API_TARGET_LABEL}</p>
 
         <form className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center" onSubmit={handleUploadAndAnalyze}>
           <input
