@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
+from backend.api import router as ai_analytics_router
 from backend.cache import CacheManager
 from backend.jobs import create_job, get_job, list_jobs, update_job
 from backend.llm_client import LLMClient, create_llm_client_from_env
@@ -71,6 +72,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(ai_analytics_router)
 
 
 class CreateSessionRequest(BaseModel):

@@ -1,0 +1,21 @@
+# AI Analytics Service — Python Dependencies
+# Install: pip install -r requirements-ai-service.txt
+
+# Core analytics
+pandas>=2.1.0
+numpy>=1.26.0
+openpyxl>=3.1.2      # XLSX support
+
+# AI SDK
+anthropic>=0.40.0
+
+# API framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9    # file uploads
+
+# Optional (recommended for production performance)
+# polars>=0.20.0           # faster than pandas for large files
+# duckdb>=0.10.0           # SQL over dataframes
+# celery>=5.3.0            # async job queues
+# redis>=5.0.0             # caching + queues

@@ -30,6 +30,7 @@ const viewTitles: Record<ViewType, string> = {
   upload: 'Data Upload',
   datasets: 'Dataset Management',
   insights: 'AI Insights',
+  ai_analytics: 'AI Analytics Engine',
   settings: 'Settings',
 };
 
@@ -76,7 +77,7 @@ export function Header({ currentView, onSearchClick, onViewChange, onLogout }: H
         <Button 
           variant="outline" 
           className="gap-2 border-health-mint/30 text-health-mint hover:bg-health-mint/10"
-          onClick={() => onViewChange('insights')}
+          onClick={() => onViewChange('ai_analytics')}
         >
           <Sparkles className="w-4 h-4" />
           <span className="hidden sm:inline">Ask AI</span>

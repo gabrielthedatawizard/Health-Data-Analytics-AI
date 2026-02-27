@@ -7,7 +7,8 @@ import {
   ChevronLeft, 
   ChevronRight,
   Activity,
-  Shield
+  Shield,
+  Sparkles
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { ViewType } from '@/App';
@@ -24,6 +25,7 @@ const menuItems = [
   { id: 'upload' as ViewType, label: 'Data Upload', icon: Upload },
   { id: 'datasets' as ViewType, label: 'Datasets', icon: Database },
   { id: 'insights' as ViewType, label: 'AI Insights', icon: Lightbulb },
+  { id: 'ai_analytics' as ViewType, label: 'AI Analytics', icon: Sparkles },
 ];
 
 const bottomItems = [

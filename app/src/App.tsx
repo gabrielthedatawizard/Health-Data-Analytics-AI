@@ -7,11 +7,12 @@ import { InsightsPanel } from './components/InsightsPanel';
 import { DatasetsView } from './components/DatasetsView';
 import { Settings } from './components/Settings';
 import { SearchModal } from './components/SearchModal';
+import { AIAnalyticsDashboard } from './components/AIAnalyticsDashboard';
 import { LandingPage } from './landing/LandingPage';
 import { I18nProvider } from './lib/i18n';
 import { AnalyticsProvider } from './lib/analytics-context';
 
-export type ViewType = 'dashboard' | 'upload' | 'datasets' | 'insights' | 'settings';
+export type ViewType = 'dashboard' | 'upload' | 'datasets' | 'insights' | 'ai_analytics' | 'settings';
 
 function AppContent() {
   const [currentView, setCurrentView] = useState<ViewType>('dashboard');
@@ -54,6 +55,8 @@ function AppContent() {
         return <InsightsPanel />;
       case 'settings':
         return <Settings onLogout={handleLogout} />;
+      case 'ai_analytics':
+        return <AIAnalyticsDashboard />;
       default:
         return <Dashboard />;
     }
