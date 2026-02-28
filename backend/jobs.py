@@ -38,12 +38,12 @@ def create_job(job_type: str, dataset_id: str, payload: dict[str, Any], path: Pa
         "type": job_type,
         "dataset_id": dataset_id,
         "status": "queued",
-        "progress": 0.0,
+        "progress": 0,
         "created_at": now,
         "updated_at": now,
         "payload": payload,
         "result": None,
-        "artifact_links": {},
+        "artifacts": {"facts": None, "spec": None, "report_pdf": None},
         "error": None,
     }
     jobs[job_id] = job
@@ -55,9 +55,10 @@ def update_job(
     job_id: str,
     status: str,
     result: dict[str, Any] | None = None,
-    error: str | None = None,
-    progress: float | None = None,
-    artifact_links: dict[str, Any] | None = None,
+    error: str | dict[str, Any] | None = None,
+    progress: float | int | None = None,
+    artifacts: dict[str, Any] | None = None,
+    artifact_links: dict[str, Any] | None = None,  # backward compatibility
     path: Path = JOBS_PATH,
 ) -> dict[str, Any]:
     jobs = _load_jobs(path)
@@ -67,12 +68,22 @@ def update_job(
     jobs[job_id]["updated_at"] = _utc_now_iso()
     if result is not None:
         jobs[job_id]["result"] = result
-    if error is not None:
-        jobs[job_id]["error"] = error
     if progress is not None:
-        jobs[job_id]["progress"] = max(0.0, min(1.0, float(progress)))
-    if artifact_links is not None:
-        jobs[job_id]["artifact_links"] = artifact_links
+        jobs[job_id]["progress"] = int(max(0.0, min(100.0, float(progress))))
+    resolved_artifacts = artifacts if artifacts is not None else artifact_links
+    if resolved_artifacts is not None:
+        existing = jobs[job_id].get("artifacts") or {}
+        existing.update(resolved_artifacts)
+        jobs[job_id]["artifacts"] = existing
+    if error is not None:
+        if isinstance(error, str):
+            jobs[job_id]["error"] = {"code": "job_error", "message": error, "trace": ""}
+        else:
+            jobs[job_id]["error"] = {
+                "code": str(error.get("code", "job_error")),
+                "message": str(error.get("message", "Unknown job failure")),
+                "trace": str(error.get("trace", "")),
+            }
     _save_jobs(jobs, path)
     return jobs[job_id]
 

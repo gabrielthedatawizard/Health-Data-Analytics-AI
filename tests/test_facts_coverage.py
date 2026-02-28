@@ -18,7 +18,7 @@ def test_facts_bundle_has_coverage() -> None:
             "mode": "sample",
             "rows_total": 10,
             "rows_used": 5,
-            "sampling_method": "seeded_sample",
+            "sampling_method": "uniform",
             "seed": 42,
             "bias_notes": "test",
         },

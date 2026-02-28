@@ -7,12 +7,10 @@ from backend.llm_schemas import DASHBOARD_SPEC_SCHEMA
 def test_schema_validation_rejects_invalid_dashboard_spec() -> None:
     invalid_spec = {
         "title": "Spec",
-        "template": "health_core",
-        "filters": [],
         "kpis": [],
+        "filters": [],
         "charts": [],
-        "components": [],
-        # missing required facts_used
+        # missing required insight_cards
     }
     with pytest.raises(SchemaValidationError):
         validate_schema(invalid_spec, DASHBOARD_SPEC_SCHEMA)
@@ -21,16 +19,28 @@ def test_schema_validation_rejects_invalid_dashboard_spec() -> None:
 def test_facts_grounding_rejects_unknown_keys() -> None:
     output = {
         "title": "Spec",
-        "template": "health_core",
+        "kpis": [{"name": "Rows", "fact_id": "fact_missing"}],
         "filters": [],
-        "kpis": [],
         "charts": [],
-        "components": [{"type": "kpi", "title": "Rows", "citation": "facts.unknown_metric"}],
-        "facts_used": ["facts.unknown_metric"],
+        "insight_cards": [{"title": "Insight", "text": "Text", "fact_ids": ["fact_missing"]}],
     }
     facts_bundle = {
-        "facts": [{"id": "F001", "metric": "row_count", "value": 10}],
-        "facts_index": {"row_count": {"id": "F001", "value": 10}},
+        "dataset_id": "ds_test",
+        "dataset_hash": "abc",
+        "created_at": "2026-01-01T00:00:00Z",
+        "data_coverage": {
+            "mode": "full",
+            "rows_total": 10,
+            "rows_used": 10,
+            "sampling_method": "uniform",
+            "seed": None,
+            "bias_notes": "test",
+        },
+        "profiling": {"shape": {}, "dtypes": {}, "missing_percent": {}, "pii_candidates": []},
+        "quality": {"score": 90, "issues": []},
+        "kpis": [{"id": "kpi_rows", "name": "Rows", "value": 10, "unit": "rows", "facts_refs": ["fact_001"]}],
+        "insight_facts": [{"id": "fact_001", "type": "comparison", "value": {"metric": "row_count", "value": 10}, "evidence": {}}],
+        "chart_candidates": [],
     }
     with pytest.raises(FactsGroundingError):
         validate_facts_references(output, facts_bundle)

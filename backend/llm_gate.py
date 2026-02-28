@@ -37,9 +37,9 @@ def _extract_citations(output: Any) -> set[str]:
     citations: set[str] = set()
     if isinstance(output, dict):
         for key, value in output.items():
-            if key in {"citation", "citation_key"} and isinstance(value, str):
+            if key in {"citation", "citation_key", "fact_id"} and isinstance(value, str):
                 citations.add(value)
-            elif key in {"facts_used", "requested_facts", "citations"} and isinstance(value, list):
+            elif key in {"facts_used", "requested_facts", "citations", "fact_ids"} and isinstance(value, list):
                 for item in value:
                     if isinstance(item, str):
                         citations.add(item)
@@ -53,7 +53,15 @@ def _extract_citations(output: Any) -> set[str]:
 
 def _allowed_fact_keys(facts_bundle: dict[str, Any]) -> set[str]:
     keys = _collect_dot_paths(facts_bundle)
-    for fact in facts_bundle.get("facts", []):
+    for fact in facts_bundle.get("insight_facts", []):
+        fact_id = fact.get("id")
+        if isinstance(fact_id, str):
+            keys.add(fact_id)
+    for kpi in facts_bundle.get("kpis", []):
+        kpi_id = kpi.get("id")
+        if isinstance(kpi_id, str):
+            keys.add(kpi_id)
+    for fact in facts_bundle.get("facts", []):  # backward compatibility for legacy files
         fact_id = fact.get("id")
         metric = fact.get("metric")
         if isinstance(fact_id, str):

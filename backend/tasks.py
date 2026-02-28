@@ -28,7 +28,8 @@ from backend.main import (
     _seed_from_dataset_hash,
     _apply_profile_masking,
     MID_COL_MAX,
-    MID_ROW_THRESHOLD,
+    MID_ROW_MAX,
+    SMALL_ROW_MAX,
     SAMPLE_MAX_ROWS,
 )
 
@@ -37,14 +38,15 @@ def _report_pdf_path(dataset_id: str) -> Path:
     return _report_path(dataset_id).with_suffix(".pdf")
 
 
-@celery_app.task(name="generate_report_task")
-def generate_report_task(job_id: str, dataset_id: str, template: str | None, sections: list[str] | None) -> dict:
+@celery_app.task(name="generate_report_task", bind=True, max_retries=2, soft_time_limit=840, time_limit=900)
+def generate_report_task(self, job_id: str, dataset_id: str, template: str | None, sections: list[str] | None) -> dict:
+    del template, sections
     try:
         meta = _load_meta(dataset_id)
         if not meta.get("file"):
             raise ValueError("No file uploaded for this session.")
 
-        update_job(job_id, status="running", progress=0.1)
+        update_job(job_id, status="running", progress=10)
 
         profile_path = _profile_path(dataset_id)
         facts_path = _facts_path(dataset_id)
@@ -60,15 +62,20 @@ def generate_report_task(job_id: str, dataset_id: str, template: str | None, sec
         if "df" not in locals():
             df = _read_uploaded_file(meta)
 
-        update_job(job_id, status="running", progress=0.35)
+        update_job(job_id, status="running", progress=35)
 
         if facts_path.exists():
             facts_bundle = _load_json(facts_path)
         else:
-            facts_bundle = _build_facts_bundle(df, profile)
+            facts_bundle = _build_facts_bundle(
+                df,
+                profile,
+                dataset_id=dataset_id,
+                dataset_hash=str(meta.get("file_hash", "")),
+            )
             _save_json(facts_path, facts_bundle)
 
-        update_job(job_id, status="running", progress=0.55)
+        update_job(job_id, status="running", progress=55)
 
         if spec_path.exists():
             spec = _load_json(spec_path)
@@ -78,19 +85,17 @@ def generate_report_task(job_id: str, dataset_id: str, template: str | None, sec
 
         if profile.get("pii_candidates") and not meta.get("allow_sensitive_export", False):
             aliases = {column: f"pii_field_{index + 1}" for index, column in enumerate(profile["pii_candidates"])}
+            df = df.rename(columns=aliases)
             profile = _apply_profile_masking(profile, True)
-            facts_bundle = json.loads(json.dumps(facts_bundle))
-            facts_bundle["facts"] = [
-                {**fact, "value": _mask_recursive(fact.get("value"), aliases)}
-                for fact in facts_bundle.get("facts", [])
-            ]
+            facts_bundle = _mask_recursive(json.loads(json.dumps(facts_bundle)), aliases)
+            spec = _mask_recursive(json.loads(json.dumps(spec)), aliases)
 
         chart_images = _chart_images_base64(df, spec.get("charts", []))
         report_html = _render_html_report(dataset_id, meta, profile, facts_bundle, spec, chart_images)
         html_path = _report_path(dataset_id)
         html_path.write_text(report_html, encoding="utf-8")
 
-        update_job(job_id, status="running", progress=0.8)
+        update_job(job_id, status="running", progress=80)
 
         pdf_path = _report_pdf_path(dataset_id)
         HTML(string=report_html).write_pdf(str(pdf_path))
@@ -107,24 +112,27 @@ def generate_report_task(job_id: str, dataset_id: str, template: str | None, sec
         update_job(
             job_id,
             status="succeeded",
-            progress=1.0,
+            progress=100,
             result=result,
-            artifact_links={"report_html": str(html_path), "report_pdf": str(pdf_path)},
+            artifacts={"report_pdf": str(pdf_path), "spec": str(spec_path), "facts": str(facts_path)},
         )
         return result
     except Exception as exc:
-        update_job(job_id, status="failed", error=str(exc))
+        if getattr(self.request, "retries", 0) < self.max_retries:
+            update_job(job_id, status="running", error={"code": "retrying", "message": str(exc), "trace": ""})
+            raise self.retry(exc=exc, countdown=2 ** int(self.request.retries))
+        update_job(job_id, status="failed", progress=100, error=str(exc))
         raise
 
 
-@celery_app.task(name="generate_facts_task")
-def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: int = 42) -> dict:
+@celery_app.task(name="generate_facts_task", bind=True, max_retries=2, soft_time_limit=840, time_limit=900)
+def generate_facts_task(self, job_id: str, dataset_id: str, mode: str = "auto", seed: int = 42) -> dict:
     try:
         meta = _load_meta(dataset_id)
         if not meta.get("file"):
             raise ValueError("No file uploaded for this session.")
 
-        update_job(job_id, status="running", progress=0.1)
+        update_job(job_id, status="running", progress=10)
         df = _read_uploaded_file(meta)
         rows, cols = df.shape
         file_hash = meta.get("file_hash", "")
@@ -132,7 +140,7 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
         meta["schema_hash"] = schema_hash
 
         if mode == "auto":
-            if rows > MID_ROW_THRESHOLD or cols > MID_COL_MAX:
+            if rows > SMALL_ROW_MAX or cols > MID_COL_MAX:
                 mode = "sample"
             else:
                 mode = "full"
@@ -143,13 +151,18 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
             sampled, sampling_method = _determine_sampling_strategy(
                 df, pre_profile, sampling_seed, SAMPLE_MAX_ROWS
             )
+            bias_note = (
+                "Large dataset sampled for interactive use; run async full mode for complete computation."
+                if rows > MID_ROW_MAX
+                else "Sample used for interactive speed; run full mode for final reporting."
+            )
             data_coverage = {
                 "mode": "sample",
                 "rows_total": rows,
                 "rows_used": int(len(sampled)),
                 "sampling_method": sampling_method,
                 "seed": sampling_seed,
-                "bias_notes": "Sampled dataset used for speed; use full computation for final reporting.",
+                "bias_notes": bias_note,
             }
             work_df = sampled
         else:
@@ -157,19 +170,18 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
                 "mode": "full",
                 "rows_total": rows,
                 "rows_used": rows,
-                "sampling_method": "none",
+                "sampling_method": "uniform",
                 "seed": None,
                 "bias_notes": "Full dataset used.",
             }
             work_df = df
 
-        update_job(job_id, status="running", progress=0.45)
+        update_job(job_id, status="running", progress=45)
         profile = _build_profile(work_df)
         profile["data_coverage"] = data_coverage
 
-        update_job(job_id, status="running", progress=0.7)
-        facts_bundle = _build_facts_bundle(work_df, profile)
-        facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
+        update_job(job_id, status="running", progress=70)
+        facts_bundle = _build_facts_bundle(work_df, profile, dataset_id=dataset_id, dataset_hash=file_hash)
         _save_json(_profile_path(dataset_id), profile)
         _save_json(_facts_path(dataset_id), facts_bundle)
 
@@ -182,11 +194,14 @@ def generate_facts_task(job_id: str, dataset_id: str, mode: str = "auto", seed: 
         update_job(
             job_id,
             status="succeeded",
-            progress=1.0,
+            progress=100,
             result=result,
-            artifact_links={"facts": str(_facts_path(dataset_id))},
+            artifacts={"facts": str(_facts_path(dataset_id))},
         )
         return result
     except Exception as exc:
-        update_job(job_id, status="failed", error=str(exc))
+        if getattr(self.request, "retries", 0) < self.max_retries:
+            update_job(job_id, status="running", error={"code": "retrying", "message": str(exc), "trace": ""})
+            raise self.retry(exc=exc, countdown=2 ** int(self.request.retries))
+        update_job(job_id, status="failed", progress=100, error=str(exc))
         raise

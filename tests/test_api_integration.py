@@ -26,7 +26,7 @@ def _upload_small_csv(dataset_id: str) -> None:
 def test_facts_async_enqueue(monkeypatch):
     dataset_id = _create_session()
     _upload_small_csv(dataset_id)
-    monkeypatch.setattr(main, "MID_ROW_THRESHOLD", 1)
+    monkeypatch.setattr(main, "SMALL_ROW_MAX", 1)
     resp = client.get(f"/sessions/{dataset_id}/facts")
     assert resp.status_code in (200, 202)
     payload = resp.json()

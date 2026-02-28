@@ -23,7 +23,7 @@ from backend.cache import CacheManager
 from backend.jobs import create_job, get_job, list_jobs, update_job
 from backend.llm_client import LLMClient, create_llm_client_from_env
 from backend.llm_gate import FactsGroundingError, SchemaValidationError, validate_facts_references, validate_schema
-from backend.llm_schemas import ASK_NARRATIVE_SCHEMA, DASHBOARD_SPEC_SCHEMA, QUERY_PLAN_SCHEMA
+from backend.llm_schemas import ASK_NARRATIVE_SCHEMA, DASHBOARD_SPEC_SCHEMA, FACTS_BUNDLE_SCHEMA, QUERY_PLAN_SCHEMA
 
 DATA_DIR = Path("data_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,8 +54,8 @@ PHONE_PATTERN = re.compile(r"^\+?[\d\-\s\(\)]{7,}$")
 ID_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9\-_]{6,}$")
 DATASET_ID_PATTERN = re.compile(r"^[a-f0-9\-]{36}$")
 
-MID_ROW_THRESHOLD = 100_000
-MID_ROW_MAX = 5_000_000
+SMALL_ROW_MAX = 50_000
+MID_ROW_MAX = 1_000_000
 MID_COL_MAX = 200
 SAMPLE_MAX_ROWS = 250_000
 CACHE_VERSION = "v1"
@@ -144,6 +144,8 @@ class AskResponse(BaseModel):
     fact_coverage: float
     data_coverage: str
     query_plan: dict[str, Any] | None = None
+    result_rows: list[dict[str, Any]] = Field(default_factory=list)
+    chart: dict[str, Any] | None = None
 
 
 class ReportRequest(BaseModel):
@@ -375,7 +377,7 @@ def _determine_sampling_strategy(df: pd.DataFrame, profile: dict[str, Any], seed
             middle_sample = _deterministic_sample(middle, core_n, seed)
             sampled = pd.concat([head_df, middle_sample, tail_df]).drop_duplicates()
             sampled = sampled.head(max_rows)
-            return sampled, f"time_head_tail_stratified:{time_col}"
+            return sampled, "time_stratified"
 
     if geo_candidates:
         key_col = geo_candidates[0]
@@ -387,7 +389,7 @@ def _determine_sampling_strategy(df: pd.DataFrame, profile: dict[str, Any], seed
         sampled = pd.concat(groups).drop_duplicates()
         if len(sampled) > max_rows:
             sampled = _deterministic_sample(sampled, max_rows, seed)
-        return sampled, f"categorical_stratified:{key_col}"
+        return sampled, "stratified"
 
     if categorical_cols:
         key_col = categorical_cols[0]
@@ -399,9 +401,9 @@ def _determine_sampling_strategy(df: pd.DataFrame, profile: dict[str, Any], seed
         sampled = pd.concat(groups).drop_duplicates()
         if len(sampled) > max_rows:
             sampled = _deterministic_sample(sampled, max_rows, seed)
-        return sampled, f"categorical_stratified:{key_col}"
+        return sampled, "stratified"
 
-    return _deterministic_sample(df, max_rows, seed), "uniform_random"
+    return _deterministic_sample(df, max_rows, seed), "uniform"
 
 
 def _infer_column_type(series: pd.Series) -> str:
@@ -642,84 +644,119 @@ def _pii_aliases(profile: dict[str, Any]) -> dict[str, str]:
     return {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
 
 
-def _build_facts_bundle(df: pd.DataFrame | None, profile: dict[str, Any]) -> dict[str, Any]:
-    facts: list[dict[str, Any]] = []
-    insights: list[dict[str, Any]] = []
+def _build_quality_issues(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    missing_percent = profile.get("missing_percent", {})
+    high_missing = [column for column, value in missing_percent.items() if float(value) >= 20.0]
+    if high_missing:
+        issues.append(
+            {
+                "code": "HIGH_MISSINGNESS",
+                "severity": "high",
+                "message": "Columns exceed 20% missing values.",
+                "columns": high_missing[:20],
+            }
+        )
 
+    duplicate_pct = float(profile.get("duplicate_percent", 0.0))
+    if duplicate_pct > 2.0:
+        issues.append(
+            {
+                "code": "HIGH_DUPLICATES",
+                "severity": "medium",
+                "message": "Duplicate row percentage is above recommended threshold.",
+                "columns": [],
+            }
+        )
+
+    pii_candidates = profile.get("pii_candidates", [])
+    if pii_candidates:
+        issues.append(
+            {
+                "code": "PII_CANDIDATES",
+                "severity": "high",
+                "message": "Potential PII columns detected; masking should be applied on exports.",
+                "columns": pii_candidates[:20],
+            }
+        )
+    return issues
+
+
+def _build_facts_bundle(
+    df: pd.DataFrame | None,
+    profile: dict[str, Any],
+    dataset_id: str = "",
+    dataset_hash: str = "",
+) -> dict[str, Any]:
     if df is None:
         df = pd.DataFrame()
 
-    def add_fact(metric: str, value: Any, description: str, citation: str) -> str:
-        fact_id = f"F{len(facts) + 1:03d}"
-        facts.append(
-            {
-                "id": fact_id,
-                "metric": metric,
-                "value": value,
-                "description": description,
-                "citation": citation,
-            }
-        )
+    rows = int(profile.get("shape", {}).get("rows", len(df)))
+    cols = int(profile.get("shape", {}).get("cols", len(df.columns)))
+    quality_score = float(profile.get("quality_score", 0.0))
+    duplicate_rows = int(profile.get("duplicate_rows", 0))
+    data_coverage = profile.get("data_coverage") or {
+        "mode": "full",
+        "rows_total": rows,
+        "rows_used": rows,
+        "sampling_method": "uniform",
+        "seed": None,
+        "bias_notes": "Full dataset used.",
+    }
+
+    insight_facts: list[dict[str, Any]] = []
+
+    def add_fact(kind: str, value: dict[str, Any], evidence: dict[str, Any]) -> str:
+        fact_id = f"fact_{len(insight_facts) + 1:03d}"
+        insight_facts.append({"id": fact_id, "type": kind, "value": value, "evidence": evidence})
         return fact_id
 
-    rows = profile["shape"]["rows"]
-    cols = profile["shape"]["cols"]
-    quality_score = profile.get("quality_score", 0)
-    duplicate_rows = profile.get("duplicate_rows", 0)
-
-    f_rows = add_fact("row_count", rows, "Total rows in dataset", "profile.shape.rows")
-    f_cols = add_fact("column_count", cols, "Total columns in dataset", "profile.shape.cols")
-    f_quality = add_fact(
-        "quality_score",
-        quality_score,
-        "Quality score based on completeness, duplicates, and outliers",
-        "profile.quality_score",
+    fact_rows = add_fact(
+        "comparison",
+        {"metric": "row_count", "value": rows},
+        {"source": "profiling.shape.rows"},
     )
-    f_duplicates = add_fact(
-        "duplicate_rows",
-        duplicate_rows,
-        "Rows fully duplicated across all columns",
-        "profile.duplicate_rows",
+    fact_cols = add_fact(
+        "comparison",
+        {"metric": "column_count", "value": cols},
+        {"source": "profiling.shape.cols"},
+    )
+    fact_quality = add_fact(
+        "comparison",
+        {"metric": "quality_score", "value": quality_score},
+        {"source": "quality.score"},
+    )
+    fact_duplicates = add_fact(
+        "comparison",
+        {"metric": "duplicate_rows", "value": duplicate_rows},
+        {"source": "profiling.duplicate_rows"},
     )
 
     missing_percent = profile.get("missing_percent", {})
     top_missing = sorted(
-        ((column, value) for column, value in missing_percent.items() if value > 0),
+        ((str(column), float(value)) for column, value in missing_percent.items() if float(value) > 0),
         key=lambda item: item[1],
         reverse=True,
-    )[:3]
+    )[:5]
     if top_missing:
         add_fact(
-            "top_missing_columns",
-            top_missing,
-            "Top columns by missing value percentage",
-            "profile.missing_percent",
+            "distribution",
+            {"metric": "top_missing_columns", "columns": top_missing},
+            {"source": "profiling.missing_percent"},
         )
 
-    numeric_cols = profile.get("numeric_cols", [])
-    categorical_cols = profile.get("categorical_cols", [])
-    datetime_cols = profile.get("datetime_cols", [])
+    numeric_cols = [str(value) for value in profile.get("numeric_cols", [])]
+    categorical_cols = [str(value) for value in profile.get("categorical_cols", [])]
+    datetime_cols = [str(value) for value in profile.get("datetime_cols", [])]
 
-    if categorical_cols:
-        first_category = categorical_cols[0]
-        series = df[first_category].dropna().astype(str)
-        if not series.empty:
-            top_categories = series.value_counts().head(5).to_dict()
-            add_fact(
-                "top_categories",
-                {"column": first_category, "values": top_categories},
-                f"Top categories in {first_category}",
-                f"dataset.column.{first_category}",
-            )
-
-    if datetime_cols and numeric_cols:
+    if datetime_cols and numeric_cols and all(col in df.columns for col in (datetime_cols[0], numeric_cols[0])):
         dt_column = datetime_cols[0]
         value_column = numeric_cols[0]
         scoped = df[[dt_column, value_column]].copy()
         scoped[dt_column] = pd.to_datetime(scoped[dt_column], errors="coerce")
         scoped[value_column] = pd.to_numeric(scoped[value_column], errors="coerce")
         scoped = scoped.dropna()
-        if len(scoped) >= 2:
+        if len(scoped) >= 3:
             monthly = (
                 scoped.set_index(dt_column)[value_column]
                 .resample("MS")
@@ -728,169 +765,145 @@ def _build_facts_bundle(df: pd.DataFrame | None, profile: dict[str, Any]) -> dic
                 .sort_values(dt_column)
             )
             if len(monthly) >= 2:
-                latest = monthly.iloc[-1][value_column]
-                previous = monthly.iloc[-2][value_column]
-                pct_change = ((latest - previous) / previous * 100) if previous else None
+                latest = float(monthly.iloc[-1][value_column])
+                previous = float(monthly.iloc[-2][value_column])
+                delta_pct = ((latest - previous) / previous * 100.0) if previous else None
                 add_fact(
-                    "latest_monthly_change",
+                    "trend",
                     {
-                        "datetime_column": dt_column,
-                        "value_column": value_column,
-                        "latest_period_value": float(latest),
-                        "previous_period_value": float(previous),
-                        "pct_change": round(float(pct_change), 2) if pct_change is not None else None,
+                        "metric": value_column,
+                        "latest_period_value": round(latest, 4),
+                        "previous_period_value": round(previous, 4),
+                        "pct_change": round(float(delta_pct), 2) if delta_pct is not None else None,
                     },
-                    f"Month-over-month change for {value_column}",
-                    f"dataset.trend.{value_column}",
+                    {"source": f"trend.{value_column}", "time_field": dt_column, "grain": "month"},
                 )
 
-    if len(numeric_cols) >= 2:
-        numeric_df = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-        corr = numeric_df.corr(numeric_only=True)
-        best_pair: tuple[str, str] | None = None
-        best_value = 0.0
-        for left_index, left_col in enumerate(corr.columns):
-            for right_col in corr.columns[left_index + 1 :]:
-                value = corr.loc[left_col, right_col]
-                if pd.isna(value):
-                    continue
-                if abs(value) > abs(best_value):
-                    best_value = float(value)
-                    best_pair = (left_col, right_col)
-        if best_pair:
-            add_fact(
-                "strongest_correlation",
-                {"columns": list(best_pair), "correlation": round(best_value, 3)},
-                "Strongest Pearson correlation pair among numeric columns",
-                "dataset.correlation",
+    if categorical_cols and numeric_cols and all(col in df.columns for col in (categorical_cols[0], numeric_cols[0])):
+        cat_col = categorical_cols[0]
+        val_col = numeric_cols[0]
+        scoped = df[[cat_col, val_col]].copy()
+        scoped[val_col] = pd.to_numeric(scoped[val_col], errors="coerce")
+        scoped = scoped.dropna()
+        if not scoped.empty:
+            grouped = (
+                scoped.groupby(cat_col, dropna=False)[val_col]
+                .mean()
+                .sort_values(ascending=False)
+                .head(10)
             )
+            if not grouped.empty:
+                top_name = str(grouped.index[0])
+                top_value = float(grouped.iloc[0])
+                add_fact(
+                    "comparison",
+                    {"metric": f"top_{val_col}_segment", "segment_field": cat_col, "segment": top_name, "value": round(top_value, 4)},
+                    {"source": f"grouped_mean.{cat_col}.{val_col}"},
+                )
 
-    insights.append(
-        {
-            "id": f"I{len(insights) + 1:03d}",
-            "title": "Dataset health overview",
-            "statement": (
-                f"Dataset has {rows:,} rows and {cols} columns with quality score {quality_score}/100. "
-                f"Detected {duplicate_rows:,} duplicate rows."
-            ),
-            "citations": [f_rows, f_cols, f_quality, f_duplicates],
-        }
-    )
+    if len(numeric_cols) >= 2 and all(col in df.columns for col in numeric_cols[:2]):
+        x_col = numeric_cols[0]
+        y_col = numeric_cols[1]
+        corr_df = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(corr_df) >= 4:
+            corr = float(corr_df[x_col].corr(corr_df[y_col]))
+            if pd.notna(corr):
+                add_fact(
+                    "comparison",
+                    {"metric": "pair_correlation", "x": x_col, "y": y_col, "value": round(corr, 4)},
+                    {"source": "correlation.pearson"},
+                )
 
-    if top_missing:
-        insights.append(
-            {
-                "id": f"I{len(insights) + 1:03d}",
-                "title": "Completeness risk",
-                "statement": (
-                    "Columns with the highest missing percentages should be reviewed before indicator "
-                    "computation and trend interpretation."
-                ),
-                "citations": ["F005"] if len(facts) >= 5 else [f_quality],
-            }
-        )
-
-    template = profile.get("health_template", {})
-    if template.get("name") == "hmis":
-        insights.append(
-            {
-                "id": f"I{len(insights) + 1:03d}",
-                "title": "Healthcare template detected",
-                "statement": (
-                    "Dataset structure matches HMIS-like fields. Standard OPD/diagnosis trend and "
-                    "demographic breakdown dashboards can be applied."
-                ),
-                "citations": [f_cols],
-            }
-        )
-
-    facts_index = {fact["id"]: fact for fact in facts}
-    facts_index.update({fact["metric"]: fact for fact in facts})
-    pii_flags = {name: True for name in profile.get("pii_candidates", [])}
-    health_signals = profile.get("health_signals", {})
-
-    data_coverage = profile.get("data_coverage") or {
-        "mode": "full",
-        "rows_total": rows,
-        "rows_used": rows,
-        "sampling_method": "none",
-        "seed": None,
-        "bias_notes": "Full dataset used.",
-    }
+    kpis = [
+        {"id": "kpi_rows", "name": "Rows", "value": rows, "unit": "rows", "facts_refs": [fact_rows]},
+        {"id": "kpi_cols", "name": "Columns", "value": cols, "unit": "cols", "facts_refs": [fact_cols]},
+        {"id": "kpi_quality", "name": "Quality Score", "value": round(quality_score, 2), "unit": "score", "facts_refs": [fact_quality]},
+        {"id": "kpi_duplicates", "name": "Duplicate Rows", "value": duplicate_rows, "unit": "rows", "facts_refs": [fact_duplicates]},
+    ]
 
     chart_candidates: list[dict[str, Any]] = []
     if datetime_cols and numeric_cols:
         chart_candidates.append(
             {
-                "id": "C001",
-                "type": "line",
-                "title": f"Monthly Trend: {numeric_cols[0]}",
-                "source": {
-                    "datetime_column": datetime_cols[0],
-                    "value_column": numeric_cols[0],
-                    "aggregation": "sum",
-                    "resample": "MS",
-                },
-                "citation": "facts.latest_monthly_change",
+                "id": "chartcand_001",
+                "chart_type": "line",
+                "x": datetime_cols[0],
+                "y": numeric_cols[0],
+                "group_by": None,
+                "filters": [],
+                "score": 0.96,
             }
         )
     if categorical_cols and numeric_cols:
         chart_candidates.append(
             {
-                "id": "C002",
-                "type": "bar",
-                "title": f"Average {numeric_cols[0]} by {categorical_cols[0]}",
-                "source": {
-                    "category_column": categorical_cols[0],
-                    "value_column": numeric_cols[0],
-                    "aggregation": "mean",
-                    "top_n": 10,
-                },
-                "citation": "facts.top_categories",
+                "id": "chartcand_002",
+                "chart_type": "bar",
+                "x": categorical_cols[0],
+                "y": numeric_cols[0],
+                "group_by": None,
+                "filters": [],
+                "score": 0.9,
             }
         )
-    elif categorical_cols:
+    if numeric_cols:
         chart_candidates.append(
             {
-                "id": "C003",
-                "type": "bar_count",
-                "title": f"Top values in {categorical_cols[0]}",
-                "source": {"category_column": categorical_cols[0], "top_n": 10},
-                "citation": "facts.top_categories",
+                "id": "chartcand_003",
+                "chart_type": "hist",
+                "x": numeric_cols[0],
+                "y": None,
+                "group_by": None,
+                "filters": [],
+                "score": 0.85,
             }
         )
 
-    return {
-        "generated_at": _utc_now_iso(),
-        "facts_bundle_version": "1.0",
-        "generation_policy": "Facts-first deterministic computation. No LLM text generation.",
-        "facts": facts,
-        "facts_index": facts_index,
-        "insights": insights,
+    quality_issues = _build_quality_issues(profile)
+    bundle = {
+        "dataset_id": dataset_id or "unknown_dataset",
+        "dataset_hash": dataset_hash or "unknown_hash",
+        "created_at": _utc_now_iso(),
         "data_coverage": data_coverage,
-        "schema": {"columns": profile.get("columns", [])},
+        "profiling": {
+            "shape": profile.get("shape", {"rows": rows, "cols": cols}),
+            "dtypes": profile.get("dtypes", {}),
+            "missing_percent": profile.get("missing_percent", {}),
+            "pii_candidates": profile.get("pii_candidates", []),
+        },
         "quality": {
-            "missingness": profile.get("missing_percent", {}),
-            "duplicates": {
-                "row_count": profile.get("duplicate_rows", 0),
-                "row_pct": profile.get("duplicate_percent", 0.0),
-            },
+            "score": round(quality_score, 2),
+            "issues": quality_issues,
         },
-        "metrics": {
-            "row_count": rows,
-            "column_count": cols,
-            "quality_score": quality_score,
-        },
-        "kpis": {
-            "row_count": rows,
-            "column_count": cols,
-            "quality_score": quality_score,
-        },
-        "insights_facts": facts,
+        "kpis": kpis,
+        "insight_facts": insight_facts,
         "chart_candidates": chart_candidates,
-        "health_signals": health_signals,
-        "pii_flags": pii_flags,
     }
+    validate_schema(bundle, FACTS_BUNDLE_SCHEMA)
+    return bundle
+
+
+def _is_facts_bundle_compatible(bundle: dict[str, Any]) -> bool:
+    required = {
+        "dataset_id",
+        "dataset_hash",
+        "created_at",
+        "data_coverage",
+        "profiling",
+        "quality",
+        "kpis",
+        "insight_facts",
+        "chart_candidates",
+    }
+    if not required.issubset(set(bundle.keys())):
+        return False
+    if not isinstance(bundle.get("kpis"), list):
+        return False
+    if not isinstance(bundle.get("insight_facts"), list):
+        return False
+    if not isinstance(bundle.get("chart_candidates"), list):
+        return False
+    return True
 
 
 def _mask_recursive(value: Any, aliases: dict[str, str]) -> Any:
@@ -926,65 +939,63 @@ def _apply_cleaning_actions(df: pd.DataFrame, actions: list[str]) -> pd.DataFram
 
 def _safe_answer_from_facts(question: str, facts_bundle: dict[str, Any]) -> tuple[str, list[str], str, float, str]:
     question_lower = question.lower()
-    facts_index = facts_bundle.get("facts_index", {})
-    facts_used: list[str] = []
-    confidence = "Low"
-    data_coverage = "sample"
+    insight_facts = facts_bundle.get("insight_facts", [])
+    data_coverage = str((facts_bundle.get("data_coverage") or {}).get("mode", "sample"))
 
-    latest_change = facts_index.get("latest_monthly_change")
-    top_missing = facts_index.get("top_missing_columns")
-    top_categories = facts_index.get("top_categories")
+    trend_fact = next((fact for fact in insight_facts if fact.get("type") == "trend"), None)
+    if trend_fact and any(token in question_lower for token in ("trend", "change", "increase", "decrease")):
+        payload = trend_fact.get("value", {})
+        pct = payload.get("pct_change")
+        latest = payload.get("latest_period_value")
+        previous = payload.get("previous_period_value")
+        if isinstance(latest, (float, int)) and isinstance(previous, (float, int)):
+            if pct is not None:
+                answer = (
+                    f"The most recent period is {float(latest):.2f} vs {float(previous):.2f} "
+                    f"({float(pct):.2f}% change)."
+                )
+            else:
+                answer = f"The most recent period is {float(latest):.2f} vs {float(previous):.2f}."
+        else:
+            answer = "A trend fact exists, but comparable periods were not fully available."
+        return answer, [str(trend_fact.get("id", ""))], "Medium", 1.0, data_coverage
 
-    if any(word in question_lower for word in ("trend", "change", "increase", "decrease")) and latest_change:
-        value = latest_change["value"]
-        pct = value.get("pct_change")
-        latest = value.get("latest_period_value")
-        previous = value.get("previous_period_value")
-        answer = (
-            "Based on computed monthly aggregates, the most recent period value is "
-            f"{latest:.2f} vs {previous:.2f}, a change of {pct}%."
-            if pct is not None
-            else "Recent period change could not be computed due to missing values."
-        )
-        facts_used.append(latest_change["id"])
-        confidence = "Medium"
-        data_coverage = "full"
-        return answer, facts_used, confidence, 1.0, data_coverage
+    if any(token in question_lower for token in ("missing", "completeness", "quality")):
+        quality = facts_bundle.get("quality", {})
+        issues = quality.get("issues", [])
+        if issues:
+            issue = issues[0]
+            columns = ", ".join(issue.get("columns", [])[:5]) or "N/A"
+            answer = f"Primary quality issue: {issue.get('code')} ({issue.get('severity')}). Columns: {columns}."
+            coverage = 1.0
+        else:
+            answer = f"Quality score is {quality.get('score')} and no major issues were flagged."
+            coverage = 0.7
+        return answer, [], "Medium", coverage, data_coverage
 
-    if any(word in question_lower for word in ("missing", "completeness")) and top_missing:
-        answer = "The highest missingness columns are listed in the facts bundle."
-        facts_used.append(top_missing["id"])
-        confidence = "Medium"
-        data_coverage = "full"
-        return answer, facts_used, confidence, 1.0, data_coverage
+    kpis = facts_bundle.get("kpis", [])
+    if any(token in question_lower for token in ("rows", "columns", "size", "shape")) and kpis:
+        rows = next((kpi for kpi in kpis if kpi.get("id") == "kpi_rows"), None)
+        cols = next((kpi for kpi in kpis if kpi.get("id") == "kpi_cols"), None)
+        if rows and cols:
+            answer = f"Dataset has {rows.get('value')} rows and {cols.get('value')} columns."
+            refs = list(rows.get("facts_refs", [])) + list(cols.get("facts_refs", []))
+            return answer, [str(value) for value in refs if isinstance(value, str)], "High", 1.0, data_coverage
 
-    if any(word in question_lower for word in ("top", "most common", "category")) and top_categories:
-        values = top_categories["value"].get("values", {})
-        summary = ", ".join(f"{key}: {val}" for key, val in list(values.items())[:5])
-        answer = f"Top categories are: {summary}."
-        facts_used.append(top_categories["id"])
-        confidence = "Medium"
-        data_coverage = "full"
-        return answer, facts_used, confidence, 1.0, data_coverage
-
-    return (
-        "I do not have computed facts for that question yet. Please run a new analysis or clarify the metric.",
-        facts_used,
-        confidence,
-        0.0,
-        data_coverage,
-    )
+    return ("No matching precomputed fact was found for this question.", [], "Low", 0.0, data_coverage)
 
 
 def _facts_context_for_llm(facts_bundle: dict[str, Any]) -> dict[str, Any]:
+    profiling = facts_bundle.get("profiling", {})
+    dtypes = profiling.get("dtypes", {})
     return {
-        "kpis": facts_bundle.get("kpis", {}),
+        "kpis": facts_bundle.get("kpis", [])[:12],
         "quality": facts_bundle.get("quality", {}),
-        "insights_facts": facts_bundle.get("insights_facts", [])[:25],
+        "insight_facts": facts_bundle.get("insight_facts", [])[:25],
         "chart_candidates": facts_bundle.get("chart_candidates", [])[:12],
-        "health_signals": facts_bundle.get("health_signals", {}),
         "data_coverage": facts_bundle.get("data_coverage", {}),
-        "facts_index_keys": sorted(list(facts_bundle.get("facts_index", {}).keys()))[:80],
+        "columns": list(dtypes.keys())[:120],
+        "dtypes": dtypes,
     }
 
 
@@ -999,286 +1010,321 @@ def _generate_dashboard_spec_llm(dataset_id: str, template: str, facts_bundle: d
         f"Dataset ID: {dataset_id}\n"
         f"Template: {template}\n"
         f"Facts context JSON:\n{json.dumps(context, ensure_ascii=True)}\n"
-        "Build a compact dashboard spec with filters, KPIs, charts, components, and facts_used."
+        "Build a compact dashboard spec for healthcare analytics."
     )
     output = llm.generate_json(DASHBOARD_SPEC_SCHEMA, system_prompt, user_prompt, timeout=30)
     validate_schema(output, DASHBOARD_SPEC_SCHEMA)
     validate_facts_references(output, facts_bundle)
-    output["dataset_id"] = dataset_id
-    output["generated_at"] = _utc_now_iso()
-    output["version"] = "1.0"
-    output["policy"] = "All cards and narratives must cite computed facts; no free-form hallucinated metrics."
-    output["layout"] = {"kpi_row_columns": 4, "chart_columns": 2}
     return output
 
 
-def _generate_query_plan_llm(question: str, facts_bundle: dict[str, Any]) -> dict[str, Any]:
+def _generate_query_plan_llm(question: str, facts_bundle: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    del facts_bundle  # facts are used later for grounding the narrative, not for plan schema.
     llm = _get_llm_client()
     context = {
         "question": question,
-        "columns": [column.get("name") for column in facts_bundle.get("schema", {}).get("columns", [])][:120],
-        "inferred_types": {
-            column.get("name"): column.get("inferred_type")
-            for column in facts_bundle.get("schema", {}).get("columns", [])[:120]
-        },
-        "facts_keys": sorted(list(facts_bundle.get("facts_index", {}).keys()))[:100],
+        "columns": [str(name) for name in profile.get("dtypes", {}).keys()][:120],
+        "numeric_columns": [str(name) for name in profile.get("numeric_cols", [])][:60],
+        "categorical_columns": [str(name) for name in profile.get("categorical_cols", [])][:60],
+        "datetime_columns": [str(name) for name in profile.get("datetime_cols", [])][:30],
     }
     system_prompt = (
         "You are a query planner for healthcare analytics. "
-        "Generate a safe plan using only filter/groupby/aggregate operations."
+        "Generate a safe query plan using only provided columns."
     )
     user_prompt = f"Build a query plan for this context:\n{json.dumps(context, ensure_ascii=True)}"
     output = llm.generate_json(QUERY_PLAN_SCHEMA, system_prompt, user_prompt, timeout=30)
     validate_schema(output, QUERY_PLAN_SCHEMA)
-    validate_facts_references(output, facts_bundle)
     return output
 
 
-def _apply_filter_op(df: pd.DataFrame, op: dict[str, Any]) -> pd.DataFrame:
-    field = op.get("field")
+def _fallback_query_plan(question: str, profile: dict[str, Any]) -> dict[str, Any]:
+    numeric_cols = [str(name) for name in profile.get("numeric_cols", [])]
+    categorical_cols = [str(name) for name in profile.get("categorical_cols", [])]
+    datetime_cols = [str(name) for name in profile.get("datetime_cols", [])]
+
+    metric_field = numeric_cols[0] if numeric_cols else (categorical_cols[0] if categorical_cols else "")
+    metric_op = "sum" if numeric_cols else "count"
+    group_by: list[str] = []
+    chart_hint = "table"
+    intent = "aggregate"
+
+    if datetime_cols and any(token in question.lower() for token in ("trend", "time", "month", "week", "year")):
+        group_by = [datetime_cols[0]]
+        chart_hint = "line"
+        intent = "trend"
+    elif categorical_cols:
+        group_by = [categorical_cols[0]]
+        chart_hint = "bar"
+        intent = "compare"
+
+    return {
+        "intent": intent,
+        "metrics": [{"op": metric_op, "field": metric_field}] if metric_field else [],
+        "group_by": group_by,
+        "filters": [],
+        "time": {
+            "field": datetime_cols[0] if datetime_cols else None,
+            "grain": "month" if datetime_cols else None,
+            "start": None,
+            "end": None,
+        },
+        "limit": 1000,
+        "chart_hint": chart_hint,
+    }
+
+
+def _apply_filter_op(df: pd.DataFrame, field: str, op: str, value: Any) -> pd.DataFrame:
     if not field or field not in df.columns:
         return df
 
-    if "range" in op and isinstance(op["range"], list) and len(op["range"]) == 2:
-        start, end = op["range"]
-        if pd.api.types.is_datetime64_any_dtype(df[field]) or any(token in field.lower() for token in TIME_KEYWORDS):
-            scoped = df.copy()
-            scoped[field] = pd.to_datetime(scoped[field], errors="coerce")
+    series = df[field]
+    if op == "eq":
+        return df[series == value]
+    if op == "neq":
+        return df[series != value]
+    if op in {"gt", "gte", "lt", "lte"}:
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if op == "gt":
+            return df[numeric_series > numeric_value]
+        if op == "gte":
+            return df[numeric_series >= numeric_value]
+        if op == "lt":
+            return df[numeric_series < numeric_value]
+        return df[numeric_series <= numeric_value]
+    if op == "in" and isinstance(value, list):
+        return df[series.isin(value)]
+    if op == "between" and isinstance(value, list) and len(value) == 2:
+        start, end = value
+        if pd.api.types.is_datetime64_any_dtype(series) or any(token in field.lower() for token in TIME_KEYWORDS):
+            dt_series = pd.to_datetime(series, errors="coerce")
             start_dt = pd.to_datetime(start, errors="coerce")
             end_dt = pd.to_datetime(end, errors="coerce")
-            return scoped[(scoped[field] >= start_dt) & (scoped[field] <= end_dt)]
-        scoped = pd.to_numeric(df[field], errors="coerce")
+            return df[(dt_series >= start_dt) & (dt_series <= end_dt)]
+        numeric_series = pd.to_numeric(series, errors="coerce")
         start_num = pd.to_numeric(pd.Series([start]), errors="coerce").iloc[0]
         end_num = pd.to_numeric(pd.Series([end]), errors="coerce").iloc[0]
-        return df[(scoped >= start_num) & (scoped <= end_num)]
-
-    if "equals" in op:
-        return df[df[field] == op["equals"]]
-
+        return df[(numeric_series >= start_num) & (numeric_series <= end_num)]
     return df
 
 
 def _execute_query_plan(df: pd.DataFrame, plan: dict[str, Any]) -> tuple[pd.DataFrame, str]:
     scoped = df.copy()
-    groupby_field: str | None = None
-    aggregate_field: str | None = None
-    aggregate_func: str | None = None
+    for flt in plan.get("filters", []):
+        if not isinstance(flt, dict):
+            continue
+        field = str(flt.get("field", ""))
+        op = str(flt.get("op", "eq"))
+        scoped = _apply_filter_op(scoped, field, op, flt.get("value"))
 
-    for op in plan.get("operations", []):
-        op_type = op.get("op")
-        if op_type == "filter":
-            scoped = _apply_filter_op(scoped, op)
-        elif op_type == "groupby":
-            candidate = op.get("field")
-            if isinstance(candidate, str) and candidate in scoped.columns:
-                groupby_field = candidate
-        elif op_type == "aggregate":
-            candidate = op.get("field")
-            func = op.get("func")
-            if isinstance(candidate, str) and candidate in scoped.columns and isinstance(func, str):
-                aggregate_field = candidate
-                aggregate_func = func
+    time_filter = plan.get("time") or {}
+    time_field = time_filter.get("field")
+    if isinstance(time_field, str) and time_field in scoped.columns:
+        scoped = scoped.copy()
+        scoped[time_field] = pd.to_datetime(scoped[time_field], errors="coerce")
+        start = pd.to_datetime(time_filter.get("start"), errors="coerce")
+        end = pd.to_datetime(time_filter.get("end"), errors="coerce")
+        if pd.notna(start):
+            scoped = scoped[scoped[time_field] >= start]
+        if pd.notna(end):
+            scoped = scoped[scoped[time_field] <= end]
 
-    if aggregate_field is None:
-        return scoped.head(20), "No aggregate operation found. Returning filtered rows preview."
+    metrics = [metric for metric in plan.get("metrics", []) if isinstance(metric, dict)]
+    if not metrics:
+        return scoped.head(min(int(plan.get("limit", 1000)), 1000)), "No metrics in query plan; returning rows."
 
-    if groupby_field:
-        grouped = scoped.groupby(groupby_field, dropna=False)[aggregate_field]
-        if aggregate_func == "sum":
-            result = grouped.sum().reset_index(name=f"{aggregate_field}_sum")
-        elif aggregate_func == "mean":
-            result = grouped.mean().reset_index(name=f"{aggregate_field}_mean")
-        elif aggregate_func == "count":
-            result = grouped.count().reset_index(name=f"{aggregate_field}_count")
-        elif aggregate_func == "min":
-            result = grouped.min().reset_index(name=f"{aggregate_field}_min")
+    group_by = [str(field) for field in plan.get("group_by", []) if isinstance(field, str) and field in scoped.columns]
+    limit = min(int(plan.get("limit", 1000)), 10000)
+
+    if group_by:
+        grouped = scoped.groupby(group_by, dropna=False)
+        frames: list[pd.DataFrame] = []
+        for metric in metrics:
+            field = str(metric.get("field", ""))
+            op = str(metric.get("op", "count"))
+            if field not in scoped.columns:
+                continue
+            alias = f"{op}_{field}"
+            if op == "count":
+                metric_df = grouped[field].count().reset_index(name=alias)
+            else:
+                typed = scoped[group_by + [field]].copy()
+                typed[field] = pd.to_numeric(typed[field], errors="coerce")
+                grouped_num = typed.groupby(group_by, dropna=False)[field]
+                if op == "sum":
+                    metric_df = grouped_num.sum().reset_index(name=alias)
+                elif op == "mean":
+                    metric_df = grouped_num.mean().reset_index(name=alias)
+                elif op == "min":
+                    metric_df = grouped_num.min().reset_index(name=alias)
+                else:
+                    metric_df = grouped_num.max().reset_index(name=alias)
+            frames.append(metric_df)
+
+        if not frames:
+            return scoped.head(min(limit, 100)), "No valid metric fields found."
+
+        result = frames[0]
+        for frame in frames[1:]:
+            result = result.merge(frame, on=group_by, how="outer")
+        value_cols = [col for col in result.columns if col not in group_by]
+        if value_cols:
+            result = result.sort_values(value_cols[0], ascending=False)
+        return result.head(limit), "Grouped aggregate computed."
+
+    row: dict[str, Any] = {}
+    for metric in metrics:
+        field = str(metric.get("field", ""))
+        op = str(metric.get("op", "count"))
+        if field not in scoped.columns:
+            continue
+        alias = f"{op}_{field}"
+        if op == "count":
+            row[alias] = int(scoped[field].count())
+            continue
+        series = pd.to_numeric(scoped[field], errors="coerce")
+        if op == "sum":
+            row[alias] = float(series.sum())
+        elif op == "mean":
+            row[alias] = float(series.mean())
+        elif op == "min":
+            row[alias] = float(series.min())
         else:
-            result = grouped.max().reset_index(name=f"{aggregate_field}_max")
-        return result.sort_values(result.columns[-1], ascending=False).head(100), "Grouped aggregate computed."
+            row[alias] = float(series.max())
 
-    series = pd.to_numeric(scoped[aggregate_field], errors="coerce")
-    if aggregate_func == "sum":
-        value = float(series.sum())
-    elif aggregate_func == "mean":
-        value = float(series.mean())
-    elif aggregate_func == "count":
-        value = float(series.count())
-    elif aggregate_func == "min":
-        value = float(series.min())
-    else:
-        value = float(series.max())
-    result = pd.DataFrame([{"metric": aggregate_field, "aggregation": aggregate_func, "value": value}])
-    return result, "Single aggregate computed."
+    if not row:
+        return scoped.head(min(limit, 100)), "No valid metric fields found."
+    return pd.DataFrame([row]).head(limit), "Aggregate computed."
 
 
-def _summarize_query_result_llm(question: str, result_df: pd.DataFrame, facts_bundle: dict[str, Any], requested_facts: list[str]) -> tuple[str, list[str]]:
+def _default_fact_ids(facts_bundle: dict[str, Any], limit: int = 3) -> list[str]:
+    return [
+        str(fact.get("id"))
+        for fact in facts_bundle.get("insight_facts", [])[:limit]
+        if isinstance(fact.get("id"), str)
+    ]
+
+
+def _summarize_query_result_llm(
+    question: str,
+    result_df: pd.DataFrame,
+    facts_bundle: dict[str, Any],
+    fact_ids: list[str],
+) -> tuple[str, list[str]]:
     llm = _get_llm_client()
     preview = json.loads(result_df.head(10).to_json(orient="records", date_format="iso"))
+    grounded_ids = [value for value in fact_ids if isinstance(value, str)]
     context = {
         "question": question,
         "result_preview": preview,
-        "requested_facts": requested_facts,
+        "fact_ids": grounded_ids,
         "data_coverage": facts_bundle.get("data_coverage", {}),
     }
     system_prompt = (
         "You summarize deterministic analysis outputs. "
-        "Do not invent numbers. Reference only requested fact keys in facts_used."
+        "Do not invent numbers. Reference only provided fact IDs."
     )
     user_prompt = f"Summarize this result context:\n{json.dumps(context, ensure_ascii=True)}"
     output = llm.generate_json(ASK_NARRATIVE_SCHEMA, system_prompt, user_prompt, timeout=30)
     validate_schema(output, ASK_NARRATIVE_SCHEMA)
     validate_facts_references(output, facts_bundle)
     answer = output.get("answer", "")
-    facts_used = [value for value in output.get("facts_used", []) if isinstance(value, str)]
+    facts_used = [value for value in output.get("fact_ids", []) if isinstance(value, str)]
     return answer, facts_used
 
 
 def _build_dashboard_spec(dataset_id: str, profile: dict[str, Any], facts_bundle: dict[str, Any]) -> dict[str, Any]:
-    template = profile.get("health_template", {}).get("name", "generic")
-    numeric_cols = profile.get("numeric_cols", [])
-    categorical_cols = profile.get("categorical_cols", [])
-    datetime_cols = profile.get("datetime_cols", [])
+    del dataset_id  # Stored with session metadata and artifact path.
+    numeric_cols = [str(value) for value in profile.get("numeric_cols", [])]
+    categorical_cols = [str(value) for value in profile.get("categorical_cols", [])]
+    datetime_cols = [str(value) for value in profile.get("datetime_cols", [])]
+    insight_facts = facts_bundle.get("insight_facts", [])
+
+    kpis: list[dict[str, str]] = []
+    for item in facts_bundle.get("kpis", [])[:4]:
+        refs = [value for value in item.get("facts_refs", []) if isinstance(value, str)]
+        if refs:
+            kpis.append({"name": str(item.get("name", "KPI")), "fact_id": refs[0]})
+
+    filters: list[dict[str, str]] = []
+    if datetime_cols:
+        filters.append({"field": datetime_cols[0], "type": "date"})
+    for field in categorical_cols[:2]:
+        filters.append({"field": field, "type": "categorical"})
+    if numeric_cols:
+        filters.append({"field": numeric_cols[0], "type": "numeric"})
 
     charts: list[dict[str, Any]] = []
-    filters: list[dict[str, Any]] = []
-
-    if datetime_cols:
-        filters.append({"id": "f_period", "column": datetime_cols[0], "type": "date_range"})
-    for idx, column in enumerate(categorical_cols[:2], start=1):
-        filters.append({"id": f"f_cat_{idx}", "column": column, "type": "multiselect"})
-
-    if datetime_cols and numeric_cols:
+    for index, candidate in enumerate(facts_bundle.get("chart_candidates", [])[:6]):
+        chart_type = str(candidate.get("chart_type", "table"))
+        resolved_type = chart_type if chart_type in {"line", "bar", "hist", "scatter", "heatmap", "table"} else "table"
+        linked_fact = (
+            str(insight_facts[index].get("id"))
+            if index < len(insight_facts)
+            else (str(insight_facts[0].get("id")) if insight_facts else "")
+        )
         charts.append(
             {
-                "id": "chart_trend",
-                "type": "line",
-                "title": f"Monthly Trend: {numeric_cols[0]}",
-                "source": {
-                    "datetime_column": datetime_cols[0],
-                    "value_column": numeric_cols[0],
-                    "aggregation": "sum",
-                    "resample": "MS",
-                },
-                "citation": "facts.latest_monthly_change",
+                "title": f"Chart {index + 1}",
+                "type": resolved_type,
+                "x": candidate.get("x"),
+                "y": candidate.get("y"),
+                "group_by": candidate.get("group_by"),
+                "aggregation": "sum" if resolved_type == "line" else ("mean" if resolved_type in {"bar", "scatter"} else "count"),
+                "fact_ids": [linked_fact] if linked_fact else [],
+                "layout": {"row": index // 2, "col": index % 2, "w": 6, "h": 4},
             }
         )
 
-    if categorical_cols and numeric_cols:
+    if not charts:
         charts.append(
             {
-                "id": "chart_category_mean",
-                "type": "bar",
-                "title": f"Average {numeric_cols[0]} by {categorical_cols[0]}",
-                "source": {
-                    "category_column": categorical_cols[0],
-                    "value_column": numeric_cols[0],
-                    "aggregation": "mean",
-                    "top_n": 10,
-                },
-                "citation": "facts.top_categories",
+                "title": "Overview Table",
+                "type": "table",
+                "x": categorical_cols[0] if categorical_cols else None,
+                "y": numeric_cols[0] if numeric_cols else None,
+                "group_by": None,
+                "aggregation": "count",
+                "fact_ids": [str(insight_facts[0].get("id"))] if insight_facts else [],
+                "layout": {"row": 0, "col": 0, "w": 12, "h": 4},
             }
         )
-    elif categorical_cols:
-        charts.append(
+
+    insight_cards: list[dict[str, Any]] = []
+    for fact in insight_facts[:4]:
+        value = fact.get("value", {})
+        metric = value.get("metric", fact.get("type", "fact"))
+        insight_cards.append(
             {
-                "id": "chart_category_count",
-                "type": "bar_count",
-                "title": f"Top values in {categorical_cols[0]}",
-                "source": {"category_column": categorical_cols[0], "top_n": 10},
-                "citation": "facts.top_categories",
+                "title": str(metric),
+                "text": f"Computed {fact.get('type')} fact available for {metric}.",
+                "fact_ids": [str(fact.get("id"))],
             }
         )
 
-    if numeric_cols:
-        charts.append(
-            {
-                "id": "chart_distribution",
-                "type": "histogram",
-                "title": f"Distribution: {numeric_cols[0]}",
-                "source": {"value_column": numeric_cols[0], "bins": 30},
-                "citation": "profile.columns",
-            }
-        )
-
-    if len(numeric_cols) >= 2:
-        charts.append(
-            {
-                "id": "chart_correlation_scatter",
-                "type": "scatter",
-                "title": f"{numeric_cols[0]} vs {numeric_cols[1]}",
-                "source": {"x_column": numeric_cols[0], "y_column": numeric_cols[1]},
-                "citation": "facts.strongest_correlation",
-            }
-        )
-
-    kpis = [
-        {
-            "id": "kpi_rows",
-            "label": "Rows",
-            "value": profile["shape"]["rows"],
-            "format": "integer",
-            "citation": "profile.shape.rows",
-        },
-        {
-            "id": "kpi_cols",
-            "label": "Columns",
-            "value": profile["shape"]["cols"],
-            "format": "integer",
-            "citation": "profile.shape.cols",
-        },
-        {
-            "id": "kpi_quality",
-            "label": "Quality Score",
-            "value": profile.get("quality_score"),
-            "format": "percent_0_100",
-            "citation": "profile.quality_score",
-        },
-        {
-            "id": "kpi_duplicates",
-            "label": "Duplicate Rows",
-            "value": profile.get("duplicate_rows"),
-            "format": "integer",
-            "citation": "profile.duplicate_rows",
-        },
-    ]
-
-    components = [
-        {"type": "kpi", "title": kpi["label"], "value": kpi["value"], "citation": kpi["citation"]}
-        for kpi in kpis
-    ]
-    for chart in charts:
-        components.append(
-            {
-                "type": chart["type"],
-                "title": chart["title"],
-                "source": chart["source"],
-                "citation": chart.get("citation"),
-            }
-        )
-
-    return {
-        "version": "1.0",
-        "dataset_id": dataset_id,
-        "generated_at": _utc_now_iso(),
-        "template": template,
-        "policy": "All cards and narratives must cite computed facts; no free-form hallucinated metrics.",
+    spec = {
+        "title": "Auto Healthcare Analytics Dashboard",
         "kpis": kpis,
         "filters": filters,
         "charts": charts,
-        "components": components,
-        "layout": {
-            "kpi_row_columns": 4,
-            "chart_columns": 2,
-        },
-        "facts_used": [fact["id"] for fact in facts_bundle.get("facts", [])],
+        "insight_cards": insight_cards,
     }
+    validate_schema(spec, DASHBOARD_SPEC_SCHEMA)
+    validate_facts_references(spec, facts_bundle)
+    return spec
 
 
 def _render_dashboard_html(spec: dict[str, Any]) -> str:
-    components_html = "".join(
-        f"<li><strong>{html.escape(component.get('title', ''))}</strong> "
-        f"({html.escape(component.get('type', ''))})</li>"
-        for component in spec.get("components", [])
+    chart_items = "".join(
+        f"<li><strong>{html.escape(chart.get('title', ''))}</strong> "
+        f"({html.escape(str(chart.get('type', '')))}): "
+        f"x={html.escape(str(chart.get('x')))}, y={html.escape(str(chart.get('y')))}</li>"
+        for chart in spec.get("charts", [])
+    )
+    kpi_items = "".join(
+        f"<li>{html.escape(kpi.get('name', ''))} -> {html.escape(kpi.get('fact_id', ''))}</li>"
+        for kpi in spec.get("kpis", [])
     )
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1292,8 +1338,11 @@ def _render_dashboard_html(spec: dict[str, Any]) -> str:
 </head>
 <body>
   <h1>Dashboard Preview</h1>
-  <p>Template: {html.escape(spec.get("template", "generic"))}</p>
-  <ul>{components_html or '<li>No components</li>'}</ul>
+  <p>Title: {html.escape(spec.get("title", "Auto Dashboard"))}</p>
+  <h3>KPIs</h3>
+  <ul>{kpi_items or '<li>No KPIs</li>'}</ul>
+  <h3>Charts</h3>
+  <ul>{chart_items or '<li>No charts</li>'}</ul>
 </body>
 </html>
 """
@@ -1301,84 +1350,81 @@ def _render_dashboard_html(spec: dict[str, Any]) -> str:
 
 def _chart_figure(df: pd.DataFrame, chart: dict[str, Any]):
     chart_type = chart.get("type")
-    source = chart.get("source", {})
     title = chart.get("title", chart_type)
+    x_col = chart.get("x")
+    y_col = chart.get("y")
+    group_by = chart.get("group_by")
+    agg = chart.get("aggregation", "sum")
 
     if chart_type == "line":
-        dt_col = source.get("datetime_column")
-        val_col = source.get("value_column")
-        if dt_col not in df.columns or val_col not in df.columns:
+        if x_col not in df.columns or y_col not in df.columns:
             return None
-        scoped = df[[dt_col, val_col]].copy()
-        scoped[dt_col] = pd.to_datetime(scoped[dt_col], errors="coerce")
-        scoped[val_col] = pd.to_numeric(scoped[val_col], errors="coerce")
+        scoped = df[[x_col, y_col]].copy()
+        scoped[x_col] = pd.to_datetime(scoped[x_col], errors="coerce")
+        scoped[y_col] = pd.to_numeric(scoped[y_col], errors="coerce")
         scoped = scoped.dropna()
         if scoped.empty:
             return None
         grouped = (
-            scoped.set_index(dt_col)[val_col]
-            .resample(source.get("resample", "MS"))
-            .agg(source.get("aggregation", "sum"))
+            scoped.set_index(x_col)[y_col]
+            .resample("MS")
+            .agg(agg if agg in {"sum", "mean", "count"} else "sum")
             .reset_index()
         )
-        return px.line(grouped, x=dt_col, y=val_col, title=title, markers=True)
+        return px.line(grouped, x=x_col, y=y_col, title=title, markers=True)
 
     if chart_type == "bar":
-        cat_col = source.get("category_column")
-        val_col = source.get("value_column")
-        if cat_col not in df.columns or val_col not in df.columns:
+        if x_col not in df.columns or y_col not in df.columns:
             return None
-        scoped = df[[cat_col, val_col]].copy()
-        scoped[val_col] = pd.to_numeric(scoped[val_col], errors="coerce")
+        scoped = df[[x_col, y_col]].copy()
+        scoped[y_col] = pd.to_numeric(scoped[y_col], errors="coerce")
         scoped = scoped.dropna()
         if scoped.empty:
             return None
         grouped = (
-            scoped.groupby(cat_col, dropna=False)[val_col]
-            .agg(source.get("aggregation", "mean"))
+            scoped.groupby(x_col, dropna=False)[y_col]
+            .agg(agg if agg in {"sum", "mean", "count"} else "mean")
             .reset_index()
-            .sort_values(val_col, ascending=False)
-            .head(int(source.get("top_n", 10)))
+            .sort_values(y_col, ascending=False)
+            .head(10)
         )
-        return px.bar(grouped, x=cat_col, y=val_col, title=title)
+        return px.bar(grouped, x=x_col, y=y_col, title=title)
 
-    if chart_type == "bar_count":
-        cat_col = source.get("category_column")
-        if cat_col not in df.columns:
+    if chart_type == "hist":
+        if x_col not in df.columns:
             return None
-        grouped = (
-            df[cat_col]
-            .dropna()
-            .astype(str)
-            .value_counts()
-            .head(int(source.get("top_n", 10)))
-            .rename_axis(cat_col)
-            .reset_index(name="count")
-        )
-        return px.bar(grouped, x=cat_col, y="count", title=title)
-
-    if chart_type == "histogram":
-        val_col = source.get("value_column")
-        if val_col not in df.columns:
-            return None
-        scoped = pd.to_numeric(df[val_col], errors="coerce").dropna()
+        scoped = pd.to_numeric(df[x_col], errors="coerce").dropna()
         if scoped.empty:
             return None
-        histogram_df = pd.DataFrame({val_col: scoped})
-        return px.histogram(histogram_df, x=val_col, nbins=int(source.get("bins", 30)), title=title)
+        histogram_df = pd.DataFrame({x_col: scoped})
+        return px.histogram(histogram_df, x=x_col, nbins=30, title=title)
 
     if chart_type == "scatter":
-        x_col = source.get("x_column")
-        y_col = source.get("y_column")
         if x_col not in df.columns or y_col not in df.columns:
             return None
         scoped = df[[x_col, y_col]].copy()
         scoped[x_col] = pd.to_numeric(scoped[x_col], errors="coerce")
         scoped[y_col] = pd.to_numeric(scoped[y_col], errors="coerce")
+        if isinstance(group_by, str) and group_by in df.columns:
+            scoped[group_by] = df[group_by]
         scoped = scoped.dropna()
         if scoped.empty:
             return None
-        return px.scatter(scoped, x=x_col, y=y_col, title=title)
+        return px.scatter(scoped, x=x_col, y=y_col, color=group_by if isinstance(group_by, str) and group_by in scoped.columns else None, title=title)
+
+    if chart_type == "table":
+        if x_col not in df.columns:
+            return None
+        grouped = (
+            df[x_col]
+            .dropna()
+            .astype(str)
+            .value_counts()
+            .head(15)
+            .rename_axis(x_col)
+            .reset_index(name="count")
+        )
+        return px.bar(grouped, x=x_col, y="count", title=title)
 
     return None
 
@@ -1407,16 +1453,19 @@ def _render_html_report(
     chart_images: list[dict[str, str]] | None = None,
 ) -> str:
     facts_html = "".join(
-        f"<li><strong>{html.escape(fact['metric'])}</strong>: {html.escape(str(fact['value']))}</li>"
-        for fact in facts_bundle.get("facts", [])
+        "<li>"
+        f"<strong>{html.escape(str(fact.get('id')))}</strong>: "
+        f"{html.escape(str(fact.get('value')))}"
+        "</li>"
+        for fact in facts_bundle.get("insight_facts", [])
     )
     insights_html = "".join(
         "<li>"
-        f"<strong>{html.escape(insight['title'])}</strong><br/>"
-        f"{html.escape(insight['statement'])}<br/>"
-        f"<small>Citations: {', '.join(insight.get('citations', []))}</small>"
+        f"<strong>{html.escape(card.get('title', 'Insight'))}</strong><br/>"
+        f"{html.escape(card.get('text', ''))}<br/>"
+        f"<small>Fact IDs: {', '.join(card.get('fact_ids', []))}</small>"
         "</li>"
-        for insight in facts_bundle.get("insights", [])
+        for card in spec.get("insight_cards", [])
     )
 
     missing_items = sorted(
@@ -1495,7 +1544,7 @@ def _render_html_report(
   <ul>{facts_html or '<li>No facts generated</li>'}</ul>
 
   <h2>4) Dashboard Plan</h2>
-  <p>Template: {html.escape(spec.get("template", "generic"))}</p>
+  <p>Title: {html.escape(spec.get("title", "Auto Dashboard"))}</p>
   <ul>{chart_titles or '<li>No chart suggestions</li>'}</ul>
   <div class="grid">{chart_images_html or ''}</div>
 
@@ -1523,13 +1572,28 @@ def _require_session_dir(dataset_id: str) -> Path:
 
 
 def _normalize_job_payload(job: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(job)
-    if normalized.get("status") == "completed":
-        normalized["status"] = "succeeded"
-    progress_value = normalized.get("progress")
+    status = str(job.get("status", "queued"))
+    if status == "completed":
+        status = "succeeded"
+    progress_value = job.get("progress")
+    progress = 0
     if isinstance(progress_value, (int, float)):
-        normalized["progress_percent"] = round(float(progress_value) * 100, 2)
-    return normalized
+        progress = int(max(0.0, min(100.0, float(progress_value))))
+    artifacts = job.get("artifacts") or job.get("artifact_links") or {"facts": None, "spec": None, "report_pdf": None}
+    error = job.get("error")
+    if isinstance(error, str):
+        error = {"code": "job_error", "message": error, "trace": ""}
+    return {
+        "job_id": job.get("job_id"),
+        "dataset_id": job.get("dataset_id"),
+        "type": job.get("type"),
+        "status": status,
+        "progress": progress,
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "artifacts": artifacts,
+        "error": error,
+    }
 
 
 @app.get("/health")
@@ -1757,6 +1821,11 @@ def generate_facts(
     cache_key = _cache_key(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
     cached = cache.get(cache_key)
     if cached and not force:
+        if meta.get("pii_masking_enabled", False):
+            profile_for_mask = _load_profile_if_exists(dataset_id) or {}
+            aliases = _pii_aliases(profile_for_mask)
+            if aliases:
+                cached = _mask_recursive(json.loads(json.dumps(cached)), aliases)
         if response is not None:
             response.headers["ETag"] = _etag_for(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
         return {"dataset_id": dataset_id, "facts_bundle": cached, "cached": True}
@@ -1764,9 +1833,13 @@ def generate_facts(
     facts_path = _facts_path(dataset_id)
     if facts_path.exists() and not force:
         facts_bundle = _load_json(facts_path)
-        signatures = facts_bundle.get("source_hashes", {})
-        if signatures.get("dataset_hash") == file_hash and signatures.get("schema_hash") == schema_hash:
+        if facts_bundle.get("dataset_hash") == file_hash:
             cache.set(cache_key, facts_bundle)
+            if meta.get("pii_masking_enabled", False):
+                profile_for_mask = _load_profile_if_exists(dataset_id) or {}
+                aliases = _pii_aliases(profile_for_mask)
+                if aliases:
+                    facts_bundle = _mask_recursive(json.loads(json.dumps(facts_bundle)), aliases)
             if response is not None:
                 response.headers["ETag"] = _etag_for(
                     dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode
@@ -1776,22 +1849,31 @@ def generate_facts(
     if df is None:
         df = _read_uploaded_file(meta)
     rows, cols = df.shape
-    if mode == "auto" and (rows > MID_ROW_THRESHOLD or cols > MID_COL_MAX):
+    if mode not in {"auto", "sample", "full"}:
+        raise HTTPException(status_code=400, detail="Mode must be one of: auto, sample, full.")
+
+    if mode == "auto":
+        requested_mode = "full" if rows <= SMALL_ROW_MAX and cols <= MID_COL_MAX else "sample"
+    else:
+        requested_mode = mode
+
+    requires_async = rows > SMALL_ROW_MAX
+    if requires_async and not force:
         seed = _seed_from_dataset_hash(file_hash)
         job = create_job(
             "facts",
             dataset_id,
-            {"mode": "sample", "seed": seed, "file_hash": file_hash, "schema_hash": schema_hash},
+            {"mode": requested_mode, "seed": seed, "file_hash": file_hash, "schema_hash": schema_hash},
         )
         try:
             from backend.tasks import generate_facts_task
 
-            generate_facts_task.delay(job["job_id"], dataset_id, "sample", seed)
+            generate_facts_task.delay(job["job_id"], dataset_id, requested_mode, seed)
             actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
-            _append_audit(dataset_id, "facts_job_queued", actor, {"job_id": job["job_id"], "mode": "sample"})
+            _append_audit(dataset_id, "facts_job_queued", actor, {"job_id": job["job_id"], "mode": requested_mode})
         except Exception as exc:
             try:
-                generate_facts_task(job["job_id"], dataset_id, "sample", seed)
+                generate_facts_task(job["job_id"], dataset_id, requested_mode, seed)
                 facts_bundle = _load_json(_facts_path(dataset_id))
                 cache.set(cache_key, facts_bundle)
                 if response is not None:
@@ -1811,8 +1893,13 @@ def generate_facts(
         )
 
     sampling_seed = _seed_from_dataset_hash(file_hash)
-    if mode == "sample":
+    if requested_mode == "sample":
         sampled, sampling_method = _determine_sampling_strategy(df, _build_profile(df), sampling_seed, SAMPLE_MAX_ROWS)
+        bias_note = (
+            "Large dataset sampled for interactive use; run async full mode for complete computation."
+            if rows > MID_ROW_MAX
+            else "Sample used for interactive speed; run full mode for final reporting."
+        )
         profile = _build_profile(sampled)
         profile["data_coverage"] = {
             "mode": "sample",
@@ -1820,21 +1907,20 @@ def generate_facts(
             "rows_used": int(len(sampled)),
             "sampling_method": sampling_method,
             "seed": sampling_seed,
-            "bias_notes": "Sampled dataset used for speed; use full computation for final reporting.",
+            "bias_notes": bias_note,
         }
-        facts_bundle = _build_facts_bundle(sampled, profile)
+        facts_bundle = _build_facts_bundle(sampled, profile, dataset_id=dataset_id, dataset_hash=file_hash)
     else:
         profile = _build_profile(df)
         profile["data_coverage"] = {
             "mode": "full",
             "rows_total": rows,
             "rows_used": rows,
-            "sampling_method": "none",
+            "sampling_method": "uniform",
             "seed": None,
             "bias_notes": "Full dataset used.",
         }
-        facts_bundle = _build_facts_bundle(df, profile)
-    facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
+        facts_bundle = _build_facts_bundle(df, profile, dataset_id=dataset_id, dataset_hash=file_hash)
     _save_json(_facts_path(dataset_id), facts_bundle)
     _save_json(_profile_path(dataset_id), profile)
     meta["artifacts"]["facts"] = str(_facts_path(dataset_id))
@@ -1843,7 +1929,7 @@ def generate_facts(
     meta["status"] = "facts_generated"
     _save_meta(dataset_id, meta)
     actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
-    _append_audit(dataset_id, "facts_generated", actor, {"mode": mode})
+    _append_audit(dataset_id, "facts_generated", actor, {"mode": requested_mode})
 
     cache.set(cache_key, facts_bundle)
     if response is not None:
@@ -1851,14 +1937,7 @@ def generate_facts(
     if meta.get("pii_masking_enabled", False):
         pii_columns = profile.get("pii_candidates", [])
         aliases = {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
-        masked_bundle = json.loads(json.dumps(facts_bundle))
-        masked_bundle["facts"] = [
-            {
-                **fact,
-                "value": _mask_recursive(fact.get("value"), aliases),
-            }
-            for fact in masked_bundle.get("facts", [])
-        ]
+        masked_bundle = _mask_recursive(json.loads(json.dumps(facts_bundle)), aliases)
         return {"dataset_id": dataset_id, "facts_bundle": masked_bundle}
 
     return {"dataset_id": dataset_id, "facts_bundle": facts_bundle}
@@ -1976,11 +2055,11 @@ def generate_dashboard_spec(
 
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
+        if not _is_facts_bundle_compatible(facts_bundle):
+            facts_bundle = _build_facts_bundle(df, profile, dataset_id=dataset_id, dataset_hash=file_hash)
+            _save_json(facts_path, facts_bundle)
     else:
-        if use_llm:
-            raise HTTPException(status_code=400, detail="Facts bundle not found. Generate facts before dashboard spec.")
-        facts_bundle = _build_facts_bundle(df, profile)
-        facts_bundle["source_hashes"] = {"dataset_hash": file_hash, "schema_hash": schema_hash}
+        facts_bundle = _build_facts_bundle(df, profile, dataset_id=dataset_id, dataset_hash=file_hash)
         _save_json(facts_path, facts_bundle)
 
     template = payload.template if payload else "health_core"
@@ -1990,7 +2069,13 @@ def generate_dashboard_spec(
         except (SchemaValidationError, FactsGroundingError) as exc:
             raise HTTPException(status_code=422, detail=f"Invalid dashboard spec from LLM: {exc}") from exc
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"LLM unavailable for dashboard spec: {exc}") from exc
+            spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
+            _append_audit(
+                dataset_id,
+                "dashboard_spec_generated",
+                _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
+                {"use_llm": False, "fallback_reason": str(exc), "template": template},
+            )
     else:
         spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
 
@@ -2030,6 +2115,26 @@ def ask_dataset(
     facts_path = _facts_path(dataset_id)
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
+        if not _is_facts_bundle_compatible(facts_bundle):
+            if not meta.get("file"):
+                raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+            refreshed_df = _read_uploaded_file(meta)
+            refreshed_profile = _build_profile(refreshed_df)
+            refreshed_profile["data_coverage"] = {
+                "mode": "full",
+                "rows_total": int(len(refreshed_df)),
+                "rows_used": int(len(refreshed_df)),
+                "sampling_method": "uniform",
+                "seed": None,
+                "bias_notes": "Full dataset used.",
+            }
+            facts_bundle = _build_facts_bundle(
+                refreshed_df,
+                refreshed_profile,
+                dataset_id=dataset_id,
+                dataset_hash=str(meta.get("file_hash") or _dataset_signature(meta)),
+            )
+            _save_json(facts_path, facts_bundle)
     else:
         raise HTTPException(status_code=400, detail="Facts bundle not generated. Run /sessions/{id}/facts first.")
 
@@ -2047,27 +2152,25 @@ def ask_dataset(
     df = _read_uploaded_file(meta)
 
     try:
-        query_plan = _generate_query_plan_llm(payload.question, facts_bundle)
-    except (SchemaValidationError, FactsGroundingError) as exc:
-        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_plan"})
-        raise HTTPException(status_code=422, detail=f"Invalid query plan from LLM: {exc}") from exc
-    except Exception as exc:
-        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "llm_unavailable"})
-        raise HTTPException(status_code=503, detail=f"LLM unavailable for query plan: {exc}") from exc
-
-    result_df, execution_note = _execute_query_plan(df, query_plan)
-    requested_facts = [value for value in query_plan.get("requested_facts", []) if isinstance(value, str)]
+        query_plan = _generate_query_plan_llm(payload.question, facts_bundle, profile)
+    except Exception:
+        query_plan = _fallback_query_plan(payload.question, profile)
 
     try:
-        answer, facts_used = _summarize_query_result_llm(payload.question, result_df, facts_bundle, requested_facts)
-    except (SchemaValidationError, FactsGroundingError) as exc:
-        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_summary"})
-        raise HTTPException(status_code=422, detail=f"Invalid summary from LLM: {exc}") from exc
-    except Exception as exc:
+        validate_schema(query_plan, QUERY_PLAN_SCHEMA)
+    except SchemaValidationError as exc:
+        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_plan"})
+        raise HTTPException(status_code=422, detail=f"Invalid query plan: {exc}") from exc
+
+    result_df, execution_note = _execute_query_plan(df, query_plan)
+    candidate_fact_ids = _default_fact_ids(facts_bundle)
+
+    try:
+        answer, facts_used = _summarize_query_result_llm(payload.question, result_df, facts_bundle, candidate_fact_ids)
+    except Exception:
         fallback_answer, fallback_facts, _, _, _ = _safe_answer_from_facts(payload.question, facts_bundle)
         answer = f"{fallback_answer} ({execution_note})"
-        facts_used = fallback_facts or requested_facts
-        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "llm_fallback", "error": str(exc)})
+        facts_used = fallback_facts or candidate_fact_ids
 
     _append_audit(
         dataset_id,
@@ -2079,6 +2182,22 @@ def ask_dataset(
     data_coverage = (facts_bundle.get("data_coverage") or {}).get("mode", "sample")
     confidence = "Medium" if facts_used else "Low"
     fact_coverage = 1.0 if facts_used else 0.0
+    result_rows = json.loads(result_df.head(min(int(query_plan.get("limit", 25)), 100)).to_json(orient="records", date_format="iso"))
+    chart_type = query_plan.get("chart_hint", "table")
+    columns = list(result_df.columns)
+    chart_payload: dict[str, Any] | None = None
+    if chart_type != "table" and columns:
+        x_col = columns[0]
+        y_col = columns[1] if len(columns) > 1 else columns[0]
+        chart_payload = {
+            "type": chart_type,
+            "x": x_col,
+            "y": y_col,
+            "title": f"Ask result: {chart_type}",
+        }
+    else:
+        chart_payload = {"type": "table", "columns": columns}
+
     return AskResponse(
         dataset_id=dataset_id,
         answer=answer,
@@ -2087,6 +2206,8 @@ def ask_dataset(
         fact_coverage=fact_coverage,
         data_coverage=data_coverage,
         query_plan=query_plan,
+        result_rows=result_rows,
+        chart=chart_payload,
     )
 
 
@@ -2166,6 +2287,11 @@ def get_report_pdf(dataset_id: str, x_api_key: str | None = Header(default=None,
     return Response(content=path.read_bytes(), media_type="application/pdf")
 
 
+@app.get("/sessions/{dataset_id}/export/pdf")
+def export_pdf_direct(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> Response:
+    return get_report_pdf(dataset_id, x_api_key=x_api_key)
+
+
 @app.get("/jobs")
 def list_all_jobs(dataset_id: str | None = Query(default=None)) -> dict[str, Any]:
     return {"jobs": [_normalize_job_payload(job) for job in list_jobs(dataset_id=dataset_id)]}
@@ -2241,7 +2367,7 @@ def export_dataset(
         df.to_csv(stream, index=False)
         return Response(content=stream.getvalue(), media_type="text/csv")
 
-    raise HTTPException(status_code=400, detail="Unsupported export format. Use html, dashboard, json, or csv.")
+    raise HTTPException(status_code=400, detail="Unsupported export format. Use html, pdf, dashboard, json, or csv.")
 
 
 @app.get("/sessions/{dataset_id}/audit")
