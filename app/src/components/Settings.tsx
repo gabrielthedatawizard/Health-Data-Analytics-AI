@@ -143,11 +143,11 @@ export function Settings({ onLogout }: SettingsProps) {
   }, [theme, notifications, privacy, services]);
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="max-w-4xl space-y-4 sm:space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-foreground">{t.settings}</h1>
-        <p className="text-muted-foreground mt-1">
+        <h1 className="text-xl font-bold text-foreground sm:text-2xl">{t.settings}</h1>
+        <p className="mt-1 text-sm text-muted-foreground sm:text-base">
           {language === 'sw' ? 'Dhibiti mapendeleo yako na mipangilio ya akaunti' : 'Manage your preferences and account settings'}
         </p>
       </div>
@@ -165,7 +165,7 @@ export function Settings({ onLogout }: SettingsProps) {
           {/* Theme Selection */}
           <div>
             <Label className="text-sm font-medium mb-3 block">{t.theme}</Label>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               {[
                 { value: 'system', icon: Monitor, label: t.system },
                 { value: 'light', icon: Sun, label: t.light },
@@ -204,7 +204,7 @@ export function Settings({ onLogout }: SettingsProps) {
           {/* Language Selection */}
           <div>
             <Label className="text-sm font-medium mb-3 block">{t.language}</Label>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {[
                 { value: 'en' as Language, label: t.english, flag: '🇺🇸' },
                 { value: 'sw' as Language, label: t.swahili, flag: '🇹🇿' },
@@ -253,8 +253,8 @@ export function Settings({ onLogout }: SettingsProps) {
             { key: 'alerts', label: t.dataQualityAlerts, icon: '⚠️' },
             { key: 'weekly', label: t.weeklySummary, icon: '📊' },
           ].map((item) => (
-            <div key={item.key} className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
+            <div key={item.key} className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3">
                 <span>{item.icon}</span>
                 <Label htmlFor={item.key} className="text-sm cursor-pointer">
                   {item.label}
@@ -286,8 +286,8 @@ export function Settings({ onLogout }: SettingsProps) {
             { key: 'analytics', label: t.usageAnalytics, desc: language === 'sw' ? 'Tusaidie kuboresha kwa kushiriki takwimu za matumizi' : 'Help us improve by sharing anonymous usage data' },
             { key: 'shareData', label: t.shareAnonymousData, desc: language === 'sw' ? 'Changia utafiti wa afya kwa data isiyojulikana' : 'Contribute to health research with anonymized data' },
           ].map((item) => (
-            <div key={item.key} className="flex items-start justify-between">
-              <div className="space-y-1">
+            <div key={item.key} className="flex items-start justify-between gap-4">
+              <div className="space-y-1 min-w-0">
                 <Label htmlFor={item.key} className="text-sm font-medium cursor-pointer">
                   {item.label}
                 </Label>
@@ -322,7 +322,7 @@ export function Settings({ onLogout }: SettingsProps) {
               <button
                 type="button"
                 key={service.name}
-                className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
+                className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 p-3"
                 onClick={() =>
                   setServices((prev) =>
                     prev.map((item) =>
@@ -338,7 +338,7 @@ export function Settings({ onLogout }: SettingsProps) {
               >
                 <div className="flex items-center gap-3">
                   <service.icon className="w-5 h-5 text-muted-foreground" />
-                  <span className="text-sm">{service.name}</span>
+                  <span className="text-sm break-words">{service.name}</span>
                 </div>
                 <Badge 
                   variant="outline" 

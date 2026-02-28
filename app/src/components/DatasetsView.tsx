@@ -125,20 +125,20 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 sm:space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-foreground">Datasets</h1>
-          <p className="text-muted-foreground mt-1">Manage and explore your health data</p>
+          <h1 className="text-xl font-bold text-foreground sm:text-2xl">Datasets</h1>
+          <p className="mt-1 text-sm text-muted-foreground sm:text-base">Manage and explore your health data</p>
         </div>
 
-        <Button className="gap-2 gradient-mint text-background hover:opacity-90" onClick={() => onViewChange('upload')}>
+        <Button className="gap-2 gradient-mint text-background hover:opacity-90 w-full sm:w-auto" onClick={() => onViewChange('upload')}>
           <Plus className="w-4 h-4" />
           Add Dataset
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
           { label: 'Total Datasets', value: stats.totalDatasets.toLocaleString(), icon: Database, color: 'bg-health-mint/20 text-health-mint' },
           { label: 'Total Records', value: stats.totalRows.toLocaleString(), icon: BarChart3, color: 'bg-blue-500/20 text-blue-400' },
@@ -169,14 +169,14 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
             className="pl-10"
           />
         </div>
-        <div className="flex gap-2">
-          <Button variant="outline" className="gap-2" onClick={() => setStatusFilter((previous) => statusCycle(previous))}>
+        <div className="flex flex-wrap gap-2 sm:flex-nowrap">
+          <Button variant="outline" className="gap-2 w-full sm:w-auto" onClick={() => setStatusFilter((previous) => statusCycle(previous))}>
             <Filter className="w-4 h-4" />
             Filter: {statusLabels[statusFilter]}
           </Button>
           <Button
             variant="outline"
-            className="gap-2"
+            className="gap-2 w-full sm:w-auto"
             onClick={() => {
               const snapshot = datasets.map((dataset) => ({
                 id: dataset.id,
@@ -203,16 +203,16 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
           return (
             <Card key={dataset.id} className="glass-card card-hover">
               <CardContent className="p-5">
-                <div className="flex items-start gap-4">
+                <div className="flex items-start gap-3 sm:gap-4">
                   <div className={cn('w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0', datasetColorClasses(dataset.type))}>
                     <Icon className="w-6 h-6" />
                   </div>
 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <h4 className="font-semibold text-foreground">{dataset.name}</h4>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h4 className="truncate font-semibold text-foreground">{dataset.name}</h4>
                           {dataset.status === 'processing' && (
                             <Badge variant="outline" className="text-xs gap-1 border-amber-500/30 text-amber-400">
                               <Clock className="w-3 h-3 animate-spin" />
@@ -289,7 +289,7 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
                       ))}
                     </div>
 
-                    <div className="flex items-center gap-4 mt-4 pt-4 border-t border-border">
+                    <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border pt-4 sm:gap-4">
                       <div className="flex items-center gap-1.5">
                         <BarChart3 className="w-4 h-4 text-muted-foreground" />
                         <span className="text-sm text-foreground">{dataset.rowCount.toLocaleString()}</span>
@@ -300,7 +300,7 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
                         <span className="text-sm text-foreground">{dataset.columnCount}</span>
                         <span className="text-xs text-muted-foreground">columns</span>
                       </div>
-                      <div className="ml-auto flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 sm:ml-auto">
                         {dataset.qualityScore >= 85 ? (
                           <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                         ) : (
@@ -321,7 +321,7 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between mt-3 text-xs text-muted-foreground">
+                    <div className="mt-3 flex flex-col gap-1 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
                       <span>By {dataset.createdBy}</span>
                       <span>Updated {new Date(dataset.lastUpdated).toLocaleDateString()}</span>
                     </div>
@@ -350,7 +350,7 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
       )}
 
       <Dialog open={Boolean(previewDataset)} onOpenChange={(open) => (!open ? setPreviewDataset(null) : undefined)}>
-        <DialogContent className="max-w-4xl">
+        <DialogContent className="max-w-4xl w-[calc(100vw-1rem)] sm:w-full">
           <DialogHeader>
             <DialogTitle>{previewDataset?.name}</DialogTitle>
             <DialogDescription>

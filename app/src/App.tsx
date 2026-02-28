@@ -17,6 +17,7 @@ export type ViewType = 'dashboard' | 'upload' | 'datasets' | 'insights' | 'ai_an
 function AppContent() {
   const [currentView, setCurrentView] = useState<ViewType>('dashboard');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [showLanding, setShowLanding] = useState(() => !localStorage.getItem('healthai_visited'));
 
@@ -43,14 +44,29 @@ function AppContent() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth >= 1024) {
+        setMobileSidebarOpen(false);
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  const handleViewChange = (view: ViewType) => {
+    setCurrentView(view);
+    setMobileSidebarOpen(false);
+  };
+
   const renderView = () => {
     switch (currentView) {
       case 'dashboard':
         return <Dashboard />;
       case 'upload':
-        return <DataUpload onViewChange={setCurrentView} />;
+        return <DataUpload onViewChange={handleViewChange} />;
       case 'datasets':
-        return <DatasetsView onViewChange={setCurrentView} />;
+        return <DatasetsView onViewChange={handleViewChange} />;
       case 'insights':
         return <InsightsPanel />;
       case 'settings':
@@ -64,17 +80,22 @@ function AppContent() {
 
   // Handle search result click - navigate to appropriate view
   const handleSearchResult = (result: { type: string; item: unknown }) => {
+    const switchView = (view: ViewType) => {
+      setCurrentView(view);
+      setMobileSidebarOpen(false);
+    };
+
     switch (result.type) {
       case 'dataset':
-        setCurrentView('datasets');
+        switchView('datasets');
         break;
       case 'insight':
-        setCurrentView('insights');
+        switchView('insights');
         break;
       case 'kpi':
       case 'district':
       case 'facility':
-        setCurrentView('dashboard');
+        switchView('dashboard');
         break;
     }
   };
@@ -85,23 +106,26 @@ function AppContent() {
   }
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex h-dvh min-h-screen bg-background overflow-hidden">
       <Sidebar 
         collapsed={sidebarCollapsed} 
         onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
         currentView={currentView}
-        onViewChange={setCurrentView}
+        onViewChange={handleViewChange}
+        mobileOpen={mobileSidebarOpen}
+        onMobileClose={() => setMobileSidebarOpen(false)}
       />
       
       <div className="flex-1 flex flex-col min-w-0">
         <Header 
           currentView={currentView}
           onSearchClick={() => setIsSearchOpen(true)}
-          onViewChange={setCurrentView}
+          onViewChange={handleViewChange}
           onLogout={handleLogout}
+          onMenuClick={() => setMobileSidebarOpen(true)}
         />
         
-        <main className="flex-1 overflow-auto custom-scrollbar p-6">
+        <main className="flex-1 overflow-auto custom-scrollbar p-3 sm:p-4 lg:p-6">
           {renderView()}
         </main>
       </div>

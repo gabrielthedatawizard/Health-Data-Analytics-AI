@@ -218,7 +218,7 @@ export function SearchModal({ isOpen, onClose, onResultClick }: SearchModalProps
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-20">
+    <div className="fixed inset-0 z-50 flex items-start justify-center p-3 pt-12 sm:p-4 sm:pt-20">
       {/* Backdrop */}
         <div 
           className="absolute inset-0 bg-background/80 backdrop-blur-sm"
@@ -226,7 +226,7 @@ export function SearchModal({ isOpen, onClose, onResultClick }: SearchModalProps
         />
       
       {/* Modal */}
-      <div className="relative w-full max-w-2xl mx-4 bg-card border border-border rounded-2xl shadow-2xl overflow-hidden">
+      <div className="relative w-full max-w-2xl bg-card border border-border rounded-2xl shadow-2xl overflow-hidden">
         {/* Search Input */}
         <div className="flex items-center gap-3 p-4 border-b border-border">
           <Search className="w-5 h-5 text-muted-foreground" />
@@ -237,7 +237,7 @@ export function SearchModal({ isOpen, onClose, onResultClick }: SearchModalProps
               setSelectedIndex(0);
             }}
             placeholder="Search datasets, insights, KPIs, districts, facilities..."
-            className="flex-1 border-0 bg-transparent text-lg focus-visible:ring-0 placeholder:text-muted-foreground"
+            className="flex-1 border-0 bg-transparent text-base focus-visible:ring-0 placeholder:text-muted-foreground sm:text-lg"
             autoFocus
           />
           {query && (
@@ -274,8 +274,8 @@ export function SearchModal({ isOpen, onClose, onResultClick }: SearchModalProps
                 >
                   <ResultIcon type={result.type} />
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-foreground">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-foreground break-words">
                         {getResultTitle(result)}
                       </span>
                       <Badge variant="outline" className="text-xs">
@@ -368,14 +368,15 @@ export function SearchModal({ isOpen, onClose, onResultClick }: SearchModalProps
         {/* Footer */}
         <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-muted/30">
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1">
+            <span className="hidden items-center gap-1 sm:flex">
               <kbd className="px-1.5 py-0.5 bg-muted rounded">↑↓</kbd>
               Navigate
             </span>
-            <span className="flex items-center gap-1">
+            <span className="hidden items-center gap-1 sm:flex">
               <kbd className="px-1.5 py-0.5 bg-muted rounded">↵</kbd>
               Select
             </span>
+            <span className="sm:hidden">Tap a result to open</span>
           </div>
           <div className="flex items-center gap-2">
             <Sparkles className="w-3 h-3 text-health-mint" />

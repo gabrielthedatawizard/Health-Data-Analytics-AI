@@ -243,9 +243,9 @@ export function AIAnalyticsDashboard() {
   };
 
   return (
-    <div className="space-y-6">
-      <section className="rounded-2xl border border-border bg-card p-6">
-        <h2 className="text-xl font-semibold text-foreground">AI Analytics Engine (files (1).zip)</h2>
+    <div className="space-y-4 sm:space-y-6">
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <h2 className="text-lg font-semibold text-foreground sm:text-xl">AI Analytics Engine (files (1).zip)</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           Upload a dataset, generate facts/dashboard spec, then optionally run Claude-powered insights and ask-data.
         </p>
@@ -261,7 +261,7 @@ export function AIAnalyticsDashboard() {
           <button
             type="submit"
             disabled={isUploading || !file}
-            className="rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+            className="w-full rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50 sm:w-auto"
           >
             {isUploading ? 'Processing...' : 'Upload + Build Facts'}
           </button>
@@ -271,22 +271,22 @@ export function AIAnalyticsDashboard() {
       </section>
 
       {(sessionId || datasetId) && (
-        <section className="grid gap-4 md:grid-cols-4">
-          <div className="rounded-2xl border border-border bg-card p-4">
+        <section className="grid gap-3 sm:gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Session ID</p>
             <p className="mt-1 break-all text-sm text-foreground">{sessionId}</p>
           </div>
-          <div className="rounded-2xl border border-border bg-card p-4">
+          <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Dataset ID</p>
             <p className="mt-1 break-all text-sm text-foreground">{datasetId}</p>
           </div>
-          <div className="rounded-2xl border border-border bg-card p-4">
+          <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Rows / Columns</p>
             <p className="mt-1 text-sm text-foreground">
               {profile ? `${profile.row_count.toLocaleString()} / ${profile.column_count.toLocaleString()}` : 'Pending'}
             </p>
           </div>
-          <div className="rounded-2xl border border-border bg-card p-4">
+          <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Quality Score</p>
             <p className="mt-1 text-sm text-foreground">
               {profile ? `${profile.quality_score.score} (${profile.quality_score.grade})` : 'Pending'}
@@ -296,13 +296,13 @@ export function AIAnalyticsDashboard() {
       )}
 
       {kpis.length > 0 && (
-        <section className="rounded-2xl border border-border bg-card p-6">
+        <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
           <h3 className="text-lg font-medium text-foreground">Computed KPI Totals</h3>
-          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {kpis.map(([metric, value]) => (
-              <div key={metric} className="rounded-xl border border-border bg-background p-4">
+              <div key={metric} className="rounded-xl border border-border bg-background p-3 sm:p-4">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">{metric}</p>
-                <p className="mt-1 text-lg font-semibold text-foreground">{value.total?.toLocaleString() ?? 'n/a'}</p>
+                <p className="mt-1 text-base font-semibold text-foreground sm:text-lg">{value.total?.toLocaleString() ?? 'n/a'}</p>
                 <p className="text-xs text-muted-foreground">mean: {value.mean?.toLocaleString() ?? 'n/a'}</p>
               </div>
             ))}
@@ -311,7 +311,7 @@ export function AIAnalyticsDashboard() {
       )}
 
       {dashboardSpec && (
-        <section className="rounded-2xl border border-border bg-card p-6">
+        <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
           <h3 className="text-lg font-medium text-foreground">Dashboard Spec</h3>
           <p className="mt-2 text-sm text-muted-foreground">
             {dashboardSpec.title ?? 'Untitled'} - Components: {dashboardSpec.components?.length ?? 0}
@@ -320,7 +320,7 @@ export function AIAnalyticsDashboard() {
       )}
 
       {sessionId && (
-        <section className="rounded-2xl border border-border bg-card p-6">
+        <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
           <div className="flex flex-wrap items-center gap-3">
             <h3 className="text-lg font-medium text-foreground">Claude Insights</h3>
             <button
@@ -359,7 +359,7 @@ export function AIAnalyticsDashboard() {
       )}
 
       {sessionId && (
-        <section className="rounded-2xl border border-border bg-card p-6">
+        <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
           <h3 className="text-lg font-medium text-foreground">Ask Your Data</h3>
           <div className="mt-3 flex flex-col gap-3 sm:flex-row">
             <input
@@ -372,7 +372,7 @@ export function AIAnalyticsDashboard() {
               type="button"
               onClick={handleAsk}
               disabled={isAsking || !askQuestion.trim()}
-              className="rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+              className="w-full rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50 sm:w-auto"
             >
               {isAsking ? 'Asking...' : 'Ask'}
             </button>

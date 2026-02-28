@@ -763,9 +763,21 @@ Before generating insights, produce a query plan:
 
 Output JSON: {{"intent":"...","critical_keys":[...],"template":"...","quality_flag":"..."}}
 """
-    plan_raw = _claude(system=plan_system, user=plan_prompt, max_tokens=700)
-    plan_candidate = _safe_json_parse(plan_raw)
-    query_plan = plan_candidate if isinstance(plan_candidate, dict) else {}
+    try:
+        plan_raw = _claude(system=plan_system, user=plan_prompt, max_tokens=700)
+        plan_candidate = _safe_json_parse(plan_raw)
+        query_plan = plan_candidate if isinstance(plan_candidate, dict) else {}
+    except ClaudeUnavailableError:
+        query_plan = _heuristic_query_plan(facts)
+        local = _local_insights_from_facts(facts, query_plan=query_plan)
+        local["memory_applied"] = bool(memory_context)
+        if memory:
+            memory.add_history(
+                "auto_insight_generation",
+                str(local.get("executive_summary", ""))[:200],
+                str(local.get("confidence", "Medium")),
+            )
+        return _validate_claims(local, facts)
 
     template_key = _select_domain_template(facts, query_plan)
     full_system = build_full_system_prompt(_INSIGHT_SYSTEM, memory, template_key)
@@ -787,7 +799,12 @@ Generate full structured insights. Output JSON with:
 - "confidence": "High"|"Medium"|"Low"
 - "follow_up_questions": [str, str, str]
 """
-    raw = _claude(system=full_system, user=insight_prompt)
+    try:
+        raw = _claude(system=full_system, user=insight_prompt)
+    except ClaudeUnavailableError:
+        local = _local_insights_from_facts(facts, query_plan=query_plan)
+        local["memory_applied"] = bool(memory_context)
+        return _validate_claims(local, facts)
     parsed = _safe_json_parse(raw)
     if not isinstance(parsed, dict):
         return {"error": "Parse failed", "raw": raw}
@@ -850,6 +867,289 @@ def _validate_claims(parsed: dict, facts: dict) -> dict:
     parsed["fact_coverage"] = "validated"
     parsed["validator"] = "claims_checked_against_facts_bundle"
     return parsed
+
+
+def _heuristic_query_plan(facts: dict, question: str = "") -> dict[str, Any]:
+    intent = "definition_lookup"
+    q = question.lower().strip()
+    if any(token in q for token in ("trend", "month", "year", "over time", "change")):
+        intent = "trend_analysis"
+    elif any(token in q for token in ("compare", "vs", "versus", "highest", "lowest")):
+        intent = "comparison"
+    elif any(token in q for token in ("outlier", "anomaly")):
+        intent = "outlier_detection"
+    elif any(token in q for token in ("why", "cause", "reason")):
+        intent = "root_cause"
+    elif any(token in q for token in ("forecast", "predict")):
+        intent = "forecast"
+    elif any(token in q for token in ("cohort", "retention")):
+        intent = "cohort_analysis"
+    elif any(token in q for token in ("kpi", "target", "coverage", "rate")):
+        intent = "kpi_check"
+    elif not q:
+        intent = "dataset_overview"
+
+    critical_keys = ["metrics", "quality"]
+    if facts.get("trends"):
+        critical_keys.append("trends")
+    if facts.get("segments"):
+        critical_keys.append("segments")
+    if facts.get("outliers"):
+        critical_keys.append("outliers")
+
+    template = _select_domain_template(facts)
+    quality = facts.get("quality", {})
+    quality_flag = "good"
+    missingness = quality.get("missingness", {}).get("overall_pct")
+    if isinstance(missingness, (int, float)) and missingness > 0.2:
+        quality_flag = "warning_high_missingness"
+
+    return {
+        "intent": intent,
+        "critical_keys": critical_keys,
+        "template": template,
+        "quality_flag": quality_flag,
+    }
+
+
+def _local_insights_from_facts(facts: dict, query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    metrics = facts.get("metrics", {}).get("kpis", {})
+    quality = facts.get("quality", {})
+    trends = facts.get("trends", {})
+    outliers = facts.get("outliers", {})
+
+    key_findings: list[dict[str, str]] = []
+    for metric, values in list(metrics.items())[:4]:
+        total = values.get("total")
+        mean = values.get("mean")
+        key_findings.append(
+            {
+                "finding": f"{metric} total is {total} with mean {mean}.",
+                "fact_key": f"metrics.kpis.{metric}",
+                "value": str(total),
+                "action": f"Track {metric} weekly for early deviation detection.",
+            }
+        )
+
+    for trend_key, trend_value in list(trends.items())[:2]:
+        pct = trend_value.get("pct_change_last_2")
+        key_findings.append(
+            {
+                "finding": f"{trend_key} latest change is {pct}%.",
+                "fact_key": f"trends.{trend_key}.pct_change_last_2",
+                "value": str(pct),
+                "action": "Review facilities driving the latest period movement.",
+            }
+        )
+
+    proactive_alerts: list[dict[str, str]] = []
+    for metric, info in list(outliers.items())[:2]:
+        proactive_alerts.append(
+            {
+                "type": "anomaly",
+                "severity": "warning",
+                "title": f"Outliers in {metric}",
+                "detail": f"{info.get('count')} outliers detected in {metric}.",
+            }
+        )
+
+    missingness = quality.get("missingness", {}).get("overall_pct")
+    data_quality_notes = [f"Overall missingness: {missingness}."]
+    limitations = ["LLM disabled; narrative generated using deterministic local rules."]
+
+    summary = (
+        "Local analytics mode is active. Insights are generated from computed facts only. "
+        "Use these findings for directional monitoring and follow up with deeper analysis when needed."
+    )
+    confidence = "Medium" if metrics else "Low"
+
+    return {
+        "executive_summary": summary,
+        "key_findings": key_findings,
+        "proactive_alerts": proactive_alerts,
+        "cohort_narrative": "Cohort narrative unavailable until cohort analysis is run.",
+        "data_quality_notes": data_quality_notes,
+        "limitations": limitations,
+        "confidence": confidence,
+        "follow_up_questions": [
+            "Which district contributed most to the latest trend change?",
+            "Which metric has the highest outlier rate?",
+            "Should this be rerun on filtered segments?",
+        ],
+        "query_plan": query_plan or _heuristic_query_plan(facts),
+        "mode": "local_fallback",
+    }
+
+
+def _local_ask_from_facts(question: str, facts: dict) -> dict[str, Any]:
+    q = question.lower()
+    metrics = facts.get("metrics", {}).get("kpis", {})
+    trends = facts.get("trends", {})
+
+    if "highest" in q or "max" in q:
+        best_name = None
+        best_total = None
+        for name, vals in metrics.items():
+            total = vals.get("total")
+            if isinstance(total, (int, float)) and (best_total is None or total > best_total):
+                best_name, best_total = name, total
+        if best_name is not None:
+            return {
+                "query_plan": {
+                    "intent": "comparison",
+                    "facts_keys_used": [f"metrics.kpis.{best_name}.total"],
+                    "computation_required": False,
+                    "confidence": "Medium",
+                },
+                "answer": f"{best_name} has the highest total at {best_total}.",
+                "facts_used": [f"metrics.kpis.{best_name}.total"],
+                "chart_recommendation": {"type": "bar", "title": "Highest metric totals", "data_key": "metrics.kpis"},
+                "follow_up_questions": [
+                    "How does this vary by district?",
+                    "What is the month-over-month change?",
+                ],
+                "action_implication": f"Prioritize validating drivers behind high {best_name} volume.",
+                "confidence": "Medium",
+                "needs_analysis": False,
+                "mode": "local_fallback",
+            }
+
+    if "trend" in q and trends:
+        first_key = next(iter(trends.keys()))
+        pct = trends[first_key].get("pct_change_last_2")
+        return {
+            "query_plan": {
+                "intent": "trend_analysis",
+                "facts_keys_used": [f"trends.{first_key}.pct_change_last_2"],
+                "computation_required": False,
+                "confidence": "Medium",
+            },
+            "answer": f"The latest observed change for {first_key} is {pct}%.",
+            "facts_used": [f"trends.{first_key}.pct_change_last_2"],
+            "chart_recommendation": {"type": "line", "title": f"{first_key} trend", "data_key": f"trends.{first_key}"},
+            "follow_up_questions": [
+                "Which segment explains this change?",
+                "Is this change sustained over multiple periods?",
+            ],
+            "action_implication": "Investigate the most recent period for underlying operational causes.",
+            "confidence": "Medium",
+            "needs_analysis": False,
+            "mode": "local_fallback",
+        }
+
+    return {
+        "query_plan": {
+            "intent": _heuristic_query_plan(facts, question).get("intent"),
+            "facts_keys_used": ["metrics", "quality"],
+            "computation_required": False,
+            "confidence": "Low",
+        },
+        "answer": "Local mode could not find a precise answer in the current facts. Try asking about totals, averages, trends, or outliers.",
+        "facts_used": [],
+        "chart_recommendation": {"type": "none", "title": "Not enough context", "data_key": ""},
+        "follow_up_questions": [
+            "Which metric has the highest total?",
+            "What are the top data quality concerns?",
+        ],
+        "action_implication": "Refine the question or run additional analysis endpoints.",
+        "confidence": "Low",
+        "needs_analysis": True,
+        "mode": "local_fallback",
+    }
+
+
+def _local_proactive_radar(facts: dict) -> dict[str, Any]:
+    alerts: list[dict[str, str]] = []
+    quality = facts.get("quality", {})
+    missing = quality.get("missingness", {}).get("overall_pct")
+    if isinstance(missing, (int, float)) and missing > 0.1:
+        alerts.append(
+            {
+                "type": "data_quality",
+                "severity": "warning",
+                "title": "High missingness detected",
+                "detail": f"Overall missingness is {missing}.",
+                "fact_key": "quality.missingness.overall_pct",
+                "recommended_action": "Prioritize completion on high-missing fields.",
+                "chart_type": "table",
+            }
+        )
+
+    for metric, info in list(facts.get("outliers", {}).items())[:2]:
+        alerts.append(
+            {
+                "type": "anomaly",
+                "severity": "warning",
+                "title": f"Outliers in {metric}",
+                "detail": f"{info.get('count')} outliers identified via IQR.",
+                "fact_key": f"outliers.{metric}",
+                "recommended_action": f"Validate extreme {metric} values at source facilities.",
+                "chart_type": "bar",
+            }
+        )
+
+    if not alerts:
+        alerts.append(
+            {
+                "type": "info",
+                "severity": "info",
+                "title": "No critical alerts",
+                "detail": "No high-severity anomaly detected from current computed facts.",
+                "fact_key": "metrics",
+                "recommended_action": "Continue routine monitoring.",
+                "chart_type": "kpi_card",
+            }
+        )
+
+    return {"alerts": alerts[:5], "scanned_at": datetime.now(timezone.utc).isoformat(), "mode": "local_fallback"}
+
+
+def _local_report_body(facts: dict, insights: dict) -> str:
+    metrics = facts.get("metrics", {}).get("kpis", {})
+    quality = facts.get("quality", {})
+    rows = metrics.items()
+    kpi_rows = "".join(
+        f"<tr><td>{name}</td><td>{vals.get('total')}</td><td>{vals.get('mean')}</td></tr>" for name, vals in list(rows)[:8]
+    )
+    return f"""
+<h2>Executive Summary</h2>
+<p>{insights.get("executive_summary", "Local deterministic report generated from facts bundle.")}</p>
+<h2>Dataset Overview</h2>
+<p>Rows: {facts.get("metrics", {}).get("row_count")} | Columns: {facts.get("metrics", {}).get("column_count")}</p>
+<p>Overall missingness: {quality.get("missingness", {}).get("overall_pct")}</p>
+<h2>Key Performance Indicators</h2>
+<table>
+  <thead><tr><th>Metric</th><th>Total</th><th>Mean</th></tr></thead>
+  <tbody>{kpi_rows}</tbody>
+</table>
+<h2>Limitations</h2>
+<ul><li>LLM unavailable; report narrative generated by local rules.</li></ul>
+"""
+
+
+def _local_eval_accuracy(question: str, ai_answer: str, ground_truth: dict[str, Any]) -> dict[str, Any]:
+    discrepancies: list[dict[str, Any]] = []
+    ai_lower = ai_answer.lower()
+    score = 100
+    for key, value in ground_truth.items():
+        value_str = str(value).lower()
+        if value_str not in ai_lower:
+            discrepancies.append({"claimed": f"{key} not found in answer", "actual": str(value), "severity": "major"})
+            score -= 15
+    score = max(score, 0)
+    verdict = "pass" if score >= 80 else "needs_review" if score >= 60 else "fail"
+    return {
+        "overall_score": score,
+        "factual_accuracy": score,
+        "completeness": max(score - 5, 0),
+        "reasoning_quality": max(score - 10, 0),
+        "actionability": max(score - 10, 0),
+        "discrepancies": discrepancies,
+        "verdict": verdict,
+        "correction": "" if verdict == "pass" else "Review answer against provided ground truth values.",
+        "mode": "local_fallback",
+        "question": question,
+    }
 
 
 def _safe_json_parse(text: str) -> Any | None:
@@ -927,7 +1227,20 @@ Question: {question}
 Facts bundle:
 {json.dumps(slim_facts, indent=2)}
 """
-    raw = _claude(system=system, user=user)
+    try:
+        raw = _claude(system=system, user=user)
+    except ClaudeUnavailableError:
+        parsed = _local_ask_from_facts(question, facts)
+        parsed["question"] = question
+        if memory and parsed.get("confidence") in ("High", "Medium"):
+            facts_used = parsed.get("facts_used", [])
+            memory.save_query(
+                question,
+                str(parsed.get("answer", ""))[:200],
+                facts_used if isinstance(facts_used, list) else [],
+            )
+            memory.add_history(question, str(parsed.get("answer", ""))[:200], str(parsed.get("confidence", "Medium")))
+        return parsed
 
     parsed = _safe_json_parse(raw)
     if not isinstance(parsed, dict):
@@ -993,7 +1306,10 @@ Only include findings backed by facts. Max 5 findings.
 Facts bundle to scan:
 {json.dumps(slim, indent=2)}
 """
-    raw = _claude(system=system, user=user, max_tokens=1600)
+    try:
+        raw = _claude(system=system, user=user, max_tokens=1600)
+    except ClaudeUnavailableError:
+        return _local_proactive_radar(facts)
     parsed = _safe_json_parse(raw)
     if isinstance(parsed, list):
         return {"alerts": parsed, "scanned_at": datetime.now(timezone.utc).isoformat()}
@@ -1065,7 +1381,13 @@ Cohort data:
 
 Narrate key cohort insights and one action implication.
 """
-    narrative_raw = _claude(system=narrative_system, user=narrative_user, max_tokens=700)
+    try:
+        narrative_raw = _claude(system=narrative_system, user=narrative_user, max_tokens=700)
+    except ClaudeUnavailableError:
+        narrative_raw = (
+            f"Local cohort mode: computed {len(cohort_data)} cohort series using {metric_col} over {time_col}. "
+            "Review segments with the lowest retention_pct for intervention."
+        )
     return {
         "cohort_metric": metric_col,
         "cohort_time_col": time_col,
@@ -1116,7 +1438,10 @@ Question: {question}
 AI Answer: {ai_answer}
 Ground Truth: {json.dumps(ground_truth, indent=2)}
 """
-    raw = _claude(system=system, user=user, max_tokens=1200)
+    try:
+        raw = _claude(system=system, user=user, max_tokens=1200)
+    except ClaudeUnavailableError:
+        return _local_eval_accuracy(question, ai_answer, ground_truth)
     result = _safe_json_parse(raw)
     if not isinstance(result, dict):
         return {"verdict": "eval_failed", "raw": raw}
@@ -1159,7 +1484,10 @@ def generate_report(facts: dict, insights: dict, memory: SmartMemory | None = No
         "Write the full HTML report body (no <html>/<head> wrapper, just the body content)."
     )
 
-    html_body = _claude(system=system_prompt, user=prompt, max_tokens=4096)
+    try:
+        html_body = _claude(system=system_prompt, user=prompt, max_tokens=4096)
+    except ClaudeUnavailableError:
+        html_body = _local_report_body(facts, insights)
 
     # Wrap in a minimal HTML shell
     full_html = f"""<!DOCTYPE html>

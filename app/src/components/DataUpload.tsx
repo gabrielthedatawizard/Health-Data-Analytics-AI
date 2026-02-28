@@ -153,7 +153,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 sm:space-y-6">
       <input
         ref={fileInputRef}
         type="file"
@@ -164,12 +164,12 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
       />
 
       <div>
-        <h1 className="text-2xl font-bold text-foreground">{t.dataUpload}</h1>
-        <p className="text-muted-foreground mt-1">{t.dragDropFiles}</p>
+        <h1 className="text-xl font-bold text-foreground sm:text-2xl">{t.dataUpload}</h1>
+        <p className="mt-1 text-sm text-muted-foreground sm:text-base">{t.dragDropFiles}</p>
       </div>
 
       {actionMessage && (
-        <div className="flex items-center justify-between rounded-xl border border-border bg-muted/40 px-4 py-3">
+        <div className="flex flex-col gap-2 rounded-xl border border-border bg-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-sm text-foreground">{actionMessage}</span>
           <Button variant="ghost" size="sm" onClick={() => setActionMessage(null)}>
             {t.dismiss}
@@ -188,7 +188,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
         }}
         onDrop={handleDrop}
         className={cn(
-          'relative rounded-2xl border-2 border-dashed p-12 text-center transition-all duration-300',
+          'relative rounded-2xl border-2 border-dashed p-6 text-center transition-all duration-300 sm:p-10 lg:p-12',
           isDragging
             ? 'border-health-mint bg-health-mint/10'
             : 'border-border bg-card/50 hover:border-muted-foreground/50'
@@ -235,7 +235,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
           )}
         >
           <CardContent className="p-5">
-            <div className="flex items-center gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="w-10 h-10 rounded-lg bg-health-mint/20 flex items-center justify-center">
                 {uploadingFile.error ? (
                   <AlertCircle className="w-5 h-5 text-red-400" />
@@ -244,7 +244,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                 )}
               </div>
               <div className="flex-1">
-                <div className="flex items-center justify-between mb-2 gap-4">
+                <div className="mb-2 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
                   <div>
                     <p className="font-medium text-foreground">{uploadingFile.name}</p>
                     <p className="text-xs text-muted-foreground">
@@ -262,7 +262,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
         </Card>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <button
           type="button"
           className="text-left"
@@ -320,7 +320,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
       </div>
 
       <div>
-        <div className="flex items-center justify-between mb-4">
+        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-lg font-semibold text-foreground">{t.recentUploads}</h3>
           <Badge variant="outline" className="gap-1">
             <Sparkles className="w-3 h-3" />
@@ -336,7 +336,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
             return (
               <Card key={dataset.id} className="glass-card card-hover">
                 <CardContent className="p-5">
-                  <div className="flex items-start gap-4">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
                     <div
                       className={cn(
                         'w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0',
@@ -360,7 +360,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                     </div>
 
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-start justify-between gap-3">
+                      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                         <div className="min-w-0">
                           <h4 className="font-medium text-foreground truncate">{dataset.name}</h4>
                           <div className="flex items-center gap-3 mt-1 flex-wrap">
@@ -378,7 +378,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <Badge variant="outline" className="text-xs">
                             {typeLabel(dataset.type)}
                           </Badge>
@@ -444,7 +444,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                       variant="outline"
                       size="sm"
                       disabled={dataset.status !== 'active' || isAnalyzing}
-                      className="gap-1 border-health-mint/30 text-health-mint hover:bg-health-mint/10"
+                      className="w-full gap-1 border-health-mint/30 text-health-mint hover:bg-health-mint/10 sm:w-auto"
                       onClick={() => {
                         void handleAnalyze(dataset);
                       }}

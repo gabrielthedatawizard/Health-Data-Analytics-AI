@@ -126,17 +126,17 @@ export function InsightsPanel() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 sm:space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-foreground">AI Insights</h1>
-        <p className="text-muted-foreground mt-1">
+        <h1 className="text-xl font-bold text-foreground sm:text-2xl">AI Insights</h1>
+        <p className="mt-1 text-sm text-muted-foreground sm:text-base">
           AI-generated insights with verified facts and citations
         </p>
       </div>
 
       <Card className="glass-card border-health-mint/20">
         <CardContent className="p-5">
-          <div className="flex items-start gap-4">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
             <div className="w-10 h-10 rounded-xl gradient-mint flex items-center justify-center flex-shrink-0">
               <Sparkles className="w-5 h-5 text-background" />
             </div>
@@ -171,7 +171,7 @@ export function InsightsPanel() {
                     void handleAsk();
                   }}
                   disabled={!question.trim() || isAsking}
-                  className="gap-2 gradient-mint text-background hover:opacity-90"
+                  className="w-full gap-2 gradient-mint text-background hover:opacity-90 sm:w-auto"
                 >
                   {isAsking ? (
                     <>
@@ -216,9 +216,9 @@ export function InsightsPanel() {
       </div>
 
       <div className="space-y-4">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-lg font-semibold text-foreground">Generated Insights</h3>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className="gap-1">
               <BarChart3 className="w-3 h-3" />
               {sortedInsights.length} insights
@@ -318,7 +318,7 @@ export function InsightsPanel() {
                       </div>
                     </div>
 
-                    <Button variant="ghost" size="icon" className="flex-shrink-0">
+                    <Button variant="ghost" size="icon" className="hidden flex-shrink-0 sm:inline-flex">
                       {insight.expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                     </Button>
                   </div>
@@ -372,7 +372,7 @@ export function InsightsPanel() {
                           </Button>
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <Button variant="ghost" size="sm" className="h-8 gap-1" onClick={() => void copyInsight(insight)}>
                             <Copy className="w-4 h-4" />
                             {copiedInsightId === insight.id ? 'Copied' : 'Copy'}
@@ -414,7 +414,7 @@ export function InsightsPanel() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {[
               { step: '1', title: 'File Parsing', desc: 'Uploaded rows are parsed and normalized' },
               { step: '2', title: 'Profile Build', desc: 'Column quality and metrics are computed' },

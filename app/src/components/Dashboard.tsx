@@ -79,7 +79,7 @@ interface KPICardProps {
 function KPICard({ title, value, change, changeLabel, icon: Icon, trend, target, confidence }: KPICardProps) {
   return (
     <Card className="glass-card card-hover overflow-hidden">
-      <CardContent className="p-5">
+      <CardContent className="p-4 sm:p-5">
         <div className="flex items-start justify-between">
           <div className="flex-1">
             <div className="flex items-center gap-2 mb-2">
@@ -98,7 +98,7 @@ function KPICard({ title, value, change, changeLabel, icon: Icon, trend, target,
             </div>
             
             <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-bold text-foreground">{value}</span>
+              <span className="text-2xl font-bold text-foreground sm:text-3xl">{value}</span>
               {target && (
                 <span className="text-xs text-muted-foreground">/ {target}</span>
               )}
@@ -155,21 +155,21 @@ export function Dashboard() {
       {/* Welcome & Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-foreground">
+          <h1 className="text-xl font-bold text-foreground sm:text-2xl">
             Welcome back, <span className="text-gradient-mint">Dr. Kimaro</span>
           </h1>
-          <p className="text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground mt-1 sm:text-base">
             Here's what's happening in Dodoma Region health facilities
           </p>
         </div>
         
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" className="gap-2">
+        <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+          <Button variant="outline" size="sm" className="gap-2 flex-1 sm:flex-none">
             <Calendar className="w-4 h-4" />
             <span>Last 12 months</span>
             <Filter className="w-3 h-3" />
           </Button>
-          <Button variant="outline" size="sm" className="gap-2">
+          <Button variant="outline" size="sm" className="gap-2 flex-1 sm:flex-none">
             <Download className="w-4 h-4" />
             Export
           </Button>
@@ -177,26 +177,26 @@ export function Dashboard() {
       </div>
 
       {/* AI Insights Banner */}
-      <div className="relative overflow-hidden rounded-2xl border border-health-mint/30 bg-gradient-to-r from-health-mint/10 via-health-purple/5 to-transparent p-5">
+      <div className="relative overflow-hidden rounded-2xl border border-health-mint/30 bg-gradient-to-r from-health-mint/10 via-health-purple/5 to-transparent p-4 sm:p-5">
         <div className="absolute top-0 right-0 w-64 h-64 gradient-glow-mint opacity-50" />
-        <div className="relative flex items-start gap-4">
+        <div className="relative flex flex-col gap-4 sm:flex-row sm:items-start">
           <div className="w-10 h-10 rounded-xl bg-health-mint/20 flex items-center justify-center flex-shrink-0">
             <Activity className="w-5 h-5 text-health-mint" />
           </div>
           <div className="flex-1">
-            <div className="flex items-center gap-2 mb-1">
+            <div className="mb-1 flex flex-wrap items-center gap-2">
               <h3 className="font-semibold text-foreground">AI-Generated Insight</h3>
               <Badge variant="outline" className="text-xs border-health-mint/30 text-health-mint">
                 94% confidence
               </Badge>
             </div>
-            <p className="text-sm text-muted-foreground">
+            <p className="text-sm leading-relaxed text-muted-foreground">
               ANC coverage has improved <span className="text-emerald-400 font-medium">+12.3%</span> this quarter, 
               with particularly strong gains in <span className="text-foreground">Chamwino (+18%)</span> and 
               <span className="text-foreground"> Bahi (+15%)</span> districts. However, 
               <span className="text-amber-400"> Kondoa remains below target at 52%</span> coverage.
             </p>
-            <div className="flex items-center gap-3 mt-3">
+            <div className="mt-3 flex flex-wrap items-center gap-3">
               <Button size="sm" variant="outline" className="h-8 text-xs gap-1 border-health-mint/30 text-health-mint hover:bg-health-mint/10">
                 View Details
                 <ArrowUpRight className="w-3 h-3" />
@@ -256,12 +256,12 @@ export function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Trend Chart */}
         <Card className="glass-card lg:col-span-2">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="text-lg font-semibold">ANC Coverage Trend</CardTitle>
               <p className="text-xs text-muted-foreground">Monthly coverage rate over time</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <div className="flex items-center gap-1.5">
                 <div className="w-3 h-3 rounded-full bg-emerald-500" />
                 <span className="text-xs text-muted-foreground">ANC</span>
@@ -277,7 +277,7 @@ export function Dashboard() {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="h-72">
+            <div className="h-60 sm:h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={trendData}>
                   <defs>
@@ -346,7 +346,7 @@ export function Dashboard() {
             <p className="text-xs text-muted-foreground">Distribution of visits</p>
           </CardHeader>
           <CardContent>
-            <div className="h-56">
+            <div className="h-52 sm:h-56">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
                   <Pie
@@ -372,7 +372,7 @@ export function Dashboard() {
                 </PieChart>
               </ResponsiveContainer>
             </div>
-            <div className="grid grid-cols-3 gap-2 mt-4">
+            <div className="grid grid-cols-2 gap-2 mt-4 sm:grid-cols-3">
               {ageDistribution.slice(0, 3).map((item) => (
                 <div key={item.name} className="text-center">
                   <div className="flex items-center justify-center gap-1">
@@ -391,7 +391,7 @@ export function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* District Comparison */}
         <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="text-lg font-semibold">ANC Coverage by District</CardTitle>
               <p className="text-xs text-muted-foreground">Performance comparison</p>
@@ -401,7 +401,7 @@ export function Dashboard() {
             </Button>
           </CardHeader>
           <CardContent>
-            <div className="h-64">
+            <div className="h-60 sm:h-64">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={districtData} layout="vertical">
                   <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 18%)" horizontal={false} />
@@ -442,7 +442,7 @@ export function Dashboard() {
 
         {/* Facility Performance Table */}
         <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="text-lg font-semibold">Facility Performance</CardTitle>
               <p className="text-xs text-muted-foreground">Top performing facilities</p>
@@ -453,7 +453,7 @@ export function Dashboard() {
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto">
-              <table className="w-full">
+              <table className="w-full min-w-[560px]">
                 <thead>
                   <tr className="border-b border-border">
                     <th className="text-left py-3 px-2 text-xs font-medium text-muted-foreground uppercase">Facility</th>
@@ -511,7 +511,7 @@ export function Dashboard() {
       </div>
 
       {/* Data Quality Warning */}
-      <div className="flex items-start gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10">
+      <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
         <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
         <div>
           <h4 className="font-medium text-amber-400 text-sm">Data Quality Warning</h4>
