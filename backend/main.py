@@ -356,7 +356,7 @@ def _deterministic_sample(df: pd.DataFrame, max_rows: int, seed: int) -> pd.Data
 
 def _determine_sampling_strategy(df: pd.DataFrame, profile: dict[str, Any], seed: int, max_rows: int) -> tuple[pd.DataFrame, str]:
     if len(df) <= max_rows:
-        return df, "none"
+        return df, "uniform"
 
     datetime_cols = profile.get("datetime_cols", [])
     categorical_cols = profile.get("categorical_cols", [])
@@ -1750,8 +1750,8 @@ async def upload_file(
 @app.get("/sessions/{dataset_id}/profile", response_model=ProfileResponse)
 def profile_dataset(
     dataset_id: str,
+    response: FastAPIResponse,
     mask_pii: bool | None = Query(default=None),
-    response: FastAPIResponse | None = None,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> ProfileResponse:
     _require_session_dir(dataset_id)
@@ -1796,9 +1796,9 @@ def profile_dataset(
 @app.get("/sessions/{dataset_id}/facts")
 def generate_facts(
     dataset_id: str,
+    response: FastAPIResponse,
     mode: str = Query(default="auto"),
     force: bool = Query(default=False),
-    response: FastAPIResponse | None = None,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict[str, Any]:
     _require_session_dir(dataset_id)
@@ -2019,9 +2019,9 @@ def clean_dataset(
 @app.post("/sessions/{dataset_id}/dashboard-spec", response_model=DashboardSpecResponse)
 def generate_dashboard_spec(
     dataset_id: str,
+    response: FastAPIResponse,
     payload: DashboardSpecRequest | None = None,
     use_llm: bool = Query(default=True),
-    response: FastAPIResponse | None = None,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> DashboardSpecResponse:
     _require_session_dir(dataset_id)
