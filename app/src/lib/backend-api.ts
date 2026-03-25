@@ -263,6 +263,27 @@ export interface ForecastDriftResponse {
   drift: ForecastDriftPayload;
 }
 
+export interface ModelRegistryEntry {
+  registry_id: string;
+  run_id: string;
+  model_kind: string;
+  status: string;
+  promoted_at: string;
+  promoted_by: string;
+  note?: string | null;
+  name: string;
+  champion_model: string;
+  metric_field: string;
+  time_field: string;
+  aggregation: string;
+  source_data_hash?: string | null;
+}
+
+export interface ModelRegistryResponse {
+  dataset_id: string;
+  entries: ModelRegistryEntry[];
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -744,6 +765,32 @@ export function getForecastDrift(datasetId: string, userId: string, runId?: stri
     userId,
     timeoutMs: 120000,
   });
+}
+
+export function getModelRegistry(datasetId: string, userId: string) {
+  return apiRequest<ModelRegistryResponse>(`/sessions/${datasetId}/ml-registry`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function promoteModelRun(
+  datasetId: string,
+  runId: string,
+  userId: string,
+  payload?: {
+    note?: string;
+  }
+) {
+  return apiRequest<ModelRegistryEntry>(
+    `/sessions/${datasetId}/ml-registry/promote/${runId}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload ?? {}),
+    },
+    { userId, timeoutMs: 120000 }
+  );
 }
 
 export function trainForecastRun(

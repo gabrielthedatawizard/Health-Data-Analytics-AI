@@ -31,6 +31,7 @@ import {
   type DocumentAskResponse,
   type DocumentSummary,
   type CohortAnalysisResponse,
+  type ModelRegistryEntry,
   type ForecastDriftResponse,
   type ForecastRunRecord,
   type SavedInvestigationRecord,
@@ -59,6 +60,7 @@ import {
   getFacts,
   getForecastDrift,
   getForecastRuns,
+  getModelRegistry,
   getJobStatus,
   getProfile,
   getSavedInvestigations,
@@ -73,6 +75,7 @@ import {
   saveInvestigation,
   savePlaybook,
   reviewWorkflowAction,
+  promoteModelRun,
   reviewSensitiveExportApproval,
   setSensitiveExportEnabled,
   trainForecastRun,
@@ -106,6 +109,7 @@ const ROLE_FALLBACK_PERMISSIONS: Record<BackendUserRole, string[]> = {
     'sessions:export_all',
     'sensitive_export:request_own',
     'sensitive_export:review',
+    'ml:promote',
     'docs:create',
     'docs:read_own',
     'docs:read_all',
@@ -117,6 +121,7 @@ const ROLE_FALLBACK_PERMISSIONS: Record<BackendUserRole, string[]> = {
     'sessions:compute_all',
     'sessions:export_all',
     'sensitive_export:review',
+    'ml:promote',
     'docs:create',
     'docs:read_all',
     'admin:all',
@@ -510,6 +515,7 @@ export function AIAnalyticsDashboard() {
   const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
   const [forecastRuns, setForecastRuns] = useState<ForecastRunRecord[]>([]);
   const [forecastDrift, setForecastDrift] = useState<ForecastDriftResponse | null>(null);
+  const [modelRegistryEntries, setModelRegistryEntries] = useState<ModelRegistryEntry[]>([]);
   const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigationRecord[]>([]);
   const [savedPlaybooks, setSavedPlaybooks] = useState<SavedPlaybookRecord[]>([]);
   const [workflowActions, setWorkflowActions] = useState<WorkflowActionRecord[]>([]);
@@ -527,6 +533,7 @@ export function AIAnalyticsDashboard() {
   const [forecastMetricField, setForecastMetricField] = useState('');
   const [forecastAggregation, setForecastAggregation] = useState<'sum' | 'mean'>('sum');
   const [forecastHorizon, setForecastHorizon] = useState('3');
+  const [modelPromotionNote, setModelPromotionNote] = useState('');
   const [workflowActionType, setWorkflowActionType] = useState<(typeof WORKFLOW_ACTION_OPTIONS)[number]['value']>('draft_email');
   const [workflowTitle, setWorkflowTitle] = useState('');
   const [workflowTarget, setWorkflowTarget] = useState('');
@@ -620,6 +627,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -639,6 +647,7 @@ export function AIAnalyticsDashboard() {
       try {
         setForecastRuns([]);
         setForecastDrift(null);
+        setModelRegistryEntries([]);
         setSavedInvestigations([]);
         setSavedPlaybooks([]);
         setWorkflowActions([]);
@@ -680,6 +689,12 @@ export function AIAnalyticsDashboard() {
           const driftResponse = await getForecastDrift(datasetId, userId);
           if (!active) return;
           setForecastDrift(driftResponse);
+        }
+
+        if (meta.artifacts?.ml_registry) {
+          const registryResponse = await getModelRegistry(datasetId, userId);
+          if (!active) return;
+          setModelRegistryEntries(registryResponse.entries ?? []);
         }
 
         if (meta.artifacts?.investigations) {
@@ -846,6 +861,7 @@ export function AIAnalyticsDashboard() {
 
   const dashboardCharts = useMemo(() => normalizeDashboardCharts(dashboardSpec), [dashboardSpec]);
   const latestForecastRun = forecastRuns[0] ?? null;
+  const activeRegistryEntry = modelRegistryEntries.find((entry) => entry.status === 'active') ?? null;
 
   const dashboardFilters = useMemo(() => {
     const items = Array.isArray(dashboardSpec?.filters) ? dashboardSpec.filters : [];
@@ -897,6 +913,7 @@ export function AIAnalyticsDashboard() {
   const canRequestSensitiveExport = permissionSet.has('sensitive_export:request_own') || permissionSet.has('admin:all');
   const canReadDocuments = permissionSet.has('docs:read_own') || permissionSet.has('docs:read_all') || permissionSet.has('admin:all');
   const canUploadDocuments = permissionSet.has('docs:create') || permissionSet.has('admin:all');
+  const canPromoteModel = permissionSet.has('ml:promote') || permissionSet.has('admin:all');
   const canDraftWorkflow = permissionSet.has('workflow:create_own') || permissionSet.has('workflow:create_all') || permissionSet.has('admin:all');
   const canReviewWorkflow = permissionSet.has('workflow:review') || permissionSet.has('admin:all');
   const canExecuteWorkflow = permissionSet.has('workflow:execute_own') || permissionSet.has('workflow:execute_all') || permissionSet.has('admin:all');
@@ -982,6 +999,11 @@ export function AIAnalyticsDashboard() {
     setForecastRuns(response.runs ?? []);
   }
 
+  async function refreshModelRegistry(targetDatasetId: string) {
+    const response = await getModelRegistry(targetDatasetId, userId);
+    setModelRegistryEntries(response.entries ?? []);
+  }
+
   async function refreshWorkflowActions(targetDatasetId: string) {
     const response = await getWorkflowActions(targetDatasetId, userId);
     setWorkflowActions(response.actions ?? []);
@@ -1000,6 +1022,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1082,6 +1105,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1125,6 +1149,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1139,6 +1164,7 @@ export function AIAnalyticsDashboard() {
       setSelectedFile(null);
       setSessionMeta(await getSession(targetDatasetId, userId));
       await refreshForecastRuns(targetDatasetId);
+      await refreshModelRegistry(targetDatasetId);
       setAuditEvents((await getAudit(targetDatasetId, userId)).events ?? []);
       setNotice(`${selectedFile.name} uploaded successfully.`);
     } catch (uploadError) {
@@ -1330,6 +1356,31 @@ export function AIAnalyticsDashboard() {
       setNotice(`Forecast drift scanned for ${response.drift.metric_field}.`);
     } catch (driftError) {
       setError(driftError instanceof Error ? driftError.message : 'Forecast drift scan failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handlePromoteModel(runId: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(`promote_model:${runId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      const promoted = await promoteModelRun(datasetId, runId, userId, {
+        note: modelPromotionNote.trim() || undefined,
+      });
+      await refreshModelRegistry(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setModelPromotionNote('');
+      setNotice(`Promoted model ${promoted.name} to the governed registry.`);
+    } catch (promoteError) {
+      setError(promoteError instanceof Error ? promoteError.message : 'Model promotion failed.');
     } finally {
       setBusyAction(null);
     }
@@ -2956,6 +3007,21 @@ export function AIAnalyticsDashboard() {
           </div>
         ) : null}
 
+        {canPromoteModel ? (
+          <div className="mt-4 rounded-xl border border-border bg-background p-4">
+            <p className="text-sm font-medium text-foreground">Registry promotion note</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Reviewer promotion is required before a forecast run becomes the active governed model for this session.
+            </p>
+            <Textarea
+              value={modelPromotionNote}
+              onChange={(event) => setModelPromotionNote(event.target.value)}
+              placeholder="Optional reviewer note about why this run is being promoted."
+              className="mt-3 min-h-[90px]"
+            />
+          </div>
+        ) : null}
+
         {latestForecastRun ? (
           <div className="mt-4 space-y-4">
             <div className="rounded-xl border border-border bg-background p-4">
@@ -2978,6 +3044,40 @@ export function AIAnalyticsDashboard() {
                   ))}
                 </div>
               ) : null}
+            </div>
+
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-foreground">Governed model registry</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Active production models are reviewer-promoted and remain visible across data refreshes.
+                  </p>
+                </div>
+                {activeRegistryEntry ? <Badge variant="outline">Active run: {activeRegistryEntry.run_id.slice(0, 8)}</Badge> : <Badge variant="outline">No active model</Badge>}
+              </div>
+              {activeRegistryEntry ? (
+                <div className="mt-3 space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    <Badge variant="outline">{activeRegistryEntry.name}</Badge>
+                    <Badge variant="outline">{activeRegistryEntry.champion_model}</Badge>
+                    <Badge variant="outline">{activeRegistryEntry.metric_field}</Badge>
+                    {activeRegistryEntry.source_data_hash && sessionMeta?.file_hash && activeRegistryEntry.source_data_hash !== sessionMeta.file_hash ? (
+                      <Badge variant="outline">Needs retrain</Badge>
+                    ) : null}
+                  </div>
+                  {activeRegistryEntry.note ? (
+                    <div className="rounded-lg border border-border/70 bg-card px-3 py-2 text-xs text-foreground">
+                      {activeRegistryEntry.note}
+                    </div>
+                  ) : null}
+                  <p className="text-xs text-muted-foreground">
+                    Promoted by {activeRegistryEntry.promoted_by} on {new Date(activeRegistryEntry.promoted_at).toLocaleString()}.
+                  </p>
+                </div>
+              ) : (
+                <p className="mt-3 text-sm text-muted-foreground">Promote a reviewed forecast run to create the active governed model entry.</p>
+              )}
             </div>
 
             {forecastDrift ? (
@@ -3122,6 +3222,22 @@ export function AIAnalyticsDashboard() {
                           <Badge variant="outline">{run.payload.metric_field}</Badge>
                           <Badge variant="outline">{run.payload.aggregation}</Badge>
                           <Badge variant="outline">{new Date(run.created_at).toLocaleString()}</Badge>
+                          {canPromoteModel ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => void handlePromoteModel(run.run_id)}
+                              disabled={
+                                busyAction === `promote_model:${run.run_id}` ||
+                                (activeRegistryEntry?.run_id === run.run_id) ||
+                                (Boolean(run.payload.training_data_hash) && Boolean(sessionMeta?.file_hash) && run.payload.training_data_hash !== sessionMeta?.file_hash)
+                              }
+                            >
+                              {busyAction === `promote_model:${run.run_id}` ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
+                              {activeRegistryEntry?.run_id === run.run_id ? 'Active' : 'Promote'}
+                            </Button>
+                          ) : null}
                           <Button
                             type="button"
                             size="sm"

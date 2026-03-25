@@ -128,6 +128,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:export_all",
         "sensitive_export:request_own",
         "sensitive_export:review",
+        "ml:promote",
         "workflow:create_own",
         "workflow:review",
         "workflow:execute_all",
@@ -142,6 +143,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:compute_all",
         "sessions:export_all",
         "sensitive_export:review",
+        "ml:promote",
         "workflow:create_all",
         "workflow:review",
         "workflow:execute_all",
@@ -497,6 +499,31 @@ class ForecastDriftResponse(BaseModel):
     drift: ForecastDriftPayload
 
 
+class ModelPromotionRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ModelRegistryEntry(BaseModel):
+    registry_id: str
+    run_id: str
+    model_kind: str
+    status: str
+    promoted_at: str
+    promoted_by: str
+    note: str | None = None
+    name: str
+    champion_model: str
+    metric_field: str
+    time_field: str
+    aggregation: str
+    source_data_hash: str | None = None
+
+
+class ModelRegistryResponse(BaseModel):
+    dataset_id: str
+    entries: list[ModelRegistryEntry] = Field(default_factory=list)
+
+
 class ReportResponse(BaseModel):
     dataset_id: str
     report_html_path: str
@@ -694,6 +721,10 @@ def _ml_drift_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "ml_drift.json"
 
 
+def _ml_registry_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "ml_registry.json"
+
+
 def _dashboard_spec_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "dashboard_spec.json"
 
@@ -836,6 +867,26 @@ def _load_ml_drift(dataset_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return _load_json(path)
+
+
+def _load_ml_registry(dataset_id: str) -> list[dict[str, Any]]:
+    path = _ml_registry_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("entries") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_ml_registry(dataset_id: str, entries: list[dict[str, Any]]) -> None:
+    _save_json(
+        _ml_registry_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "entries": entries,
+        },
+    )
 
 
 def _safe_directory_size(path: Path) -> int:
@@ -995,6 +1046,8 @@ def _session_action_allowed(meta: dict[str, Any], actor: str, role: str, action:
     if action == "draft_workflow":
         return owner and role in {"analyst", "reviewer"}
     if action == "review_workflow":
+        return role == "reviewer"
+    if action == "promote_ml":
         return role == "reviewer"
     if action == "execute_workflow":
         return role == "reviewer" or (owner and role in {"analyst", "reviewer"})
@@ -4032,6 +4085,7 @@ def get_session(
         allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
         sensitive_export_approval=_sensitive_export_approval(meta),
         file=meta.get("file"),
+        file_hash=meta.get("file_hash"),
         artifacts=meta.get("artifacts", {}),
     )
 
@@ -4291,6 +4345,8 @@ async def upload_file(
     preserved_artifacts: dict[str, str] = {}
     if _ml_runs_path(dataset_id).exists():
         preserved_artifacts["ml_runs"] = str(_ml_runs_path(dataset_id))
+    if _ml_registry_path(dataset_id).exists():
+        preserved_artifacts["ml_registry"] = str(_ml_registry_path(dataset_id))
 
     # New upload invalidates derived artifacts, but forecast runs remain visible so they can be drift-checked against refreshed data.
     meta["file"] = file_meta
@@ -4613,6 +4669,84 @@ def get_forecast_drift(
         {"run_id": drift.get("run_id"), "drift_score": drift.get("drift_score"), "stale_model": drift.get("stale_model")},
     )
     return ForecastDriftResponse(dataset_id=dataset_id, drift=ForecastDriftPayload(**drift))
+
+
+@app.get("/sessions/{dataset_id}/ml-registry", response_model=ModelRegistryResponse)
+def list_ml_registry(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ModelRegistryResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return ModelRegistryResponse(
+        dataset_id=dataset_id,
+        entries=[ModelRegistryEntry(**item) for item in _load_ml_registry(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/ml-registry/promote/{run_id}", response_model=ModelRegistryEntry)
+def promote_ml_run(
+    dataset_id: str,
+    run_id: str,
+    request: ModelPromotionRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ModelRegistryEntry:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="promote_ml", x_api_key=x_api_key, x_user_role=x_user_role)
+    runs = _load_ml_runs(dataset_id)
+    selected = next((item for item in runs if str(item.get("run_id")) == run_id), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Requested forecast run was not found.")
+
+    payload = selected.get("payload") if isinstance(selected, dict) else {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="The selected forecast run payload is malformed.")
+
+    training_hash = str(payload.get("training_data_hash") or "") or None
+    current_hash = str(meta.get("file_hash") or _dataset_signature(meta) or "") or None
+    if training_hash and current_hash and training_hash != current_hash:
+        raise HTTPException(status_code=400, detail="Stale forecast runs cannot be promoted. Retrain on the current dataset first.")
+
+    promoted_at = _utc_now_iso()
+    existing_entries = _load_ml_registry(dataset_id)
+    updated_entries: list[dict[str, Any]] = []
+    for entry in existing_entries:
+        current = dict(entry)
+        if current.get("status") == "active":
+            current["status"] = "archived"
+        updated_entries.append(current)
+
+    record = {
+        "registry_id": str(uuid.uuid4()),
+        "run_id": run_id,
+        "model_kind": str(selected.get("model_kind") or "forecast"),
+        "status": "active",
+        "promoted_at": promoted_at,
+        "promoted_by": actor,
+        "note": request.note.strip() if request.note and request.note.strip() else None,
+        "name": str(payload.get("name") or run_id),
+        "champion_model": str(payload.get("champion_model") or "unknown"),
+        "metric_field": str(payload.get("metric_field") or ""),
+        "time_field": str(payload.get("time_field") or ""),
+        "aggregation": str(payload.get("aggregation") or "sum"),
+        "source_data_hash": training_hash,
+    }
+    entries = [record, *updated_entries]
+    _save_ml_registry(dataset_id, entries)
+    meta.setdefault("artifacts", {})["ml_registry"] = str(_ml_registry_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "ml_model_promoted",
+        actor,
+        {
+            "registry_id": record["registry_id"],
+            "run_id": run_id,
+            "model_kind": record["model_kind"],
+            "champion_model": record["champion_model"],
+        },
+    )
+    return ModelRegistryEntry(**record)
 
 
 @app.get("/sessions/{dataset_id}/workflow-actions", response_model=WorkflowActionsResponse)
