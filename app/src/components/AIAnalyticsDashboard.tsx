@@ -175,6 +175,11 @@ type CohortDraftCriterion = {
   operator: string;
   value: string;
 };
+type CohortRequestCriterion = {
+  field: string;
+  operator: string;
+  value?: string | string[];
+};
 type CohortFieldOption = {
   name: string;
   inferredType: string;
@@ -1455,7 +1460,7 @@ export function AIAnalyticsDashboard() {
       return;
     }
 
-    const criteriaPayload = cohortCriteria
+    const criteriaPayload: CohortRequestCriterion[] = cohortCriteria
       .map((criterion) => {
         const field = criterion.field.trim();
         const operator = criterion.operator.trim();
@@ -1474,7 +1479,7 @@ export function AIAnalyticsDashboard() {
             : value,
         };
       })
-      .filter((item): item is { field: string; operator: string; value?: unknown } => Boolean(item));
+      .filter((item): item is CohortRequestCriterion => item !== null);
 
     if (criteriaPayload.length === 0) {
       setError('Add at least one governed cohort criterion.');
@@ -3380,7 +3385,7 @@ export function AIAnalyticsDashboard() {
                           variant="outline"
                           onClick={() => {
                             setAskQuestion(item.question);
-                            setAskResult(item.result as AskResponsePayload);
+                            setAskResult(item.result as unknown as AskResponsePayload);
                             setNotice(`Loaded saved investigation: ${item.title}.`);
                           }}
                         >
