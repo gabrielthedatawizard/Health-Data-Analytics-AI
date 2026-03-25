@@ -407,11 +407,18 @@ export function Settings({ onLogout }: SettingsProps) {
             className="w-full justify-start gap-3 text-destructive hover:text-destructive"
             onClick={() => {
               const confirmed = window.confirm(
-                'This will remove all uploaded datasets and generated insights from this browser. Continue?'
+                'This will remove all governed backend dataset sessions and local generated insights for this workspace. Continue?'
               );
               if (!confirmed) return;
-              clearAllData();
-              onLogout?.();
+              void clearAllData()
+                .then(() => {
+                  onLogout?.();
+                })
+                .catch((error) => {
+                  const message =
+                    error instanceof Error ? error.message : 'Could not clear workspace data.';
+                  window.alert(message);
+                });
             }}
           >
             <Database className="w-4 h-4" />

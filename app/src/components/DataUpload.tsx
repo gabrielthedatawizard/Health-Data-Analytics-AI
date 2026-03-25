@@ -41,13 +41,11 @@ function pause(ms: number): Promise<void> {
 
 function typeLabel(type: DatasetRecord['type']): string {
   if (type === 'csv') return 'CSV';
-  if (type === 'json') return 'JSON';
   return 'Excel';
 }
 
 function datasetTypeIcon(type: DatasetRecord['type']) {
   if (type === 'csv') return FileSpreadsheet;
-  if (type === 'json') return Database;
   return FileText;
 }
 
@@ -144,12 +142,17 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
   );
 
   const handleSourceImport = useCallback(
-    (kind: SampleDatasetKind, label: string) => {
-      addSampleDataset(kind);
-      setActionMessage(`${label} imported successfully.`);
-      onViewChange('datasets');
+    async (kind: SampleDatasetKind, label: string) => {
+      try {
+        await addSampleDataset(kind);
+        setActionMessage(`${label} imported successfully.`);
+        onViewChange('datasets');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : t.error;
+        setActionMessage(`Import failed for ${label}: ${message}`);
+      }
     },
-    [addSampleDataset, onViewChange]
+    [addSampleDataset, onViewChange, t.error]
   );
 
   return (
@@ -157,7 +160,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".csv,.json,.xlsx,.xls"
+        accept=".csv,.xlsx,.xls"
         multiple
         className="hidden"
         onChange={handleFileSelect}
@@ -211,10 +214,6 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
               <FileText className="w-3 h-3" />
               Excel
             </Badge>
-            <Badge variant="outline" className="gap-1.5">
-              <Database className="w-3 h-3" />
-              JSON
-            </Badge>
           </div>
 
           <Button
@@ -266,7 +265,9 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
         <button
           type="button"
           className="text-left"
-          onClick={() => handleSourceImport('database', 'Database sample')}
+          onClick={() => {
+            void handleSourceImport('database', 'Database sample');
+          }}
         >
           <Card className="glass-card card-hover cursor-pointer">
             <CardContent className="p-5">
@@ -284,7 +285,13 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
           </Card>
         </button>
 
-        <button type="button" className="text-left" onClick={() => handleSourceImport('dhis2', 'DHIS2 sample')}>
+        <button
+          type="button"
+          className="text-left"
+          onClick={() => {
+            void handleSourceImport('dhis2', 'DHIS2 sample');
+          }}
+        >
           <Card className="glass-card card-hover cursor-pointer">
             <CardContent className="p-5">
               <div className="flex items-start gap-4">
@@ -301,7 +308,13 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
           </Card>
         </button>
 
-        <button type="button" className="text-left" onClick={() => handleSourceImport('demo', 'Demo dataset')}>
+        <button
+          type="button"
+          className="text-left"
+          onClick={() => {
+            void handleSourceImport('demo', 'Demo dataset');
+          }}
+        >
           <Card className="glass-card card-hover cursor-pointer">
             <CardContent className="p-5">
               <div className="flex items-start gap-4">
@@ -411,7 +424,13 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                             variant="ghost"
                             size="icon"
                             className="h-8 w-8"
-                            onClick={() => removeDataset(dataset.id)}
+                            onClick={() => {
+                              void removeDataset(dataset.id).catch((error) => {
+                                const message =
+                                  error instanceof Error ? error.message : 'Could not remove dataset.';
+                                window.alert(message);
+                              });
+                            }}
                           >
                             <X className="w-4 h-4" />
                           </Button>

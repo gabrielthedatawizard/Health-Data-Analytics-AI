@@ -16,6 +16,26 @@ export interface SessionMeta {
   artifacts: Record<string, string>;
 }
 
+export interface SessionSummary {
+  dataset_id: string;
+  display_name: string;
+  description: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  pii_masking_enabled: boolean;
+  allow_sensitive_export: boolean;
+  file_name?: string | null;
+  file_type?: string | null;
+  size_bytes: number;
+  row_count: number;
+  column_count: number;
+  quality_score: number;
+  quality_issues: string[];
+  artifacts: Record<string, string>;
+}
+
 export interface ProfileResponse {
   dataset_id: string;
   profile: Record<string, unknown>;
@@ -82,6 +102,13 @@ export interface AuditResponse {
   events: AuditEvent[];
 }
 
+export interface PreviewResponse {
+  dataset_id: string;
+  rows: Array<Record<string, unknown>>;
+  columns: string[];
+  row_count: number;
+}
+
 export const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
 
 export function computeDefaultApiBase(): string {
@@ -97,6 +124,7 @@ export function computeDefaultApiBase(): string {
 
 export const API_BASE = ENV_API_BASE || computeDefaultApiBase();
 export const API_TARGET_LABEL = API_BASE || 'same-origin';
+export const BACKEND_USER_STORAGE_KEY = 'healthai_backend_user_id';
 
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
@@ -173,13 +201,22 @@ export async function apiRequest<T>(
   }
 }
 
-export function createSession(userId: string) {
+export function createSession(
+  userId: string,
+  payload?: {
+    display_name?: string;
+    description?: string;
+  }
+) {
   return apiRequest<{ dataset_id: string; created_at: string }>(
     '/sessions',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ created_by: userId || 'react_user' }),
+      body: JSON.stringify({
+        created_by: userId || 'react_user',
+        ...(payload ?? {}),
+      }),
     },
     { userId }
   );
@@ -187,6 +224,32 @@ export function createSession(userId: string) {
 
 export function getSession(datasetId: string, userId: string) {
   return apiRequest<SessionMeta>(`/sessions/${datasetId}`, undefined, { userId });
+}
+
+export function listSessions(userId: string) {
+  return apiRequest<{ sessions: SessionSummary[] }>('/sessions', undefined, { userId });
+}
+
+export function updateSession(datasetId: string, userId: string, payload: { display_name?: string; description?: string }) {
+  return apiRequest<{ dataset_id: string; session: SessionSummary }>(
+    `/sessions/${datasetId}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId }
+  );
+}
+
+export function deleteSession(datasetId: string, userId: string) {
+  return apiRequest<{ dataset_id: string; deleted: boolean }>(
+    `/sessions/${datasetId}`,
+    {
+      method: 'DELETE',
+    },
+    { userId }
+  );
 }
 
 export async function uploadDataset(datasetId: string, file: File, userId: string) {
@@ -205,6 +268,13 @@ export async function uploadDataset(datasetId: string, file: File, userId: strin
 
 export function getProfile(datasetId: string, userId: string) {
   return apiRequest<ProfileResponse>(`/sessions/${datasetId}/profile`, undefined, { userId });
+}
+
+export function getPreview(datasetId: string, userId: string, limit = 100) {
+  return apiRequest<PreviewResponse>(`/sessions/${datasetId}/preview?limit=${encodeURIComponent(String(limit))}`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
 }
 
 export function getFacts(datasetId: string, userId: string, mode = 'auto') {

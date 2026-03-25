@@ -57,7 +57,7 @@ export interface InsightRecord {
 
 export interface AIEnvironmentState {
   status: 'ready' | 'busy' | 'error';
-  mode: 'local-guarded';
+  mode: 'local-guarded' | 'governed-backend';
   model: string;
   version: string;
   lastRunAt: string | null;

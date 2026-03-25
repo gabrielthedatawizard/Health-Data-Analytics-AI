@@ -83,11 +83,38 @@ app.include_router(ai_analytics_router)
 
 class CreateSessionRequest(BaseModel):
     created_by: str = "anonymous"
+    display_name: str | None = None
+    description: str | None = None
 
 
 class CreateSessionResponse(BaseModel):
     dataset_id: str
     created_at: str
+
+
+class SessionSummaryResponse(BaseModel):
+    dataset_id: str
+    display_name: str
+    description: str
+    status: str
+    created_at: str
+    updated_at: str
+    created_by: str
+    pii_masking_enabled: bool
+    allow_sensitive_export: bool
+    file_name: str | None = None
+    file_type: str | None = None
+    size_bytes: int = 0
+    row_count: int = 0
+    column_count: int = 0
+    quality_score: float = 0.0
+    quality_issues: list[str] = Field(default_factory=list)
+    artifacts: dict[str, str] = Field(default_factory=dict)
+
+
+class UpdateSessionRequest(BaseModel):
+    display_name: str | None = None
+    description: str | None = None
 
 
 class SessionMetaResponse(BaseModel):
@@ -238,6 +265,84 @@ def _load_meta(dataset_id: str) -> dict[str, Any]:
 def _save_meta(dataset_id: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = _utc_now_iso()
     _save_json(_meta_path(dataset_id), meta)
+
+
+def _safe_directory_size(path: Path) -> int:
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
+def _session_summary_from_meta(dataset_id: str, meta: dict[str, Any]) -> SessionSummaryResponse:
+    file_meta = meta.get("file") or {}
+    file_name = str(file_meta.get("filename") or "") or None
+    file_type = str(file_meta.get("extension") or "").lstrip(".") or None
+    display_name = str(meta.get("display_name") or file_name or dataset_id)
+    description = str(meta.get("description") or "")
+
+    row_count = 0
+    column_count = 0
+    quality_score = 0.0
+    quality_issues: list[str] = []
+
+    profile_path = _profile_path(dataset_id)
+    if profile_path.exists():
+        try:
+            profile = _load_json(profile_path)
+            shape = profile.get("shape") or {}
+            row_count = int(shape.get("rows") or 0)
+            column_count = int(shape.get("cols") or 0)
+            quality_score = float(profile.get("quality_score") or 0.0)
+            quality_issues = [
+                str(issue.get("issue") or issue.get("code") or issue)
+                for issue in (profile.get("quality_issues") or [])
+                if issue is not None
+            ]
+            if not quality_issues:
+                columns = profile.get("columns") or []
+                for column in columns:
+                    if not isinstance(column, dict):
+                        continue
+                    if float(column.get("missing_percent") or 0.0) >= 20:
+                        quality_issues.append(f"{column.get('name', 'column')} has high missingness")
+                quality_issues = quality_issues[:4]
+        except Exception:
+            row_count = 0
+            column_count = 0
+            quality_score = 0.0
+            quality_issues = []
+
+    size_bytes = int(file_meta.get("size_bytes") or 0)
+    if size_bytes <= 0:
+        size_bytes = _safe_directory_size(_dataset_path(dataset_id))
+
+    return SessionSummaryResponse(
+        dataset_id=dataset_id,
+        display_name=display_name,
+        description=description,
+        status=str(meta.get("status", "unknown")),
+        created_at=str(meta.get("created_at", "")),
+        updated_at=str(meta.get("updated_at", "")),
+        created_by=str(meta.get("created_by", "anonymous")),
+        pii_masking_enabled=bool(meta.get("pii_masking_enabled", False)),
+        allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
+        file_name=file_name,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        row_count=row_count,
+        column_count=column_count,
+        quality_score=round(quality_score, 2),
+        quality_issues=quality_issues,
+        artifacts=meta.get("artifacts", {}),
+    )
 
 
 def _append_audit(dataset_id: str, action: str, actor: str, details: dict[str, Any] | None = None) -> None:
@@ -1639,6 +1744,8 @@ def create_session(
         "status": "created",
         "created_by": created_by,
         "user_id": created_by,
+        "display_name": (payload.display_name.strip() if payload and payload.display_name else "") or None,
+        "description": (payload.description.strip() if payload and payload.description else "") or "",
         "pii_masking_enabled": False,
         "allow_sensitive_export": False,
         "file": None,
@@ -1647,6 +1754,31 @@ def create_session(
     _save_json(_meta_path(dataset_id), meta)
     _append_audit(dataset_id, "session_created", created_by, {})
     return CreateSessionResponse(dataset_id=dataset_id, created_at=now)
+
+
+@app.get("/sessions")
+def list_sessions(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> dict[str, Any]:
+    actor = _actor_from_header(x_api_key, fallback="anonymous")
+    items: list[SessionSummaryResponse] = []
+
+    for child in sorted(DATA_DIR.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        meta_path = child / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = _load_json(meta_path)
+            created_by = str(meta.get("user_id") or meta.get("created_by") or "anonymous")
+            if actor != "anonymous" and created_by != actor:
+                continue
+            dataset_id = str(meta.get("dataset_id") or child.name)
+            items.append(_session_summary_from_meta(dataset_id, meta))
+        except Exception:
+            continue
+
+    items.sort(key=lambda item: item.updated_at, reverse=True)
+    return {"sessions": [item.model_dump() for item in items]}
 
 
 @app.get("/sessions/{dataset_id}", response_model=SessionMetaResponse)
@@ -1665,6 +1797,50 @@ def get_session(dataset_id: str) -> SessionMetaResponse:
         file=meta.get("file"),
         artifacts=meta.get("artifacts", {}),
     )
+
+
+@app.patch("/sessions/{dataset_id}")
+def update_session(
+    dataset_id: str, payload: UpdateSessionRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> dict[str, Any]:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+
+    if payload.display_name is not None:
+        normalized_name = payload.display_name.strip()
+        meta["display_name"] = normalized_name or None
+    if payload.description is not None:
+        meta["description"] = payload.description.strip()
+
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "session_updated",
+        actor,
+        {"display_name": meta.get("display_name"), "description": meta.get("description", "")},
+    )
+    return {"dataset_id": dataset_id, "session": _session_summary_from_meta(dataset_id, meta).model_dump()}
+
+
+@app.delete("/sessions/{dataset_id}")
+def delete_session(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> dict[str, Any]:
+    session_dir = _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    _append_audit(dataset_id, "session_deleted", actor, {})
+    cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:")
+
+    for child in sorted(session_dir.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink(missing_ok=True)
+        elif child.is_dir():
+            try:
+                child.rmdir()
+            except OSError:
+                continue
+    session_dir.rmdir()
+    return {"dataset_id": dataset_id, "deleted": True}
 
 
 @app.post("/sessions/{dataset_id}/masking")
@@ -1747,6 +1923,8 @@ async def upload_file(
 
     # New upload invalidates derived artifacts.
     meta["file"] = file_meta
+    if not meta.get("display_name"):
+        meta["display_name"] = Path(filename).stem
     meta["status"] = "uploaded"
     meta["artifacts"] = {}
     meta["file_hash"] = _dataset_signature(meta)
