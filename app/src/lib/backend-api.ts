@@ -127,6 +127,37 @@ export interface SensitiveExportStatusResponse {
   sensitive_export_approval: SensitiveExportApprovalState;
 }
 
+export interface DocumentSummary {
+  document_id: string;
+  title: string;
+  source_name: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  file_name: string;
+  file_type: string;
+  chunk_count: number;
+  char_count: number;
+  snippet_preview: string;
+}
+
+export interface DocumentCitation {
+  citation_key: string;
+  document_id: string;
+  title: string;
+  source_name: string;
+  snippet: string;
+  chunk_index: number;
+}
+
+export interface DocumentAskResponse {
+  answer: string;
+  grounded: boolean;
+  confidence: string;
+  citations: DocumentCitation[];
+}
+
 export type BackendUserRole = 'viewer' | 'analyst' | 'reviewer' | 'admin';
 
 export interface AuthContextResponse {
@@ -290,6 +321,45 @@ export async function apiRequest<T>(
 
 export function getAuthContext(userId: string, userRole?: BackendUserRole) {
   return apiRequest<AuthContextResponse>('/auth/me', undefined, { userId, userRole });
+}
+
+export function listDocuments(userId: string) {
+  return apiRequest<{ documents: DocumentSummary[] }>('/documents', undefined, { userId });
+}
+
+export async function uploadDocument(userId: string, file: File, payload?: { title?: string; source_name?: string }) {
+  const form = new FormData();
+  form.append('file', file);
+  if (payload?.title?.trim()) {
+    form.append('title', payload.title.trim());
+  }
+  if (payload?.source_name?.trim()) {
+    form.append('source_name', payload.source_name.trim());
+  }
+  return apiRequest<DocumentSummary>(
+    '/documents',
+    {
+      method: 'POST',
+      body: form,
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function askDocuments(userId: string, question: string, documentIds?: string[], limit = 4) {
+  return apiRequest<DocumentAskResponse>(
+    '/documents/ask',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question,
+        document_ids: documentIds ?? [],
+        limit,
+      }),
+    },
+    { userId, timeoutMs: 120000 }
+  );
 }
 
 export function createSession(

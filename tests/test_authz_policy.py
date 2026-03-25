@@ -27,7 +27,7 @@ def test_auth_me_returns_inferred_and_explicit_role_context() -> None:
     explicit = client.get("/auth/me", headers={"X-API-Key": "manager_1", "X-User-Role": "viewer"})
     assert explicit.status_code == 200
     assert explicit.json()["role"] == "viewer"
-    assert explicit.json()["permissions"] == ["sessions:read_own", "sessions:export_masked_own"]
+    assert explicit.json()["permissions"] == ["sessions:read_own", "sessions:export_masked_own", "docs:read_own"]
 
 
 def test_analyst_cannot_read_another_users_session() -> None:

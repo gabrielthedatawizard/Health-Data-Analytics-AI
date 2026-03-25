@@ -65,9 +65,42 @@ MID_ROW_MAX = 1_000_000
 MID_COL_MAX = 200
 SAMPLE_MAX_ROWS = 250_000
 CACHE_VERSION = "v1"
+DOCUMENT_LIBRARY_DIR = DATA_DIR / "document_library"
+DOCUMENT_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+SUPPORTED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json"}
+MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
+DOCUMENT_CHUNK_SIZE = 900
+DOCUMENT_CHUNK_OVERLAP = 120
+DOCUMENT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+}
 VALID_USER_ROLES = {"viewer", "analyst", "reviewer", "admin"}
 ROLE_PERMISSIONS: dict[str, list[str]] = {
-    "viewer": ["sessions:read_own", "sessions:export_masked_own"],
+    "viewer": ["sessions:read_own", "sessions:export_masked_own", "docs:read_own"],
     "analyst": [
         "sessions:create",
         "sessions:read_own",
@@ -75,6 +108,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:compute_own",
         "sessions:export_own",
         "sensitive_export:request_own",
+        "docs:create",
+        "docs:read_own",
     ],
     "reviewer": [
         "sessions:create",
@@ -86,6 +121,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:export_all",
         "sensitive_export:request_own",
         "sensitive_export:review",
+        "docs:create",
+        "docs:read_own",
+        "docs:read_all",
     ],
     "admin": [
         "sessions:create",
@@ -94,6 +132,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:compute_all",
         "sessions:export_all",
         "sensitive_export:review",
+        "docs:create",
+        "docs:read_all",
         "admin:all",
     ],
 }
@@ -245,6 +285,67 @@ class AuthContextResponse(BaseModel):
     permissions: list[str] = Field(default_factory=list)
 
 
+class DocumentSummaryResponse(BaseModel):
+    document_id: str
+    title: str
+    source_name: str
+    status: str
+    created_at: str
+    updated_at: str
+    created_by: str
+    file_name: str
+    file_type: str
+    chunk_count: int
+    char_count: int
+
+
+class DocumentMetaResponse(DocumentSummaryResponse):
+    snippet_preview: str = ""
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str = Field(min_length=3, max_length=1000)
+    document_ids: list[str] = Field(default_factory=list)
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class DocumentSearchHit(BaseModel):
+    citation_key: str
+    document_id: str
+    title: str
+    source_name: str
+    snippet: str
+    chunk_index: int
+    score: float
+
+
+class DocumentSearchResponse(BaseModel):
+    query: str
+    results: list[DocumentSearchHit] = Field(default_factory=list)
+
+
+class DocumentAskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=1000)
+    document_ids: list[str] = Field(default_factory=list)
+    limit: int = Field(default=4, ge=1, le=8)
+
+
+class DocumentCitation(BaseModel):
+    citation_key: str
+    document_id: str
+    title: str
+    source_name: str
+    snippet: str
+    chunk_index: int
+
+
+class DocumentAskResponse(BaseModel):
+    answer: str
+    grounded: bool
+    confidence: str
+    citations: list[DocumentCitation] = Field(default_factory=list)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -261,6 +362,23 @@ def _dataset_path(dataset_id: str) -> Path:
 
 def _meta_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "meta.json"
+
+
+def _document_path(document_id: str) -> Path:
+    _validate_dataset_id(document_id)
+    return DOCUMENT_LIBRARY_DIR / document_id
+
+
+def _document_meta_path(document_id: str) -> Path:
+    return _document_path(document_id) / "meta.json"
+
+
+def _document_content_path(document_id: str) -> Path:
+    return _document_path(document_id) / "content.txt"
+
+
+def _document_chunks_path(document_id: str) -> Path:
+    return _document_path(document_id) / "chunks.json"
 
 
 def _profile_path(dataset_id: str) -> Path:
@@ -314,6 +432,18 @@ def _load_meta(dataset_id: str) -> dict[str, Any]:
 def _save_meta(dataset_id: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = _utc_now_iso()
     _save_json(_meta_path(dataset_id), meta)
+
+
+def _load_document_meta(document_id: str) -> dict[str, Any]:
+    path = _document_meta_path(document_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return _load_json(path)
+
+
+def _save_document_meta(document_id: str, meta: dict[str, Any]) -> None:
+    meta["updated_at"] = _utc_now_iso()
+    _save_json(_document_meta_path(document_id), meta)
 
 
 def _safe_directory_size(path: Path) -> int:
@@ -514,6 +644,277 @@ def _authorized_session_context(
     )
     _require_session_action(meta, actor, role, action)
     return meta, actor, role
+
+
+def _document_owner(meta: dict[str, Any]) -> str:
+    return str(meta.get("created_by") or "anonymous")
+
+
+def _document_action_allowed(meta: dict[str, Any], actor: str, role: str, action: str) -> bool:
+    if role == "admin":
+        return True
+
+    owner = actor == _document_owner(meta)
+    if action == "read":
+        return owner or role == "reviewer"
+    if action == "create":
+        return role in {"analyst", "reviewer"}
+    return False
+
+
+def _require_document_action(meta: dict[str, Any], actor: str, role: str, action: str) -> None:
+    if _document_action_allowed(meta, actor, role, action):
+        return
+
+    owner = _document_owner(meta)
+    role_label = role or "viewer"
+    raise HTTPException(
+        status_code=403,
+        detail=f"{role_label} is not allowed to {action.replace('_', ' ')} for document owned by {owner}.",
+    )
+
+
+def _authorized_document_context(
+    document_id: str,
+    *,
+    action: str,
+    x_api_key: str | None = None,
+    x_user_role: str | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    meta = _load_document_meta(document_id)
+    actor, role, _ = _resolve_auth_context(x_api_key, x_user_role)
+    _require_document_action(meta, actor, role, action)
+    return meta, actor, role
+
+
+def _document_summary_from_meta(document_id: str, meta: dict[str, Any]) -> DocumentMetaResponse:
+    content_path = _document_content_path(document_id)
+    snippet_preview = ""
+    if content_path.exists():
+        try:
+            snippet_preview = content_path.read_text(encoding="utf-8")[:240].strip()
+        except OSError:
+            snippet_preview = ""
+
+    return DocumentMetaResponse(
+        document_id=document_id,
+        title=str(meta.get("title") or meta.get("file_name") or document_id),
+        source_name=str(meta.get("source_name") or meta.get("title") or meta.get("file_name") or document_id),
+        status=str(meta.get("status") or "ready"),
+        created_at=str(meta.get("created_at") or ""),
+        updated_at=str(meta.get("updated_at") or ""),
+        created_by=str(meta.get("created_by") or "anonymous"),
+        file_name=str(meta.get("file_name") or ""),
+        file_type=str(meta.get("file_type") or ""),
+        chunk_count=int(meta.get("chunk_count") or 0),
+        char_count=int(meta.get("char_count") or 0),
+        snippet_preview=snippet_preview,
+    )
+
+
+def _read_document_text(content: bytes, extension: str) -> str:
+    if extension in {".txt", ".md"}:
+        for encoding in CSV_ENCODINGS:
+            try:
+                return content.decode(encoding)
+            except Exception:  # noqa: PERF203
+                continue
+        raise ValueError("Could not decode text document with supported encodings.")
+
+    if extension in {".html", ".htm"}:
+        for encoding in CSV_ENCODINGS:
+            try:
+                decoded = content.decode(encoding)
+                stripped = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", decoded, flags=re.IGNORECASE)
+                stripped = re.sub(r"<[^>]+>", " ", stripped)
+                return html.unescape(stripped)
+            except Exception:  # noqa: PERF203
+                continue
+        raise ValueError("Could not decode HTML document with supported encodings.")
+
+    if extension == ".json":
+        try:
+            parsed = json.loads(content.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Could not parse JSON document: {exc}") from exc
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+    raise ValueError(f"Unsupported document type '{extension}'.")
+
+
+def _normalize_document_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    normalized = re.sub(r"[ \t]+", " ", normalized)
+    return normalized.strip()
+
+
+def _chunk_document_text(text: str) -> list[str]:
+    normalized = _normalize_document_text(text)
+    if not normalized:
+        return []
+
+    paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", normalized) if segment.strip()]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
+        if len(candidate) <= DOCUMENT_CHUNK_SIZE:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(paragraph) <= DOCUMENT_CHUNK_SIZE:
+            current = paragraph
+            continue
+        start = 0
+        while start < len(paragraph):
+            end = min(len(paragraph), start + DOCUMENT_CHUNK_SIZE)
+            chunk = paragraph[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(paragraph):
+                break
+            start = max(end - DOCUMENT_CHUNK_OVERLAP, start + 1)
+        current = ""
+    if current:
+        chunks.append(current)
+    return chunks[:100]
+
+
+def _tokenize_document_query(text: str) -> list[str]:
+    tokens = [token for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(token) >= 3]
+    return [token for token in tokens if token not in DOCUMENT_STOPWORDS]
+
+
+def _document_snippet(text: str, max_chars: int = 260) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 1].rstrip() + "..."
+
+
+def _score_document_chunk(query: str, query_tokens: list[str], chunk_text: str, title: str, source_name: str) -> float:
+    haystack = f"{title} {source_name} {chunk_text}".lower()
+    if not haystack.strip():
+        return 0.0
+
+    score = 0.0
+    lowered_query = query.lower().strip()
+    if lowered_query and lowered_query in haystack:
+        score += 6.0
+
+    chunk_tokens = set(_tokenize_document_query(haystack))
+    for token in query_tokens:
+        if token in chunk_tokens:
+            score += 1.5
+        if token in title.lower():
+            score += 1.0
+        if token in source_name.lower():
+            score += 0.75
+
+    return score
+
+
+def _load_document_chunks(document_id: str) -> list[str]:
+    path = _document_chunks_path(document_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    chunks = payload.get("chunks") or []
+    return [str(chunk) for chunk in chunks if isinstance(chunk, str)]
+
+
+def _iter_accessible_documents(actor: str, role: str) -> list[tuple[str, dict[str, Any]]]:
+    items: list[tuple[str, dict[str, Any]]] = []
+    for child in sorted(DOCUMENT_LIBRARY_DIR.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        meta_path = child / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = _load_json(meta_path)
+            if not _document_action_allowed(meta, actor, role, "read"):
+                continue
+            items.append((str(meta.get("document_id") or child.name), meta))
+        except Exception:
+            continue
+    return items
+
+
+def _search_documents_internal(
+    actor: str,
+    role: str,
+    query: str,
+    *,
+    document_ids: list[str] | None = None,
+    limit: int = 5,
+) -> list[DocumentSearchHit]:
+    requested_ids = {document_id for document_id in (document_ids or []) if document_id}
+    query_tokens = _tokenize_document_query(query)
+    candidates: list[DocumentSearchHit] = []
+
+    for document_id, meta in _iter_accessible_documents(actor, role):
+        if requested_ids and document_id not in requested_ids:
+            continue
+        title = str(meta.get("title") or meta.get("file_name") or document_id)
+        source_name = str(meta.get("source_name") or title)
+        chunks = _load_document_chunks(document_id)
+        for index, chunk in enumerate(chunks):
+            score = _score_document_chunk(query, query_tokens, chunk, title, source_name)
+            if score <= 0:
+                continue
+            candidates.append(
+                DocumentSearchHit(
+                    citation_key=f"doc:{document_id}:{index}",
+                    document_id=document_id,
+                    title=title,
+                    source_name=source_name,
+                    snippet=_document_snippet(chunk),
+                    chunk_index=index,
+                    score=round(score, 3),
+                )
+            )
+
+    candidates.sort(key=lambda item: (item.score, item.document_id), reverse=True)
+    return candidates[:limit]
+
+
+def _answer_documents(question: str, hits: list[DocumentSearchHit]) -> DocumentAskResponse:
+    if not hits:
+        return DocumentAskResponse(
+            answer="No grounded answer was found in the trusted document library for that question.",
+            grounded=False,
+            confidence="Low",
+            citations=[],
+        )
+
+    lead = hits[0]
+    supporting = hits[1:3]
+    answer_parts = [
+        f"The most relevant trusted source is {lead.title}.",
+        f"It states: \"{lead.snippet}\"",
+    ]
+    if supporting:
+        answer_parts.append(
+            "Supporting documents add: "
+            + " ".join(f"{item.title}: \"{item.snippet}\"" for item in supporting)
+        )
+
+    citations = [
+        DocumentCitation(
+            citation_key=item.citation_key,
+            document_id=item.document_id,
+            title=item.title,
+            source_name=item.source_name,
+            snippet=item.snippet,
+            chunk_index=item.chunk_index,
+        )
+        for item in hits
+    ]
+    confidence = "High" if len(hits) >= 2 and hits[0].score >= 3 else "Medium"
+    return DocumentAskResponse(answer=" ".join(answer_parts), grounded=True, confidence=confidence, citations=citations)
 
 
 def _sha256_text(value: str) -> str:
@@ -1917,6 +2318,114 @@ def get_auth_context(
 ) -> AuthContextResponse:
     actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
     return AuthContextResponse(actor=actor, role=role, permissions=permissions)
+
+
+@app.get("/documents")
+def list_documents(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    actor, role, _ = _resolve_auth_context(x_api_key, x_user_role)
+    documents = [
+        _document_summary_from_meta(document_id, meta).model_dump()
+        for document_id, meta in _iter_accessible_documents(actor, role)
+    ]
+    documents.sort(key=lambda item: item["updated_at"], reverse=True)
+    return {"documents": documents}
+
+
+@app.post("/documents", response_model=DocumentMetaResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    source_name: str | None = Form(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> DocumentMetaResponse:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    if "docs:create" not in permissions and "admin:all" not in permissions:
+        raise HTTPException(status_code=403, detail=f"{role} is not allowed to upload trusted documents.")
+
+    filename = file.filename or "document"
+    extension = Path(filename).suffix.lower()
+    if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Supported document types are: {', '.join(sorted(SUPPORTED_DOCUMENT_EXTENSIONS))}.",
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded document is empty.")
+    if len(content) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(status_code=400, detail="Document too large (max 5MB).")
+
+    try:
+        text = _normalize_document_text(_read_document_text(content, extension))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Document did not contain readable text.")
+
+    chunks = _chunk_document_text(text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Document did not produce retrievable text chunks.")
+
+    document_id = str(uuid.uuid4())
+    document_dir = _document_path(document_id)
+    document_dir.mkdir(parents=True, exist_ok=True)
+    _document_content_path(document_id).write_text(text, encoding="utf-8")
+    _save_json(_document_chunks_path(document_id), {"chunks": chunks})
+
+    now = _utc_now_iso()
+    meta = {
+        "document_id": document_id,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": actor,
+        "title": (title or "").strip() or Path(filename).stem,
+        "source_name": (source_name or "").strip() or Path(filename).stem,
+        "status": "ready",
+        "file_name": filename,
+        "file_type": extension.lstrip("."),
+        "chunk_count": len(chunks),
+        "char_count": len(text),
+    }
+    _save_json(_document_meta_path(document_id), meta)
+    return _document_summary_from_meta(document_id, meta)
+
+
+@app.get("/documents/{document_id}", response_model=DocumentMetaResponse)
+def get_document(
+    document_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> DocumentMetaResponse:
+    meta, _, _ = _authorized_document_context(document_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return _document_summary_from_meta(document_id, meta)
+
+
+@app.post("/documents/search", response_model=DocumentSearchResponse)
+def search_documents(
+    payload: DocumentSearchRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> DocumentSearchResponse:
+    actor, role, _ = _resolve_auth_context(x_api_key, x_user_role)
+    hits = _search_documents_internal(actor, role, payload.query, document_ids=payload.document_ids, limit=payload.limit)
+    return DocumentSearchResponse(query=payload.query, results=hits)
+
+
+@app.post("/documents/ask", response_model=DocumentAskResponse)
+def ask_documents(
+    payload: DocumentAskRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> DocumentAskResponse:
+    actor, role, _ = _resolve_auth_context(x_api_key, x_user_role)
+    hits = _search_documents_internal(actor, role, payload.question, document_ids=payload.document_ids, limit=payload.limit)
+    return _answer_documents(payload.question, hits)
 
 
 @app.post("/sessions", response_model=CreateSessionResponse)

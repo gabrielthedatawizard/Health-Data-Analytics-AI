@@ -6,6 +6,7 @@ import {
   Bot,
   Database,
   FileDown,
+  FileText,
   FileSpreadsheet,
   Loader2,
   RefreshCw,
@@ -24,11 +25,14 @@ import {
   BACKEND_ROLE_STORAGE_KEY,
   BACKEND_USER_STORAGE_KEY,
   type AskResponsePayload,
+  type DocumentAskResponse,
+  type DocumentSummary,
   type AuthContextResponse,
   type BackendUserRole,
   type AuditEvent,
   type JobStatus,
   type SessionMeta,
+  askDocuments,
   askDataset,
   createSession,
   datasetCsvUrl,
@@ -43,11 +47,13 @@ import {
   getProfile,
   getSession,
   inferBackendUserRole,
+  listDocuments,
   requestSensitiveExportApproval,
   reportHtmlUrl,
   reportPdfUrl,
   reviewSensitiveExportApproval,
   setSensitiveExportEnabled,
+  uploadDocument,
   uploadDataset,
 } from '@/lib/backend-api';
 
@@ -309,13 +315,17 @@ export function AIAnalyticsDashboard() {
   const [datasetId, setDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
   const [loadDatasetId, setLoadDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedDocumentFile, setSelectedDocumentFile] = useState<File | null>(null);
   const [authContext, setAuthContext] = useState<AuthContextResponse | null>(null);
   const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null);
+  const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [profile, setProfile] = useState<Record<string, unknown> | null>(null);
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
   const [askResult, setAskResult] = useState<AskResponsePayload | null>(null);
+  const [documentQuestion, setDocumentQuestion] = useState('What do our trusted policy documents say about denominator exclusions?');
+  const [documentAnswer, setDocumentAnswer] = useState<DocumentAskResponse | null>(null);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [factsJob, setFactsJob] = useState<JobStatus | null>(null);
   const [reportJob, setReportJob] = useState<JobStatus | null>(null);
@@ -363,6 +373,27 @@ export function AIAnalyticsDashboard() {
     }
 
     void resolveAuthContext();
+
+    return () => {
+      active = false;
+    };
+  }, [userId, userRole]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function hydrateDocuments() {
+      try {
+        const response = await listDocuments(userId);
+        if (!active) return;
+        setDocuments(response.documents ?? []);
+      } catch {
+        if (!active) return;
+        setDocuments([]);
+      }
+    }
+
+    void hydrateDocuments();
 
     return () => {
       active = false;
@@ -557,6 +588,8 @@ export function AIAnalyticsDashboard() {
   const canCompute = permissionSet.has('sessions:compute_own') || permissionSet.has('sessions:compute_all') || permissionSet.has('admin:all');
   const canReviewSensitiveExport = permissionSet.has('sensitive_export:review') || permissionSet.has('admin:all');
   const canRequestSensitiveExport = permissionSet.has('sensitive_export:request_own') || permissionSet.has('admin:all');
+  const canReadDocuments = permissionSet.has('docs:read_own') || permissionSet.has('docs:read_all') || permissionSet.has('admin:all');
+  const canUploadDocuments = permissionSet.has('docs:create') || permissionSet.has('admin:all');
 
   useEffect(() => {
     if (dashboardCharts.length === 0) {
@@ -569,6 +602,11 @@ export function AIAnalyticsDashboard() {
     );
   }, [dashboardCharts]);
 
+  async function refreshDocuments() {
+    const response = await listDocuments(userId);
+    setDocuments(response.documents ?? []);
+  }
+
   async function handleCreateSession() {
     setBusyAction('create_session');
     setError(null);
@@ -580,6 +618,47 @@ export function AIAnalyticsDashboard() {
       setNotice(`Created session ${created.dataset_id}.`);
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : 'Failed to create session.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleUploadDocument() {
+    if (!selectedDocumentFile) {
+      setError('Choose a TXT, MD, HTML, or JSON document first.');
+      return;
+    }
+
+    setBusyAction('document_upload');
+    setError(null);
+    setNotice(null);
+    try {
+      await uploadDocument(userId, selectedDocumentFile);
+      await refreshDocuments();
+      setSelectedDocumentFile(null);
+      setNotice(`${selectedDocumentFile.name} uploaded to the trusted document library.`);
+    } catch (documentError) {
+      setError(documentError instanceof Error ? documentError.message : 'Document upload failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleAskDocuments() {
+    if (!documentQuestion.trim()) {
+      setError('Enter a document question first.');
+      return;
+    }
+
+    setBusyAction('document_ask');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await askDocuments(userId, documentQuestion.trim());
+      setDocumentAnswer(response);
+      setNotice(response.grounded ? 'Document answer generated with citations.' : 'No grounded document answer was found.');
+    } catch (documentError) {
+      setError(documentError instanceof Error ? documentError.message : 'Document Q&A failed.');
     } finally {
       setBusyAction(null);
     }
@@ -1133,6 +1212,107 @@ export function AIAnalyticsDashboard() {
         ) : null}
       </section>
 
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <div className="flex items-center gap-2">
+          <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+            <FileText className="h-5 w-5" />
+          </div>
+          <div>
+            <h3 className="text-lg font-medium text-foreground">Trusted Document Q&amp;A</h3>
+            <p className="text-sm text-muted-foreground">
+              Upload trusted SOPs, policy notes, and measure definitions, then answer only from cited document snippets.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
+          <Input
+            type="file"
+            accept=".txt,.md,.html,.htm,.json"
+            onChange={(event) => setSelectedDocumentFile(event.target.files?.[0] ?? null)}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleUploadDocument()}
+            disabled={busyAction === 'document_upload' || !selectedDocumentFile || !canUploadDocuments}
+          >
+            {busyAction === 'document_upload' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+            Add Trusted Doc
+          </Button>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Badge variant="outline">Documents: {documents.length}</Badge>
+          <Badge variant="outline">Readable: {canReadDocuments ? 'yes' : 'no'}</Badge>
+          <Badge variant="outline">Upload enabled: {canUploadDocuments ? 'yes' : 'no'}</Badge>
+        </div>
+
+        {documents.length > 0 ? (
+          <div className="mt-4 grid gap-3 lg:grid-cols-2">
+            {documents.slice(0, 6).map((document) => (
+              <div key={document.document_id} className="rounded-xl border border-border bg-background px-4 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{document.file_type.toUpperCase()}</Badge>
+                  <Badge variant="outline">{document.chunk_count} chunks</Badge>
+                </div>
+                <p className="mt-2 text-sm font-medium text-foreground">{document.title}</p>
+                <p className="mt-1 text-xs text-muted-foreground">{document.source_name}</p>
+                {document.snippet_preview ? (
+                  <p className="mt-2 text-xs text-muted-foreground">{document.snippet_preview}</p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            No trusted documents uploaded yet. This first slice supports TXT, MD, HTML, and JSON sources.
+          </div>
+        )}
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
+          <Textarea
+            value={documentQuestion}
+            onChange={(event) => setDocumentQuestion(event.target.value)}
+            placeholder="Ask a source-backed document question..."
+            className="min-h-[110px]"
+          />
+          <Button type="button" onClick={() => void handleAskDocuments()} disabled={busyAction === 'document_ask' || !canReadDocuments}>
+            {busyAction === 'document_ask' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
+            Ask Docs
+          </Button>
+        </div>
+
+        {documentAnswer ? (
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-border bg-background p-4">
+              <p className="text-sm text-foreground">{documentAnswer.answer}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="outline">Grounded: {documentAnswer.grounded ? 'yes' : 'no'}</Badge>
+                <Badge variant="outline">Confidence: {documentAnswer.confidence}</Badge>
+                <Badge variant="outline">Citations: {documentAnswer.citations.length}</Badge>
+              </div>
+            </div>
+            {documentAnswer.citations.length > 0 ? (
+              <div className="grid gap-3 lg:grid-cols-2">
+                {documentAnswer.citations.map((citation) => (
+                  <div
+                    key={citation.citation_key}
+                    className="rounded-xl border border-border bg-background px-4 py-3"
+                  >
+                    <p className="text-sm font-medium text-foreground">{citation.title}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {citation.source_name} · chunk {citation.chunk_index + 1}
+                    </p>
+                    <p className="mt-2 text-sm text-muted-foreground">{citation.snippet}</p>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+
       <section className="grid gap-4 xl:grid-cols-2">
         <Card className="border-border">
           <CardHeader>
@@ -1579,9 +1759,9 @@ export function AIAnalyticsDashboard() {
           <div>
             <h3 className="font-medium text-foreground">Current Phase</h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              This governed React surface now supports inspectable ask-data, dashboard summaries, and chart-level
-              explanations. The rest of the product still needs migration away from the legacy browser-local analytics
-              context.
+              This governed React surface now supports inspectable ask-data, dashboard summaries, chart-level
+              explanations, and source-backed trusted document Q&amp;A. The rest of the product still needs migration
+              away from the legacy browser-local analytics context.
             </p>
           </div>
         </div>
