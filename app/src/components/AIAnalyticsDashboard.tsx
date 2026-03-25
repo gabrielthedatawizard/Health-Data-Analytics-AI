@@ -60,6 +60,61 @@ import {
 const DATASET_STORAGE_KEY = 'healthai_backend_dataset_id';
 const USER_STORAGE_KEY = BACKEND_USER_STORAGE_KEY;
 const ROLE_STORAGE_KEY = BACKEND_ROLE_STORAGE_KEY;
+const DATASET_ID_PATTERN = /^[a-f0-9-]{36}$/i;
+const ROLE_FALLBACK_PERMISSIONS: Record<BackendUserRole, string[]> = {
+  viewer: ['sessions:read_own', 'sessions:export_masked_own', 'docs:read_own'],
+  analyst: [
+    'sessions:create',
+    'sessions:read_own',
+    'sessions:write_own',
+    'sessions:compute_own',
+    'sessions:export_own',
+    'sensitive_export:request_own',
+    'docs:create',
+    'docs:read_own',
+  ],
+  reviewer: [
+    'sessions:create',
+    'sessions:read_own',
+    'sessions:write_own',
+    'sessions:compute_own',
+    'sessions:export_own',
+    'sessions:read_all',
+    'sessions:export_all',
+    'sensitive_export:request_own',
+    'sensitive_export:review',
+    'docs:create',
+    'docs:read_own',
+    'docs:read_all',
+  ],
+  admin: [
+    'sessions:create',
+    'sessions:read_all',
+    'sessions:write_all',
+    'sessions:compute_all',
+    'sessions:export_all',
+    'sensitive_export:review',
+    'docs:create',
+    'docs:read_all',
+    'admin:all',
+  ],
+};
+
+function isDatasetId(value: string): boolean {
+  return DATASET_ID_PATTERN.test(value.trim());
+}
+
+function getStoredDatasetId(): string {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  const storedValue = localStorage.getItem(DATASET_STORAGE_KEY)?.trim() ?? '';
+  return isDatasetId(storedValue) ? storedValue : '';
+}
+
+function fallbackPermissionsForRole(role: BackendUserRole): string[] {
+  return ROLE_FALLBACK_PERMISSIONS[role] ?? ROLE_FALLBACK_PERMISSIONS.analyst;
+}
 
 function asNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -312,11 +367,12 @@ export function AIAnalyticsDashboard() {
     }
     return inferBackendUserRole(localStorage.getItem(USER_STORAGE_KEY) || 'react_user');
   });
-  const [datasetId, setDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
-  const [loadDatasetId, setLoadDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
+  const [datasetId, setDatasetId] = useState(() => getStoredDatasetId());
+  const [loadDatasetId, setLoadDatasetId] = useState(() => getStoredDatasetId());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedDocumentFile, setSelectedDocumentFile] = useState<File | null>(null);
   const [authContext, setAuthContext] = useState<AuthContextResponse | null>(null);
+  const [usingFallbackAuthContext, setUsingFallbackAuthContext] = useState(false);
   const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null);
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [profile, setProfile] = useState<Record<string, unknown> | null>(null);
@@ -362,13 +418,15 @@ export function AIAnalyticsDashboard() {
         const context = await getAuthContext(userId, userRole);
         if (!active) return;
         setAuthContext(context);
+        setUsingFallbackAuthContext(false);
       } catch {
         if (!active) return;
         setAuthContext({
           actor: userId.trim() || 'anonymous',
           role: userRole,
-          permissions: [],
+          permissions: fallbackPermissionsForRole(userRole),
         });
+        setUsingFallbackAuthContext(true);
       }
     }
 
@@ -582,7 +640,14 @@ export function AIAnalyticsDashboard() {
   const sensitiveExportApproval = sessionMeta?.sensitive_export_approval;
   const sensitiveExportStatus = asString(sensitiveExportApproval?.status) ?? 'not_requested';
   const maskedExportsActive = piiCandidates.length > 0 && !sessionMeta?.allow_sensitive_export;
-  const permissionSet = useMemo(() => new Set(authContext?.permissions ?? []), [authContext]);
+  const effectivePermissions = useMemo(() => {
+    const resolvedPermissions = authContext?.permissions ?? [];
+    if (resolvedPermissions.length > 0) {
+      return resolvedPermissions;
+    }
+    return fallbackPermissionsForRole(authContext?.role ?? userRole);
+  }, [authContext, userRole]);
+  const permissionSet = useMemo(() => new Set(effectivePermissions), [effectivePermissions]);
   const effectiveRole = authContext?.role ?? userRole;
   const canCreateSession = permissionSet.has('sessions:create') || permissionSet.has('admin:all');
   const canCompute = permissionSet.has('sessions:compute_own') || permissionSet.has('sessions:compute_all') || permissionSet.has('admin:all');
@@ -665,17 +730,22 @@ export function AIAnalyticsDashboard() {
   }
 
   async function handleLoadSession() {
-    if (!loadDatasetId.trim()) {
-      setError('Enter a dataset ID to load.');
+    const targetDatasetId = loadDatasetId.trim();
+    if (!targetDatasetId) {
+      setError('Enter a session ID to load.');
+      return;
+    }
+    if (!isDatasetId(targetDatasetId)) {
+      setError('Session IDs are generated UUIDs. Click New Session or paste a valid session ID, not a short value like 1.');
       return;
     }
     setBusyAction('load_session');
     setError(null);
     setNotice(null);
     try {
-      await getSession(loadDatasetId.trim(), userId);
-      setDatasetId(loadDatasetId.trim());
-      setNotice(`Loaded session ${loadDatasetId.trim()}.`);
+      await getSession(targetDatasetId, userId);
+      setDatasetId(targetDatasetId);
+      setNotice(`Loaded session ${targetDatasetId}.`);
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : 'Failed to load session.');
     } finally {
@@ -1019,7 +1089,7 @@ export function AIAnalyticsDashboard() {
 
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="rounded-xl border border-border bg-background px-3 py-2">
-              <p className="text-xs text-muted-foreground">Dataset ID</p>
+              <p className="text-xs text-muted-foreground">Session ID</p>
               <p className="break-all text-sm text-foreground">{datasetId || 'Not selected'}</p>
             </div>
             <div className="rounded-xl border border-border bg-background px-3 py-2">
@@ -1044,7 +1114,7 @@ export function AIAnalyticsDashboard() {
           <Input
             value={loadDatasetId}
             onChange={(event) => setLoadDatasetId(event.target.value)}
-            placeholder="Existing dataset ID"
+            placeholder="Existing session ID (UUID)"
           />
           <div className="flex gap-2">
             <Button type="button" variant="outline" onClick={() => void handleLoadSession()} disabled={isBusy('load_session')}>
@@ -1062,14 +1132,19 @@ export function AIAnalyticsDashboard() {
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline">Actor: {authContext?.actor ?? userId ?? 'anonymous'}</Badge>
             <Badge variant="outline">Role: {effectiveRole}</Badge>
-            <Badge variant="outline">Permissions: {authContext?.permissions.length ?? 0}</Badge>
+            <Badge variant="outline">Permissions: {effectivePermissions.length}</Badge>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
-            This dev auth layer is permission-aware but still header-driven. Production rollout still needs real identity and policy enforcement.
+            {usingFallbackAuthContext
+              ? 'Using local role fallback permissions because the auth context check could not be loaded. New Session and other governed actions stay available while connectivity recovers.'
+              : 'This dev auth layer is permission-aware but still header-driven. Production rollout still needs real identity and policy enforcement.'}
           </p>
-          {authContext?.permissions?.length ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Use New Session to generate a fresh session ID automatically. Do not type small values like 1 into the load field.
+          </p>
+          {effectivePermissions.length ? (
             <div className="mt-2 flex flex-wrap gap-2">
-              {authContext.permissions.slice(0, 8).map((permission) => (
+              {effectivePermissions.slice(0, 8).map((permission) => (
                 <Badge key={permission} variant="secondary">
                   {permission}
                 </Badge>
