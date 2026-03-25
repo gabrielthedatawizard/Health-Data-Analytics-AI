@@ -67,6 +67,34 @@ export interface DashboardSpecResponse {
   dashboard_spec: Record<string, unknown>;
 }
 
+export interface AnomalyFinding {
+  anomaly_id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  summary: string;
+  metric?: string | null;
+  dimension?: string | null;
+  segment?: string | null;
+  period?: string | null;
+  evidence: string[];
+  root_cause_hints: string[];
+  recommended_question?: string | null;
+}
+
+export interface AnomalyAnalysisPayload {
+  generated_at: string;
+  anomaly_count: number;
+  summary: string;
+  anomalies: AnomalyFinding[];
+  suggested_questions: string[];
+}
+
+export interface AnomalyAnalysisResponse {
+  dataset_id: string;
+  analysis: AnomalyAnalysisPayload;
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -443,6 +471,17 @@ export function getFacts(datasetId: string, userId: string, mode = 'auto') {
     userId,
     timeoutMs: 120000,
   });
+}
+
+export function getAnomalyAnalysis(datasetId: string, userId: string, limit = 6) {
+  return apiRequest<AnomalyAnalysisResponse>(
+    `/sessions/${datasetId}/anomalies?limit=${encodeURIComponent(String(limit))}`,
+    undefined,
+    {
+      userId,
+      timeoutMs: 120000,
+    }
+  );
 }
 
 export function generateDashboardSpec(datasetId: string, userId: string, template = 'health_core') {

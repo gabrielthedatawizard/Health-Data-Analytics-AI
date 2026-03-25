@@ -22,6 +22,7 @@ import { Progress } from '@/components/ui/progress';
 import { Textarea } from '@/components/ui/textarea';
 import {
   API_TARGET_LABEL,
+  type AnomalyAnalysisResponse,
   BACKEND_ROLE_STORAGE_KEY,
   BACKEND_USER_STORAGE_KEY,
   type AskResponsePayload,
@@ -40,6 +41,7 @@ import {
   generateDashboardSpec,
   generateReport,
   getAudit,
+  getAnomalyAnalysis,
   getAuthContext,
   getDashboardSpec,
   getFacts,
@@ -377,6 +379,7 @@ export function AIAnalyticsDashboard() {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [profile, setProfile] = useState<Record<string, unknown> | null>(null);
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
+  const [anomalyAnalysis, setAnomalyAnalysis] = useState<AnomalyAnalysisResponse | null>(null);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
   const [askResult, setAskResult] = useState<AskResponsePayload | null>(null);
@@ -463,6 +466,7 @@ export function AIAnalyticsDashboard() {
       setSessionMeta(null);
       setProfile(null);
       setFactsBundle(null);
+      setAnomalyAnalysis(null);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -491,6 +495,12 @@ export function AIAnalyticsDashboard() {
           const factsResponse = await getFacts(datasetId, userId);
           if (!active) return;
           setFactsBundle(factsResponse.facts_bundle ?? null);
+        }
+
+        if (meta.artifacts?.anomaly_analysis) {
+          const anomalyResponse = await getAnomalyAnalysis(datasetId, userId);
+          if (!active) return;
+          setAnomalyAnalysis(anomalyResponse);
         }
 
         if (meta.artifacts?.dashboard_spec) {
@@ -603,6 +613,12 @@ export function AIAnalyticsDashboard() {
     const issues = (quality as { issues?: unknown }).issues;
     return Array.isArray(issues) ? issues.slice(0, 5) : [];
   }, [factsBundle]);
+
+  const anomalyFindings = useMemo(() => anomalyAnalysis?.analysis.anomalies ?? [], [anomalyAnalysis]);
+  const anomalySuggestedQuestions = useMemo(
+    () => anomalyAnalysis?.analysis.suggested_questions ?? [],
+    [anomalyAnalysis]
+  );
 
   const dashboardCharts = useMemo(() => normalizeDashboardCharts(dashboardSpec), [dashboardSpec]);
 
@@ -774,6 +790,7 @@ export function AIAnalyticsDashboard() {
       await uploadDataset(targetDatasetId, selectedFile, userId);
       setProfile(null);
       setFactsBundle(null);
+      setAnomalyAnalysis(null);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -872,28 +889,62 @@ export function AIAnalyticsDashboard() {
     }
   }
 
-  async function handleAsk() {
+  async function handleDetectAnomalies() {
     if (!datasetId) {
       setError('Create or load a session first.');
       return;
     }
+    setBusyAction('anomalies');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await getAnomalyAnalysis(datasetId, userId);
+      setAnomalyAnalysis(response);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(
+        response.analysis.anomaly_count > 0
+          ? `Detected ${response.analysis.anomaly_count} governed anomaly signal(s).`
+          : 'No high-signal anomalies were detected.'
+      );
+    } catch (anomalyError) {
+      setError(anomalyError instanceof Error ? anomalyError.message : 'Anomaly detection failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleInvestigateQuestion(question: string, successNotice = 'Investigation generated successfully.') {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!question.trim()) {
+      setError('Investigation question is empty.');
+      return;
+    }
+    setBusyAction('investigate');
+    setError(null);
+    setNotice(null);
+    setAskQuestion(question);
+    try {
+      const response = await askDataset(datasetId, userId, question.trim());
+      setAskResult(response);
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(successNotice);
+    } catch (askError) {
+      setError(askError instanceof Error ? askError.message : 'Investigation request failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleAsk() {
     if (!askQuestion.trim()) {
       setError('Enter a question first.');
       return;
     }
-    setBusyAction('ask');
-    setError(null);
-    setNotice(null);
-    try {
-      const response = await askDataset(datasetId, userId, askQuestion.trim());
-      setAskResult(response);
-      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
-      setNotice('Ask-data answer generated successfully.');
-    } catch (askError) {
-      setError(askError instanceof Error ? askError.message : 'Ask-data request failed.');
-    } finally {
-      setBusyAction(null);
-    }
+    await handleInvestigateQuestion(askQuestion.trim(), 'Ask-data answer generated successfully.');
   }
 
   async function handleRequestSensitiveExportApproval() {
@@ -1237,6 +1288,15 @@ export function AIAnalyticsDashboard() {
           <Button type="button" variant="outline" onClick={() => void handleFacts()} disabled={isBusy('facts') || !datasetId || !canCompute}>
             {isBusy('facts') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
             Generate Facts
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleDetectAnomalies()}
+            disabled={isBusy('anomalies') || !datasetId || !canCompute}
+          >
+            {isBusy('anomalies') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <AlertCircle className="mr-2 h-4 w-4" />}
+            Detect Anomalies
           </Button>
           <Button
             type="button"
@@ -1588,6 +1648,135 @@ export function AIAnalyticsDashboard() {
             )}
           </CardContent>
         </Card>
+      </section>
+
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-center gap-2">
+            <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+              <AlertCircle className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-lg font-medium text-foreground">Anomaly and Root-Cause Scan</h3>
+              <p className="text-sm text-muted-foreground">
+                Detect governed quality, segment, and time-based anomalies, then investigate them with auditable follow-up questions.
+              </p>
+            </div>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleDetectAnomalies()}
+            disabled={isBusy('anomalies') || !datasetId || !canCompute}
+          >
+            {isBusy('anomalies') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            Refresh Anomaly Scan
+          </Button>
+        </div>
+
+        {!anomalyAnalysis ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            Run anomaly detection to surface governed quality flags, segment outliers, and time-based spikes or dips.
+          </div>
+        ) : (
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline">Anomalies: {anomalyAnalysis.analysis.anomaly_count}</Badge>
+                <Badge variant="outline">Generated: {new Date(anomalyAnalysis.analysis.generated_at).toLocaleString()}</Badge>
+              </div>
+              <p className="mt-3 text-sm text-foreground">{anomalyAnalysis.analysis.summary}</p>
+            </div>
+
+            {anomalyFindings.length > 0 ? (
+              <div className="grid gap-3 lg:grid-cols-2">
+                {anomalyFindings.map((finding) => (
+                  <div key={finding.anomaly_id} className="rounded-xl border border-border bg-background p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{finding.title}</p>
+                        <p className="mt-1 text-xs text-muted-foreground">{finding.summary}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant="outline">{finding.kind}</Badge>
+                        <Badge variant="outline">{finding.severity}</Badge>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {finding.metric ? <Badge variant="outline">Metric: {finding.metric}</Badge> : null}
+                      {finding.dimension ? <Badge variant="outline">Dimension: {finding.dimension}</Badge> : null}
+                      {finding.segment ? <Badge variant="outline">Segment: {finding.segment}</Badge> : null}
+                      {finding.period ? <Badge variant="outline">Period: {finding.period}</Badge> : null}
+                    </div>
+
+                    {finding.evidence.length > 0 ? (
+                      <div className="mt-3 space-y-2">
+                        {finding.evidence.slice(0, 3).map((evidence, index) => (
+                          <div key={`${finding.anomaly_id}-evidence-${index}`} className="rounded-lg border border-border/70 bg-card px-3 py-2 text-xs text-muted-foreground">
+                            {evidence}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+
+                    {finding.root_cause_hints.length > 0 ? (
+                      <div className="mt-3 rounded-lg border border-health-mint/20 bg-health-mint/10 px-3 py-2">
+                        <p className="text-xs font-medium uppercase tracking-wide text-health-mint">Root-cause hints</p>
+                        <div className="mt-2 space-y-1">
+                          {finding.root_cause_hints.slice(0, 3).map((hint, index) => (
+                            <p key={`${finding.anomaly_id}-hint-${index}`} className="text-xs text-foreground">
+                              {hint}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {finding.recommended_question ? (
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleInvestigateQuestion(finding.recommended_question!, `${finding.title} investigation generated successfully.`)}
+                          disabled={busyAction === 'investigate' || !canCompute}
+                        >
+                          {busyAction === 'investigate' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
+                          Investigate
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+                No high-signal anomaly findings were returned for this dataset.
+              </div>
+            )}
+
+            {anomalySuggestedQuestions.length > 0 ? (
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Suggested follow-up questions</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {anomalySuggestedQuestions.map((question) => (
+                    <Button
+                      key={question}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleInvestigateQuestion(question, 'Anomaly follow-up generated successfully.')}
+                      disabled={busyAction === 'investigate' || !canCompute}
+                    >
+                      {question}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        )}
       </section>
 
       <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">

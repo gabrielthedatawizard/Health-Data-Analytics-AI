@@ -219,6 +219,34 @@ class DashboardSpecResponse(BaseModel):
     dashboard_spec: dict[str, Any]
 
 
+class AnomalyFinding(BaseModel):
+    anomaly_id: str
+    kind: str
+    severity: str
+    title: str
+    summary: str
+    metric: str | None = None
+    dimension: str | None = None
+    segment: str | None = None
+    period: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    root_cause_hints: list[str] = Field(default_factory=list)
+    recommended_question: str | None = None
+
+
+class AnomalyAnalysisPayload(BaseModel):
+    generated_at: str
+    anomaly_count: int
+    summary: str
+    anomalies: list[AnomalyFinding] = Field(default_factory=list)
+    suggested_questions: list[str] = Field(default_factory=list)
+
+
+class AnomalyAnalysisResponse(BaseModel):
+    dataset_id: str
+    analysis: AnomalyAnalysisPayload
+
+
 class ReportResponse(BaseModel):
     dataset_id: str
     report_html_path: str
@@ -387,6 +415,10 @@ def _profile_path(dataset_id: str) -> Path:
 
 def _facts_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "facts.json"
+
+
+def _anomaly_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "anomaly_analysis.json"
 
 
 def _dashboard_spec_path(dataset_id: str) -> Path:
@@ -1338,6 +1370,365 @@ def _load_profile_if_exists(dataset_id: str) -> dict[str, Any] | None:
     if path.exists():
         return _load_json(path)
     return None
+
+
+def _column_profile_index(profile: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    columns = profile.get("columns", []) if isinstance(profile, dict) else []
+    return {
+        str(column.get("name")): column
+        for column in columns
+        if isinstance(column, dict) and column.get("name")
+    }
+
+
+def _preferred_dimension_candidates(profile: dict[str, Any]) -> list[str]:
+    health_signals = profile.get("health_signals", {}) if isinstance(profile, dict) else {}
+    preferred = [
+        *health_signals.get("geography_columns", []),
+        *health_signals.get("service_columns", []),
+        *profile.get("categorical_cols", []),
+    ]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    column_index = _column_profile_index(profile)
+    for raw_name in preferred:
+        name = str(raw_name)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        column = column_index.get(name, {})
+        if column.get("is_pii_candidate") or column.get("is_id_like"):
+            continue
+        unique_count = int(column.get("unique_count") or 0)
+        if 2 <= unique_count <= 20:
+            ordered.append(name)
+    return ordered
+
+
+def _numeric_metric_candidates(profile: dict[str, Any]) -> list[str]:
+    column_index = _column_profile_index(profile)
+    candidates: list[str] = []
+    for raw_name in profile.get("numeric_cols", []):
+        name = str(raw_name)
+        column = column_index.get(name, {})
+        if column.get("is_pii_candidate") or column.get("is_id_like"):
+            continue
+        unique_count = int(column.get("unique_count") or 0)
+        if unique_count >= 3:
+            candidates.append(name)
+    return candidates
+
+
+def _time_candidates(profile: dict[str, Any]) -> list[str]:
+    health_signals = profile.get("health_signals", {}) if isinstance(profile, dict) else {}
+    preferred = [
+        *health_signals.get("time_columns", []),
+        *profile.get("datetime_cols", []),
+    ]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw_name in preferred:
+        name = str(raw_name)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def _anomaly_priority(item: dict[str, Any]) -> tuple[int, float]:
+    severity_rank = {"high": 3, "medium": 2, "low": 1}
+    return (severity_rank.get(str(item.get("severity", "low")), 0), float(item.get("score") or 0.0))
+
+
+def _top_period_contributor(
+    df: pd.DataFrame,
+    parsed_periods: pd.Series,
+    period_label: str,
+    metric: str,
+    dimension_candidates: list[str],
+) -> dict[str, Any] | None:
+    metric_series = pd.to_numeric(df[metric], errors="coerce")
+    period_mask = parsed_periods.dt.to_period("M").astype("string") == period_label
+
+    for dimension in dimension_candidates:
+        contributor_df = pd.DataFrame({dimension: df[dimension], metric: metric_series})[period_mask].dropna()
+        if contributor_df.empty:
+            continue
+        grouped = contributor_df.groupby(dimension)[metric].sum().sort_values(ascending=False)
+        if grouped.empty:
+            continue
+        top_segment = str(grouped.index[0])
+        top_value = float(grouped.iloc[0])
+        total_value = float(grouped.sum())
+        share = round((top_value / total_value) * 100, 1) if total_value else 0.0
+        return {
+            "dimension": dimension,
+            "segment": top_segment,
+            "value": round(top_value, 2),
+            "share_percent": share,
+        }
+    return None
+
+
+def _build_quality_anomalies(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    anomalies: list[dict[str, Any]] = []
+    for column in profile.get("columns", []):
+        if not isinstance(column, dict):
+            continue
+        if column.get("is_pii_candidate") or column.get("is_id_like"):
+            continue
+
+        name = str(column.get("name") or "column")
+        missing_percent = float(column.get("missing_percent") or 0.0)
+        outlier_percent = float(column.get("outlier_percent") or 0.0)
+        outlier_count = int(column.get("outlier_count") or 0)
+
+        if missing_percent >= 25.0:
+            severity = "high" if missing_percent >= 45.0 else "medium"
+            anomalies.append(
+                {
+                    "anomaly_id": f"quality_missing_{name}",
+                    "kind": "quality",
+                    "severity": severity,
+                    "score": missing_percent,
+                    "title": f"High missingness in {name}",
+                    "summary": f"{name} is missing in {missing_percent:.1f}% of rows, which can distort downstream analysis.",
+                    "metric": name,
+                    "evidence": [
+                        f"{missing_percent:.1f}% of records are missing this field.",
+                        "The governed profile flagged this column as materially incomplete.",
+                    ],
+                    "root_cause_hints": [
+                        "Check whether this field is optional in the source workflow.",
+                        "Inspect whether one facility, payer, or period contributes most of the missing values.",
+                    ],
+                    "recommended_question": f"Which segments contribute most to missing values in {name}?",
+                }
+            )
+
+        if outlier_count >= 5 and outlier_percent >= 5.0:
+            severity = "high" if outlier_percent >= 10.0 else "medium"
+            anomalies.append(
+                {
+                    "anomaly_id": f"quality_outliers_{name}",
+                    "kind": "distribution",
+                    "severity": severity,
+                    "score": outlier_percent,
+                    "title": f"Outlier-heavy distribution in {name}",
+                    "summary": f"{name} contains {outlier_count} outlier rows ({outlier_percent:.1f}% of the dataset).",
+                    "metric": name,
+                    "evidence": [
+                        f"{outlier_count} rows were flagged as IQR outliers during profiling.",
+                        "The governed profile identified an unusually wide spread for this metric.",
+                    ],
+                    "root_cause_hints": [
+                        "Validate whether these values are legitimate operational spikes or entry errors.",
+                        "Cut the metric by district, facility, or service line to isolate concentration points.",
+                    ],
+                    "recommended_question": f"Which segments are driving the outlier pattern in {name}?",
+                }
+            )
+    return anomalies
+
+
+def _build_segment_anomalies(df: pd.DataFrame, profile: dict[str, Any]) -> list[dict[str, Any]]:
+    anomalies: list[dict[str, Any]] = []
+    dimension_candidates = _preferred_dimension_candidates(profile)[:3]
+    metric_candidates = _numeric_metric_candidates(profile)[:3]
+
+    for metric in metric_candidates:
+        metric_series = pd.to_numeric(df[metric], errors="coerce")
+        if int(metric_series.notna().sum()) < 12:
+            continue
+
+        for dimension in dimension_candidates:
+            grouped_df = pd.DataFrame({dimension: df[dimension], metric: metric_series}).dropna()
+            if grouped_df.empty:
+                continue
+
+            group_sizes = grouped_df.groupby(dimension).size()
+            grouped_metric = grouped_df.groupby(dimension)[metric].mean()
+            grouped_metric = grouped_metric[group_sizes >= 3]
+            if len(grouped_metric) < 3:
+                continue
+
+            baseline = float(grouped_metric.mean())
+            spread = float(grouped_metric.std(ddof=0) or 0.0)
+            if baseline == 0.0 or spread == 0.0:
+                continue
+
+            strongest: dict[str, Any] | None = None
+            for segment, value in grouped_metric.items():
+                ratio = float(value) / baseline if baseline else 0.0
+                magnitude = max(ratio, 1 / ratio) if ratio > 0 else 0.0
+                if magnitude < 1.4:
+                    continue
+                z_score = abs((float(value) - baseline) / spread)
+                if z_score < 1.5:
+                    continue
+                candidate = {
+                    "segment": str(segment),
+                    "value": float(value),
+                    "ratio": ratio,
+                    "z_score": z_score,
+                    "row_count": int(group_sizes.get(segment, 0)),
+                }
+                if strongest is None or candidate["z_score"] > strongest["z_score"]:
+                    strongest = candidate
+
+            if strongest is None:
+                continue
+
+            severity = "high" if strongest["z_score"] >= 2.4 else "medium"
+            ratio_label = "above" if strongest["ratio"] >= 1 else "below"
+            anomalies.append(
+                {
+                    "anomaly_id": f"segment_{dimension}_{metric}_{strongest['segment']}",
+                    "kind": "segment_outlier",
+                    "severity": severity,
+                    "score": round(float(strongest["z_score"]), 2),
+                    "title": f"{dimension} outlier in {metric}",
+                    "summary": (
+                        f"{strongest['segment']} is {abs(strongest['ratio'] - 1) * 100:.1f}% {ratio_label} "
+                        f"the grouped baseline for {metric}."
+                    ),
+                    "metric": metric,
+                    "dimension": dimension,
+                    "segment": strongest["segment"],
+                    "evidence": [
+                        f"{strongest['segment']} average {metric} is {strongest['value']:.2f}.",
+                        f"Grouped baseline average is {baseline:.2f} across {len(grouped_metric)} segments.",
+                        f"{strongest['row_count']} row(s) contributed to this segment estimate.",
+                    ],
+                    "root_cause_hints": [
+                        f"Inspect {strongest['segment']} over time to see whether this is persistent or recent.",
+                        f"Compare {strongest['segment']} against peer {dimension} groups using the same metric definition.",
+                    ],
+                    "recommended_question": f"Why is {strongest['segment']} an outlier for {metric} within {dimension}?",
+                }
+            )
+
+    return anomalies
+
+
+def _build_time_anomalies(df: pd.DataFrame, profile: dict[str, Any]) -> list[dict[str, Any]]:
+    anomalies: list[dict[str, Any]] = []
+    time_candidates = _time_candidates(profile)[:2]
+    metric_candidates = _numeric_metric_candidates(profile)[:2]
+    dimension_candidates = _preferred_dimension_candidates(profile)
+
+    for time_col in time_candidates:
+        parsed_time = pd.to_datetime(df[time_col], errors="coerce")
+        if int(parsed_time.notna().sum()) < 6:
+            continue
+
+        for metric in metric_candidates:
+            metric_series = pd.to_numeric(df[metric], errors="coerce")
+            time_df = pd.DataFrame({"period": parsed_time.dt.to_period("M").astype("string"), metric: metric_series}).dropna()
+            grouped = time_df.groupby("period")[metric].sum().sort_index()
+            if len(grouped) < 4:
+                continue
+
+            baseline = float(grouped.median())
+            if baseline <= 0:
+                continue
+
+            strongest: dict[str, Any] | None = None
+            for period_label, value in grouped.items():
+                current_value = float(value)
+                ratio = current_value / baseline if baseline else 0.0
+                magnitude = max(ratio, 1 / ratio) if ratio > 0 else 0.0
+                if magnitude < 1.5:
+                    continue
+                candidate = {
+                    "period": str(period_label),
+                    "value": current_value,
+                    "ratio": ratio,
+                    "magnitude": magnitude,
+                }
+                if strongest is None or candidate["magnitude"] > strongest["magnitude"]:
+                    strongest = candidate
+
+            if strongest is None:
+                continue
+
+            contributor = _top_period_contributor(df, parsed_time, strongest["period"], metric, dimension_candidates)
+            direction = "spike" if strongest["ratio"] >= 1 else "dip"
+            severity = "high" if strongest["magnitude"] >= 2.0 else "medium"
+            hints = [
+                f"Validate whether source activity truly changed in {strongest['period']} or whether data capture shifted.",
+            ]
+            if contributor:
+                hints.append(
+                    f"{contributor['segment']} contributed the largest share within {contributor['dimension']} "
+                    f"({contributor['share_percent']:.1f}% of the period total)."
+                )
+
+            anomalies.append(
+                {
+                    "anomaly_id": f"time_{time_col}_{metric}_{strongest['period']}",
+                    "kind": "time_spike",
+                    "severity": severity,
+                    "score": round(float(strongest["magnitude"]), 2),
+                    "title": f"{metric} {direction} in {strongest['period']}",
+                    "summary": (
+                        f"{metric} shows a {direction} in {strongest['period']}, "
+                        f"reaching {strongest['value']:.2f} against a median baseline of {baseline:.2f}."
+                    ),
+                    "metric": metric,
+                    "period": strongest["period"],
+                    "evidence": [
+                        f"The period total is {strongest['value']:.2f}.",
+                        f"Median period baseline is {baseline:.2f}.",
+                        f"Detection used {time_col} aggregated to calendar month.",
+                    ],
+                    "root_cause_hints": hints,
+                    "recommended_question": f"What changed in {strongest['period']} that caused the {metric} {direction}?",
+                }
+            )
+
+    return anomalies
+
+
+def _build_anomaly_analysis(df: pd.DataFrame, profile: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+    anomalies = [
+        *_build_quality_anomalies(profile),
+        *_build_segment_anomalies(df, profile),
+        *_build_time_anomalies(df, profile),
+    ]
+    anomalies.sort(key=_anomaly_priority, reverse=True)
+    trimmed = anomalies[:limit]
+
+    suggested_questions = [
+        item.get("recommended_question")
+        for item in trimmed
+        if isinstance(item.get("recommended_question"), str) and item.get("recommended_question")
+    ]
+    if not suggested_questions:
+        suggested_questions = [
+            "Which segment is contributing most to the strongest anomaly?",
+            "Is the anomaly concentrated in one period or persistent over time?",
+        ]
+
+    if trimmed:
+        summary = (
+            f"Detected {len(trimmed)} governed anomaly signal(s) across quality, segment, and time-based scans. "
+            "Use the suggested questions to investigate likely drivers before making decisions."
+        )
+    else:
+        summary = (
+            "No high-signal anomalies were detected from governed quality, segment, and time-based scans. "
+            "You can still ask follow-up questions to inspect specific metrics or periods."
+        )
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "anomaly_count": len(trimmed),
+        "summary": summary,
+        "anomalies": trimmed,
+        "suggested_questions": suggested_questions[:6],
+    }
 
 
 def _pii_aliases(profile: dict[str, Any]) -> dict[str, str]:
@@ -2838,6 +3229,42 @@ def profile_dataset(
     mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
     response_profile = _apply_profile_masking(profile, mask_enabled)
     return ProfileResponse(dataset_id=dataset_id, profile=response_profile)
+
+
+@app.get("/sessions/{dataset_id}/anomalies", response_model=AnomalyAnalysisResponse)
+def get_anomaly_analysis(
+    dataset_id: str,
+    limit: int = Query(default=6, ge=1, le=12),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> AnomalyAnalysisResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    try:
+        df = _read_uploaded_file(meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    profile = _load_profile_if_exists(dataset_id)
+    if profile is None:
+        profile = _build_profile(df)
+        _save_json(_profile_path(dataset_id), profile)
+        meta.setdefault("artifacts", {})["profile"] = str(_profile_path(dataset_id))
+
+    analysis = _build_anomaly_analysis(df, profile, limit=limit)
+    _save_json(_anomaly_path(dataset_id), analysis)
+    meta.setdefault("artifacts", {})["anomaly_analysis"] = str(_anomaly_path(dataset_id))
+    meta["status"] = "analyzed"
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "anomaly_analysis_generated",
+        actor,
+        {"limit": limit, "anomaly_count": analysis.get("anomaly_count", 0)},
+    )
+    return AnomalyAnalysisResponse(dataset_id=dataset_id, analysis=AnomalyAnalysisPayload(**analysis))
 
 
 @app.get("/sessions/{dataset_id}/semantic-layer", response_model=SemanticLayerResponse)
