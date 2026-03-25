@@ -95,6 +95,34 @@ export interface AnomalyAnalysisResponse {
   analysis: AnomalyAnalysisPayload;
 }
 
+export interface CohortCriterionPayload {
+  field: string;
+  operator: string;
+  value?: unknown;
+  inferred_type?: string;
+  operator_label?: string;
+}
+
+export interface CohortAnalysisPayload {
+  generated_at: string;
+  name: string;
+  description?: string | null;
+  row_count: number;
+  population_row_count: number;
+  criteria_count: number;
+  criteria: CohortCriterionPayload[];
+  preview_columns: string[];
+  preview_rows: Array<Record<string, unknown>>;
+  excluded_columns: string[];
+  summary: string;
+  suggested_questions: string[];
+}
+
+export interface CohortAnalysisResponse {
+  dataset_id: string;
+  cohort: CohortAnalysisPayload;
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -481,6 +509,38 @@ export function getAnomalyAnalysis(datasetId: string, userId: string, limit = 6)
       userId,
       timeoutMs: 120000,
     }
+  );
+}
+
+export function getCohortAnalysis(datasetId: string, userId: string) {
+  return apiRequest<CohortAnalysisResponse>(`/sessions/${datasetId}/cohorts`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function buildCohortAnalysis(
+  datasetId: string,
+  userId: string,
+  payload: {
+    name?: string;
+    description?: string;
+    criteria: Array<{
+      field: string;
+      operator: string;
+      value?: unknown;
+    }>;
+    limit?: number;
+  }
+) {
+  return apiRequest<CohortAnalysisResponse>(
+    `/sessions/${datasetId}/cohorts`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
   );
 }
 

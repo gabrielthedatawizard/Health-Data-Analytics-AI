@@ -9,10 +9,12 @@ import {
   FileText,
   FileSpreadsheet,
   Loader2,
+  Plus,
   RefreshCw,
   Shield,
   Sparkles,
   Upload,
+  X,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -28,6 +30,7 @@ import {
   type AskResponsePayload,
   type DocumentAskResponse,
   type DocumentSummary,
+  type CohortAnalysisResponse,
   type AuthContextResponse,
   type BackendUserRole,
   type AuditEvent,
@@ -35,6 +38,7 @@ import {
   type SessionMeta,
   askDocuments,
   askDataset,
+  buildCohortAnalysis,
   createSession,
   datasetCsvUrl,
   factsJsonUrl,
@@ -43,6 +47,7 @@ import {
   getAudit,
   getAnomalyAnalysis,
   getAuthContext,
+  getCohortAnalysis,
   getDashboardSpec,
   getFacts,
   getJobStatus,
@@ -143,6 +148,17 @@ type DashboardChartSpec = {
 };
 
 type ExplainPreset = 'summary' | 'significance' | 'contributors';
+type CohortDraftCriterion = {
+  id: string;
+  field: string;
+  operator: string;
+  value: string;
+};
+type CohortFieldOption = {
+  name: string;
+  inferredType: string;
+  sampleValues: string[];
+};
 
 type ChartExplanationEntry = {
   question: string;
@@ -172,6 +188,95 @@ const EXPLAIN_PRESETS: Array<{
     instruction: 'Identify which segment, category, or time slice appears to contribute most and what follow-up cut to inspect next.',
   },
 ];
+const COHORT_OPERATOR_OPTIONS: Record<string, Array<{ value: string; label: string }>> = {
+  string: [
+    { value: 'eq', label: 'equals' },
+    { value: 'neq', label: 'does not equal' },
+    { value: 'contains', label: 'contains' },
+    { value: 'starts_with', label: 'starts with' },
+    { value: 'in', label: 'is one of' },
+    { value: 'not_in', label: 'is not one of' },
+    { value: 'is_null', label: 'is blank' },
+    { value: 'not_null', label: 'is present' },
+  ],
+  number: [
+    { value: 'eq', label: 'equals' },
+    { value: 'neq', label: 'does not equal' },
+    { value: 'gt', label: 'greater than' },
+    { value: 'gte', label: 'at least' },
+    { value: 'lt', label: 'less than' },
+    { value: 'lte', label: 'at most' },
+    { value: 'between', label: 'between' },
+    { value: 'in', label: 'is one of' },
+    { value: 'not_in', label: 'is not one of' },
+    { value: 'is_null', label: 'is blank' },
+    { value: 'not_null', label: 'is present' },
+  ],
+  datetime: [
+    { value: 'eq', label: 'on' },
+    { value: 'neq', label: 'not on' },
+    { value: 'gt', label: 'after' },
+    { value: 'gte', label: 'on or after' },
+    { value: 'lt', label: 'before' },
+    { value: 'lte', label: 'on or before' },
+    { value: 'between', label: 'between' },
+    { value: 'in', label: 'is one of' },
+    { value: 'not_in', label: 'is not one of' },
+    { value: 'is_null', label: 'is blank' },
+    { value: 'not_null', label: 'is present' },
+  ],
+};
+
+function cohortOperatorsForType(inferredType: string) {
+  return COHORT_OPERATOR_OPTIONS[inferredType] ?? COHORT_OPERATOR_OPTIONS.string;
+}
+
+function cohortOperatorNeedsValue(operator: string) {
+  return operator !== 'is_null' && operator !== 'not_null';
+}
+
+function createDraftCriterion(fieldOptions: CohortFieldOption[]): CohortDraftCriterion {
+  const fallbackField = fieldOptions[0];
+  const inferredType = fallbackField?.inferredType ?? 'string';
+  return {
+    id: `criterion-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    field: fallbackField?.name ?? '',
+    operator: cohortOperatorsForType(inferredType)[0]?.value ?? 'eq',
+    value: '',
+  };
+}
+
+function formatCohortCriterionValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).join(', ');
+  }
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return String(value);
+}
+
+function normalizeCohortFieldOptions(profile: Record<string, unknown> | null): CohortFieldOption[] {
+  const columns = Array.isArray(profile?.columns) ? profile.columns : [];
+  return columns
+    .map((entry) => {
+      const column = asRecord(entry);
+      const name = asString(column?.name);
+      if (!name || column?.is_pii_candidate || column?.is_id_like) {
+        return null;
+      }
+      const inferredType = asString(column?.inferred_type) ?? 'string';
+      const sampleValues = Array.isArray(column?.sample_values)
+        ? column.sample_values.map((item) => String(item)).filter(Boolean).slice(0, 4)
+        : [];
+      return {
+        name,
+        inferredType,
+        sampleValues,
+      };
+    })
+    .filter((item): item is CohortFieldOption => Boolean(item));
+}
 
 function summarizeFactReference(fact: unknown): string | null {
   const item = asRecord(fact);
@@ -380,8 +485,12 @@ export function AIAnalyticsDashboard() {
   const [profile, setProfile] = useState<Record<string, unknown> | null>(null);
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
   const [anomalyAnalysis, setAnomalyAnalysis] = useState<AnomalyAnalysisResponse | null>(null);
+  const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
+  const [cohortName, setCohortName] = useState('Priority follow-up cohort');
+  const [cohortDescription, setCohortDescription] = useState('');
+  const [cohortCriteria, setCohortCriteria] = useState<CohortDraftCriterion[]>([{ id: 'criterion-initial', field: '', operator: 'eq', value: '' }]);
   const [askResult, setAskResult] = useState<AskResponsePayload | null>(null);
   const [documentQuestion, setDocumentQuestion] = useState('What do our trusted policy documents say about denominator exclusions?');
   const [documentAnswer, setDocumentAnswer] = useState<DocumentAskResponse | null>(null);
@@ -467,6 +576,7 @@ export function AIAnalyticsDashboard() {
       setProfile(null);
       setFactsBundle(null);
       setAnomalyAnalysis(null);
+      setCohortAnalysis(null);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -501,6 +611,12 @@ export function AIAnalyticsDashboard() {
           const anomalyResponse = await getAnomalyAnalysis(datasetId, userId);
           if (!active) return;
           setAnomalyAnalysis(anomalyResponse);
+        }
+
+        if (meta.artifacts?.cohort_analysis) {
+          const cohortResponse = await getCohortAnalysis(datasetId, userId);
+          if (!active) return;
+          setCohortAnalysis(cohortResponse);
         }
 
         if (meta.artifacts?.dashboard_spec) {
@@ -619,6 +735,15 @@ export function AIAnalyticsDashboard() {
     () => anomalyAnalysis?.analysis.suggested_questions ?? [],
     [anomalyAnalysis]
   );
+  const cohortFieldOptions = useMemo(() => normalizeCohortFieldOptions(profile), [profile]);
+  const cohortFieldLookup = useMemo(
+    () =>
+      cohortFieldOptions.reduce<Record<string, CohortFieldOption>>((accumulator, option) => {
+        accumulator[option.name] = option;
+        return accumulator;
+      }, {}),
+    [cohortFieldOptions]
+  );
 
   const dashboardCharts = useMemo(() => normalizeDashboardCharts(dashboardSpec), [dashboardSpec]);
 
@@ -673,6 +798,32 @@ export function AIAnalyticsDashboard() {
   const canUploadDocuments = permissionSet.has('docs:create') || permissionSet.has('admin:all');
 
   useEffect(() => {
+    if (cohortFieldOptions.length === 0) {
+      return;
+    }
+
+    setCohortCriteria((current) =>
+      current.map((criterion) => {
+        if (criterion.field && cohortFieldLookup[criterion.field]) {
+          const allowedOperators = cohortOperatorsForType(cohortFieldLookup[criterion.field].inferredType).map((item) => item.value);
+          if (allowedOperators.includes(criterion.operator)) {
+            return criterion;
+          }
+          return { ...criterion, operator: allowedOperators[0] ?? 'eq', value: '' };
+        }
+
+        const fallback = cohortFieldOptions[0];
+        const fallbackOperator = cohortOperatorsForType(fallback.inferredType)[0]?.value ?? 'eq';
+        return {
+          ...criterion,
+          field: fallback.name,
+          operator: fallbackOperator,
+        };
+      })
+    );
+  }, [cohortFieldLookup, cohortFieldOptions]);
+
+  useEffect(() => {
     if (dashboardCharts.length === 0) {
       setSelectedChartKey(null);
       return;
@@ -694,6 +845,17 @@ export function AIAnalyticsDashboard() {
     setNotice(null);
     try {
       const created = await createSession(userId);
+      setSessionMeta(null);
+      setProfile(null);
+      setFactsBundle(null);
+      setAnomalyAnalysis(null);
+      setCohortAnalysis(null);
+      setDashboardSpec(null);
+      setAskResult(null);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(null);
+      setAuditEvents([]);
       setDatasetId(created.dataset_id);
       setSessionMeta(await getSession(created.dataset_id, userId));
       setNotice(`Created session ${created.dataset_id}.`);
@@ -760,6 +922,17 @@ export function AIAnalyticsDashboard() {
     setNotice(null);
     try {
       await getSession(targetDatasetId, userId);
+      setSessionMeta(null);
+      setProfile(null);
+      setFactsBundle(null);
+      setAnomalyAnalysis(null);
+      setCohortAnalysis(null);
+      setDashboardSpec(null);
+      setAskResult(null);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(null);
+      setAuditEvents([]);
       setDatasetId(targetDatasetId);
       setNotice(`Loaded session ${targetDatasetId}.`);
     } catch (sessionError) {
@@ -791,6 +964,7 @@ export function AIAnalyticsDashboard() {
       setProfile(null);
       setFactsBundle(null);
       setAnomalyAnalysis(null);
+      setCohortAnalysis(null);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -909,6 +1083,134 @@ export function AIAnalyticsDashboard() {
       );
     } catch (anomalyError) {
       setError(anomalyError instanceof Error ? anomalyError.message : 'Anomaly detection failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  function handleAddCohortCriterion() {
+    setCohortCriteria((current) => [...current, createDraftCriterion(cohortFieldOptions)]);
+  }
+
+  function handleRemoveCohortCriterion(criterionId: string) {
+    setCohortCriteria((current) => {
+      if (current.length === 1) {
+        return [{ id: 'criterion-initial', field: cohortFieldOptions[0]?.name ?? '', operator: cohortOperatorsForType(cohortFieldOptions[0]?.inferredType ?? 'string')[0]?.value ?? 'eq', value: '' }];
+      }
+      return current.filter((criterion) => criterion.id !== criterionId);
+    });
+  }
+
+  function handleUpdateCohortCriterion(
+    criterionId: string,
+    patch: Partial<CohortDraftCriterion> & { field?: string; operator?: string; value?: string }
+  ) {
+    setCohortCriteria((current) =>
+      current.map((criterion) => {
+        if (criterion.id !== criterionId) {
+          return criterion;
+        }
+
+        const nextField = patch.field ?? criterion.field;
+        const nextFieldType = cohortFieldLookup[nextField]?.inferredType ?? 'string';
+        const allowedOperators = cohortOperatorsForType(nextFieldType).map((item) => item.value);
+        const requestedOperator = patch.operator ?? criterion.operator;
+        const nextOperator = allowedOperators.includes(requestedOperator) ? requestedOperator : allowedOperators[0] ?? 'eq';
+        const nextValue =
+          patch.value !== undefined
+            ? patch.value
+            : nextOperator !== criterion.operator && !cohortOperatorNeedsValue(nextOperator)
+              ? ''
+              : criterion.value;
+
+        return {
+          ...criterion,
+          ...patch,
+          field: nextField,
+          operator: nextOperator,
+          value: cohortOperatorNeedsValue(nextOperator) ? nextValue : '',
+        };
+      })
+    );
+  }
+
+  async function handleBuildCohort() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!profile) {
+      setBusyAction('cohort_profile');
+      setError(null);
+      setNotice(null);
+      try {
+        const response = await getProfile(datasetId, userId);
+        setProfile(response.profile);
+        setSessionMeta(await getSession(datasetId, userId));
+        setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+        setNotice('Profile loaded. Review the governed fields and run the cohort builder again.');
+      } catch (profileError) {
+        setError(profileError instanceof Error ? profileError.message : 'Failed to load profile for cohort builder.');
+      } finally {
+        setBusyAction(null);
+      }
+      return;
+    }
+
+    const criteriaPayload = cohortCriteria
+      .map((criterion) => {
+        const field = criterion.field.trim();
+        const operator = criterion.operator.trim();
+        const value = criterion.value.trim();
+        if (!field || !operator) {
+          return null;
+        }
+        if (!cohortOperatorNeedsValue(operator)) {
+          return { field, operator };
+        }
+        return {
+          field,
+          operator,
+          value: operator === 'in' || operator === 'not_in' || operator === 'between'
+            ? value.split(',').map((item) => item.trim()).filter(Boolean)
+            : value,
+        };
+      })
+      .filter((item): item is { field: string; operator: string; value?: unknown } => Boolean(item));
+
+    if (criteriaPayload.length === 0) {
+      setError('Add at least one governed cohort criterion.');
+      return;
+    }
+
+    const missingValueCriterion = cohortCriteria.find(
+      (criterion) => criterion.field.trim() && criterion.operator.trim() && cohortOperatorNeedsValue(criterion.operator) && !criterion.value.trim()
+    );
+    if (missingValueCriterion) {
+      setError(`Enter a value for cohort field ${missingValueCriterion.field}.`);
+      return;
+    }
+
+    setBusyAction('cohort');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await buildCohortAnalysis(datasetId, userId, {
+        name: cohortName.trim() || undefined,
+        description: cohortDescription.trim() || undefined,
+        criteria: criteriaPayload,
+        limit: 25,
+      });
+      setCohortAnalysis(response);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(
+        response.cohort.row_count > 0
+          ? `Cohort generated with ${response.cohort.row_count} matching row(s).`
+          : 'Cohort generated, but no rows matched the current governed criteria.'
+      );
+    } catch (cohortError) {
+      setError(cohortError instanceof Error ? cohortError.message : 'Cohort generation failed.');
     } finally {
       setBusyAction(null);
     }
@@ -1343,6 +1645,224 @@ export function AIAnalyticsDashboard() {
               <Badge variant="outline">{reportJob.progress ?? 0}%</Badge>
             </div>
             <Progress className="mt-3 h-2" value={reportJob.progress ?? 0} />
+          </div>
+        ) : null}
+      </section>
+
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-center gap-2">
+            <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+              <BadgeCheck className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-lg font-medium text-foreground">Governed Cohort Builder</h3>
+              <p className="text-sm text-muted-foreground">
+                Build editable cohort rules from approved fields only. PII and ID-like columns stay blocked from criteria and preview rows.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" variant="outline" onClick={handleAddCohortCriterion} disabled={!cohortFieldOptions.length || !canCompute}>
+              <Plus className="mr-2 h-4 w-4" />
+              Add Criterion
+            </Button>
+            <Button type="button" onClick={() => void handleBuildCohort()} disabled={isBusy('cohort') || isBusy('cohort_profile') || !datasetId || !canCompute}>
+              {isBusy('cohort') || isBusy('cohort_profile') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
+              Build Cohort
+            </Button>
+          </div>
+        </div>
+
+        {!datasetId ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            Create or load a session before building governed cohort criteria.
+          </div>
+        ) : !profile ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            Run profiling once to load governed cohort fields. The builder only exposes approved, non-PHI columns.
+          </div>
+        ) : cohortFieldOptions.length === 0 ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            No governed cohort fields are currently available after applying PII and identifier controls.
+          </div>
+        ) : (
+          <div className="mt-4 space-y-4">
+            <div className="grid gap-3 lg:grid-cols-[1fr_1.2fr]">
+              <Input value={cohortName} onChange={(event) => setCohortName(event.target.value)} placeholder="Cohort name" />
+              <Textarea
+                value={cohortDescription}
+                onChange={(event) => setCohortDescription(event.target.value)}
+                placeholder="Optional description of the operational or quality use case."
+                className="min-h-[72px]"
+              />
+            </div>
+
+            <div className="grid gap-3">
+              {cohortCriteria.map((criterion) => {
+                const fieldMeta = cohortFieldLookup[criterion.field];
+                const operatorOptions = cohortOperatorsForType(fieldMeta?.inferredType ?? 'string');
+                return (
+                  <div key={criterion.id} className="rounded-xl border border-border bg-background p-4">
+                    <div className="grid gap-3 lg:grid-cols-[1.2fr_0.9fr_1fr_auto]">
+                      <select
+                        value={criterion.field}
+                        onChange={(event) => handleUpdateCohortCriterion(criterion.id, { field: event.target.value })}
+                        className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+                      >
+                        {cohortFieldOptions.map((option) => (
+                          <option key={option.name} value={option.name}>
+                            {option.name} ({option.inferredType})
+                          </option>
+                        ))}
+                      </select>
+
+                      <select
+                        value={criterion.operator}
+                        onChange={(event) => handleUpdateCohortCriterion(criterion.id, { operator: event.target.value })}
+                        className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+                      >
+                        {operatorOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+
+                      <Input
+                        value={criterion.value}
+                        onChange={(event) => handleUpdateCohortCriterion(criterion.id, { value: event.target.value })}
+                        placeholder={
+                          criterion.operator === 'between'
+                            ? 'two values separated by comma'
+                            : criterion.operator === 'in' || criterion.operator === 'not_in'
+                              ? 'comma-separated values'
+                              : 'value'
+                        }
+                        disabled={!cohortOperatorNeedsValue(criterion.operator)}
+                      />
+
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => handleRemoveCohortCriterion(criterion.id)}
+                        aria-label="Remove cohort criterion"
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+
+                    {fieldMeta?.sampleValues.length ? (
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        Sample values: {fieldMeta.sampleValues.join(', ')}
+                      </p>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {cohortCriteria
+                .filter((criterion) => criterion.field)
+                .map((criterion) => {
+                  const fieldMeta = cohortFieldLookup[criterion.field];
+                  const operatorLabel =
+                    cohortOperatorsForType(fieldMeta?.inferredType ?? 'string').find((item) => item.value === criterion.operator)?.label ??
+                    criterion.operator;
+                  const valueLabel = cohortOperatorNeedsValue(criterion.operator) && criterion.value.trim() ? ` ${criterion.value.trim()}` : '';
+                  return (
+                    <Badge key={`${criterion.id}-badge`} variant="outline">
+                      {criterion.field} {operatorLabel}
+                      {valueLabel}
+                    </Badge>
+                  );
+                })}
+            </div>
+          </div>
+        )}
+
+        {cohortAnalysis ? (
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline">Rows: {cohortAnalysis.cohort.row_count}</Badge>
+                <Badge variant="outline">Population: {cohortAnalysis.cohort.population_row_count}</Badge>
+                <Badge variant="outline">Criteria: {cohortAnalysis.cohort.criteria_count}</Badge>
+              </div>
+              <p className="mt-3 text-sm text-foreground">{cohortAnalysis.cohort.summary}</p>
+              {cohortAnalysis.cohort.excluded_columns.length > 0 ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Excluded by governance: {cohortAnalysis.cohort.excluded_columns.join(', ')}
+                </p>
+              ) : null}
+            </div>
+
+            {cohortAnalysis.cohort.criteria.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {cohortAnalysis.cohort.criteria.map((criterion, index) => (
+                  <Badge key={`${criterion.field}-${index}`} variant="outline">
+                    {criterion.field} {criterion.operator_label ?? criterion.operator}
+                    {criterion.value !== undefined && criterion.value !== null && formatCohortCriterionValue(criterion.value)
+                      ? ` ${formatCohortCriterionValue(criterion.value)}`
+                      : ''}
+                  </Badge>
+                ))}
+              </div>
+            ) : null}
+
+            {cohortAnalysis.cohort.suggested_questions.length > 0 ? (
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Suggested follow-up questions</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {cohortAnalysis.cohort.suggested_questions.map((question) => (
+                    <Button
+                      key={question}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleInvestigateQuestion(question, 'Cohort follow-up generated successfully.')}
+                      disabled={busyAction === 'investigate' || !canCompute}
+                    >
+                      {question}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="rounded-xl border border-border bg-background p-4">
+              <p className="text-sm font-medium text-foreground">Preview Rows</p>
+              {cohortAnalysis.cohort.preview_rows.length === 0 ? (
+                <p className="mt-3 text-sm text-muted-foreground">No preview rows matched the current governed cohort rules.</p>
+              ) : (
+                <div className="mt-3 overflow-auto">
+                  <table className="min-w-full divide-y divide-border text-sm">
+                    <thead>
+                      <tr>
+                        {cohortAnalysis.cohort.preview_columns.map((column) => (
+                          <th key={column} className="px-3 py-2 text-left font-medium text-muted-foreground">
+                            {column}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {cohortAnalysis.cohort.preview_rows.map((row, rowIndex) => (
+                        <tr key={`cohort-row-${rowIndex}`}>
+                          {cohortAnalysis.cohort.preview_columns.map((column) => (
+                            <td key={`${rowIndex}-${column}`} className="px-3 py-2 text-foreground">
+                              {String(row[column] ?? '—')}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         ) : null}
       </section>

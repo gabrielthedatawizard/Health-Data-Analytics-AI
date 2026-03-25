@@ -137,6 +137,26 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "admin:all",
     ],
 }
+COHORT_OPERATOR_LABELS = {
+    "eq": "equals",
+    "neq": "does not equal",
+    "contains": "contains",
+    "starts_with": "starts with",
+    "gt": "is greater than",
+    "gte": "is at least",
+    "lt": "is less than",
+    "lte": "is at most",
+    "between": "is between",
+    "in": "is one of",
+    "not_in": "is not one of",
+    "is_null": "is blank",
+    "not_null": "is present",
+}
+COHORT_OPERATORS_BY_TYPE = {
+    "string": {"eq", "neq", "contains", "starts_with", "in", "not_in", "is_null", "not_null"},
+    "number": {"eq", "neq", "gt", "gte", "lt", "lte", "between", "in", "not_in", "is_null", "not_null"},
+    "datetime": {"eq", "neq", "gt", "gte", "lt", "lte", "between", "in", "not_in", "is_null", "not_null"},
+}
 
 
 app = FastAPI(title="AI Analytics Backend", version="0.1.0")
@@ -245,6 +265,39 @@ class AnomalyAnalysisPayload(BaseModel):
 class AnomalyAnalysisResponse(BaseModel):
     dataset_id: str
     analysis: AnomalyAnalysisPayload
+
+
+class CohortCriterion(BaseModel):
+    field: str = Field(min_length=1, max_length=200)
+    operator: str = Field(min_length=2, max_length=32)
+    value: Any | None = None
+
+
+class CohortBuildRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=160)
+    description: str | None = Field(default=None, max_length=1000)
+    criteria: list[CohortCriterion] = Field(default_factory=list)
+    limit: int = Field(default=25, ge=1, le=100)
+
+
+class CohortAnalysisPayload(BaseModel):
+    generated_at: str
+    name: str
+    description: str | None = None
+    row_count: int
+    population_row_count: int
+    criteria_count: int
+    criteria: list[dict[str, Any]] = Field(default_factory=list)
+    preview_columns: list[str] = Field(default_factory=list)
+    preview_rows: list[dict[str, Any]] = Field(default_factory=list)
+    excluded_columns: list[str] = Field(default_factory=list)
+    summary: str
+    suggested_questions: list[str] = Field(default_factory=list)
+
+
+class CohortAnalysisResponse(BaseModel):
+    dataset_id: str
+    cohort: CohortAnalysisPayload
 
 
 class ReportResponse(BaseModel):
@@ -419,6 +472,10 @@ def _facts_path(dataset_id: str) -> Path:
 
 def _anomaly_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "anomaly_analysis.json"
+
+
+def _cohort_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "cohort_analysis.json"
 
 
 def _dashboard_spec_path(dataset_id: str) -> Path:
@@ -1434,6 +1491,287 @@ def _time_candidates(profile: dict[str, Any]) -> list[str]:
         seen.add(name)
         ordered.append(name)
     return ordered
+
+
+def _cohort_operator_options(inferred_type: str) -> set[str]:
+    return set(COHORT_OPERATORS_BY_TYPE.get(inferred_type, COHORT_OPERATORS_BY_TYPE["string"]))
+
+
+def _cohort_value_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if item is not None and str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [value]
+
+
+def _coerce_cohort_scalar(raw_value: Any, inferred_type: str, field: str) -> Any:
+    if inferred_type == "number":
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Cohort field '{field}' expects a numeric value.") from exc
+
+    if inferred_type == "datetime":
+        parsed = pd.to_datetime(raw_value, errors="coerce")
+        if pd.isna(parsed):
+            raise HTTPException(status_code=400, detail=f"Cohort field '{field}' expects a valid date/time value.")
+        return parsed
+
+    return str(raw_value).strip()
+
+
+def _normalize_cohort_criterion(
+    criterion: CohortCriterion,
+    df: pd.DataFrame,
+    profile: dict[str, Any],
+) -> tuple[pd.Series, dict[str, Any]]:
+    field = criterion.field.strip()
+    operator = criterion.operator.strip().lower()
+    if not field:
+        raise HTTPException(status_code=400, detail="Cohort criteria require a field name.")
+
+    column_index = _column_profile_index(profile)
+    column_profile = column_index.get(field)
+    if column_profile is None or field not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Cohort field '{field}' is not available in this dataset.")
+    if column_profile.get("is_pii_candidate") or column_profile.get("is_id_like"):
+        raise HTTPException(status_code=400, detail=f"Cohort field '{field}' is blocked by governance controls.")
+
+    inferred_type = str(column_profile.get("inferred_type") or "string")
+    allowed_operators = _cohort_operator_options(inferred_type)
+    if operator not in allowed_operators:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Operator '{operator}' is not allowed for cohort field '{field}' ({inferred_type}).",
+        )
+
+    series = df[field]
+    normalized_value: Any = None
+
+    if operator == "is_null":
+        mask = series.isna()
+    elif operator == "not_null":
+        mask = series.notna()
+    elif inferred_type == "number":
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        if operator in {"in", "not_in"}:
+            normalized_value = [_coerce_cohort_scalar(item, inferred_type, field) for item in _cohort_value_list(criterion.value)]
+            if not normalized_value:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires at least one value.")
+            mask = numeric_series.isin(normalized_value)
+            if operator == "not_in":
+                mask = ~mask
+        elif operator == "between":
+            bounds = [_coerce_cohort_scalar(item, inferred_type, field) for item in _cohort_value_list(criterion.value)]
+            if len(bounds) != 2:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires two values for 'between'.")
+            low, high = sorted(bounds)
+            normalized_value = [low, high]
+            mask = numeric_series.between(low, high, inclusive="both")
+        else:
+            normalized_value = _coerce_cohort_scalar(criterion.value, inferred_type, field)
+            comparisons = {
+                "eq": numeric_series.eq(normalized_value),
+                "neq": numeric_series.ne(normalized_value),
+                "gt": numeric_series.gt(normalized_value),
+                "gte": numeric_series.ge(normalized_value),
+                "lt": numeric_series.lt(normalized_value),
+                "lte": numeric_series.le(normalized_value),
+            }
+            mask = comparisons[operator]
+    elif inferred_type == "datetime":
+        time_series = pd.to_datetime(series, errors="coerce")
+        if operator in {"in", "not_in"}:
+            normalized_value = [_coerce_cohort_scalar(item, inferred_type, field) for item in _cohort_value_list(criterion.value)]
+            if not normalized_value:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires at least one value.")
+            normalized_index = {value.isoformat() for value in normalized_value}
+            comparable = time_series.dt.strftime("%Y-%m-%dT%H:%M:%S")
+            mask = comparable.isin(normalized_index)
+            if operator == "not_in":
+                mask = ~mask
+            normalized_value = [value.isoformat() for value in normalized_value]
+        elif operator == "between":
+            bounds = [_coerce_cohort_scalar(item, inferred_type, field) for item in _cohort_value_list(criterion.value)]
+            if len(bounds) != 2:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires two values for 'between'.")
+            low, high = sorted(bounds)
+            normalized_value = [low.isoformat(), high.isoformat()]
+            mask = time_series.between(low, high, inclusive="both")
+        else:
+            normalized_scalar = _coerce_cohort_scalar(criterion.value, inferred_type, field)
+            normalized_value = normalized_scalar.isoformat()
+            comparisons = {
+                "eq": time_series.eq(normalized_scalar),
+                "neq": time_series.ne(normalized_scalar),
+                "gt": time_series.gt(normalized_scalar),
+                "gte": time_series.ge(normalized_scalar),
+                "lt": time_series.lt(normalized_scalar),
+                "lte": time_series.le(normalized_scalar),
+            }
+            mask = comparisons[operator]
+    else:
+        string_series = series.astype("string").str.strip()
+        comparable = string_series.str.lower()
+        if operator in {"in", "not_in"}:
+            normalized_value = [str(item).strip() for item in _cohort_value_list(criterion.value)]
+            if not normalized_value:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires at least one value.")
+            normalized_lookup = {item.lower() for item in normalized_value}
+            mask = comparable.isin(normalized_lookup)
+            if operator == "not_in":
+                mask = ~mask
+        else:
+            normalized_value = str(criterion.value or "").strip()
+            if operator not in {"is_null", "not_null"} and not normalized_value:
+                raise HTTPException(status_code=400, detail=f"Cohort field '{field}' requires a value for operator '{operator}'.")
+            lowered_value = normalized_value.lower()
+            comparisons = {
+                "eq": comparable.eq(lowered_value),
+                "neq": comparable.ne(lowered_value),
+                "contains": comparable.str.contains(re.escape(lowered_value), na=False),
+                "starts_with": comparable.str.startswith(lowered_value, na=False),
+            }
+            mask = comparisons[operator]
+
+    normalized = {
+        "field": field,
+        "operator": operator,
+        "operator_label": COHORT_OPERATOR_LABELS.get(operator, operator.replace("_", " ")),
+        "value": normalized_value,
+        "inferred_type": inferred_type,
+    }
+    return mask.fillna(False), normalized
+
+
+def _describe_cohort_criterion(criterion: dict[str, Any]) -> str:
+    field = str(criterion.get("field") or "field")
+    operator = str(criterion.get("operator") or "eq")
+    value = criterion.get("value")
+
+    if operator == "is_null":
+        return f"{field} is blank"
+    if operator == "not_null":
+        return f"{field} is present"
+    if operator == "between" and isinstance(value, list) and len(value) == 2:
+        return f"{field} is between {value[0]} and {value[1]}"
+    if operator in {"in", "not_in"} and isinstance(value, list):
+        joined = ", ".join(str(item) for item in value[:5])
+        verb = "is one of" if operator == "in" else "is not one of"
+        return f"{field} {verb} {joined}"
+    if operator == "contains":
+        return f"{field} contains '{value}'"
+    if operator == "starts_with":
+        return f"{field} starts with '{value}'"
+    return f"{field} {COHORT_OPERATOR_LABELS.get(operator, operator)} {value}"
+
+
+def _cohort_preview_columns(df: pd.DataFrame, profile: dict[str, Any], criteria_fields: list[str]) -> tuple[list[str], list[str]]:
+    column_index = _column_profile_index(profile)
+    blocked = {
+        name
+        for name, column in column_index.items()
+        if column.get("is_pii_candidate") or column.get("is_id_like")
+    }
+
+    ordered_candidates = [
+        *criteria_fields,
+        *_preferred_dimension_candidates(profile),
+        *_time_candidates(profile),
+        *_numeric_metric_candidates(profile),
+    ]
+
+    preview_columns: list[str] = []
+    seen: set[str] = set()
+    for raw_name in ordered_candidates:
+        name = str(raw_name)
+        if not name or name in seen or name in blocked or name not in df.columns:
+            continue
+        seen.add(name)
+        preview_columns.append(name)
+        if len(preview_columns) >= 8:
+            break
+
+    if not preview_columns:
+        for column in df.columns:
+            name = str(column)
+            if name in blocked:
+                continue
+            preview_columns.append(name)
+            if len(preview_columns) >= 8:
+                break
+
+    return preview_columns, sorted(blocked)
+
+
+def _build_cohort_analysis(
+    df: pd.DataFrame,
+    profile: dict[str, Any],
+    request: CohortBuildRequest,
+) -> dict[str, Any]:
+    if not request.criteria:
+        raise HTTPException(status_code=400, detail="Add at least one cohort criterion before running the builder.")
+
+    combined_mask = pd.Series(True, index=df.index)
+    normalized_criteria: list[dict[str, Any]] = []
+    for criterion in request.criteria:
+        mask, normalized = _normalize_cohort_criterion(criterion, df, profile)
+        combined_mask &= mask
+        normalized_criteria.append(normalized)
+
+    filtered_df = df.loc[combined_mask].copy()
+    preview_columns, blocked_columns = _cohort_preview_columns(
+        filtered_df if not filtered_df.empty else df,
+        profile,
+        [item["field"] for item in normalized_criteria],
+    )
+    preview_source = filtered_df[preview_columns] if preview_columns and not filtered_df.empty else filtered_df
+    preview_rows = _to_json_compatible_rows(preview_source, request.limit) if not preview_source.empty else []
+
+    population_row_count = int(len(df.index))
+    row_count = int(len(filtered_df.index))
+    match_percent = round((row_count / population_row_count) * 100, 2) if population_row_count else 0.0
+    criteria_summary = "; ".join(_describe_cohort_criterion(item) for item in normalized_criteria[:4])
+    cohort_name = request.name.strip() if request.name and request.name.strip() else "Governed cohort"
+
+    if row_count:
+        summary = (
+            f"{cohort_name} matched {row_count} row(s) out of {population_row_count} "
+            f"({match_percent:.2f}% of the governed dataset) using {criteria_summary}."
+        )
+    else:
+        summary = (
+            f"{cohort_name} matched no rows in the governed dataset. "
+            f"Review the criteria combination: {criteria_summary}."
+        )
+
+    preferred_dimension = next((item for item in _preferred_dimension_candidates(profile) if item in df.columns), None)
+    preferred_time = next((item for item in _time_candidates(profile) if item in df.columns), None)
+    preferred_metric = next((item for item in _numeric_metric_candidates(profile) if item in df.columns), None)
+    suggested_questions = [
+        preferred_dimension and row_count
+        and f"Break this cohort down by {preferred_dimension} and explain the largest segment differences.",
+        preferred_time and row_count and f"How has this cohort changed over time using {preferred_time}?",
+        preferred_metric and row_count and f"Compare {preferred_metric} for this cohort against the full dataset.",
+    ]
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "name": cohort_name,
+        "description": request.description.strip() if request.description and request.description.strip() else None,
+        "row_count": row_count,
+        "population_row_count": population_row_count,
+        "criteria_count": len(normalized_criteria),
+        "criteria": normalized_criteria,
+        "preview_columns": preview_columns,
+        "preview_rows": preview_rows,
+        "excluded_columns": blocked_columns,
+        "summary": summary,
+        "suggested_questions": [item for item in suggested_questions if item][:4],
+    }
 
 
 def _anomaly_priority(item: dict[str, Any]) -> tuple[int, float]:
@@ -3229,6 +3567,60 @@ def profile_dataset(
     mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
     response_profile = _apply_profile_masking(profile, mask_enabled)
     return ProfileResponse(dataset_id=dataset_id, profile=response_profile)
+
+
+@app.get("/sessions/{dataset_id}/cohorts", response_model=CohortAnalysisResponse)
+def get_saved_cohort_analysis(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> CohortAnalysisResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    path = _cohort_path(dataset_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No saved cohort analysis exists for this session.")
+    cohort = _load_json(path)
+    return CohortAnalysisResponse(dataset_id=dataset_id, cohort=CohortAnalysisPayload(**cohort))
+
+
+@app.post("/sessions/{dataset_id}/cohorts", response_model=CohortAnalysisResponse)
+def build_cohort_analysis(
+    dataset_id: str,
+    request: CohortBuildRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> CohortAnalysisResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    try:
+        df = _read_uploaded_file(meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    profile = _load_profile_if_exists(dataset_id)
+    if profile is None:
+        profile = _build_profile(df)
+        _save_json(_profile_path(dataset_id), profile)
+        meta.setdefault("artifacts", {})["profile"] = str(_profile_path(dataset_id))
+
+    analysis = _build_cohort_analysis(df, profile, request)
+    _save_json(_cohort_path(dataset_id), analysis)
+    meta.setdefault("artifacts", {})["cohort_analysis"] = str(_cohort_path(dataset_id))
+    meta["status"] = "analyzed"
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "cohort_analysis_generated",
+        actor,
+        {
+            "criteria_count": analysis.get("criteria_count", 0),
+            "row_count": analysis.get("row_count", 0),
+            "name": analysis.get("name", "Governed cohort"),
+        },
+    )
+    return CohortAnalysisResponse(dataset_id=dataset_id, cohort=CohortAnalysisPayload(**analysis))
 
 
 @app.get("/sessions/{dataset_id}/anomalies", response_model=AnomalyAnalysisResponse)
