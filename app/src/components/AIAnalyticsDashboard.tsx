@@ -31,6 +31,7 @@ import {
   type DocumentAskResponse,
   type DocumentSummary,
   type CohortAnalysisResponse,
+  type ForecastDriftResponse,
   type ForecastRunRecord,
   type SavedInvestigationRecord,
   type SavedPlaybookRecord,
@@ -56,6 +57,7 @@ import {
   getCohortAnalysis,
   getDashboardSpec,
   getFacts,
+  getForecastDrift,
   getForecastRuns,
   getJobStatus,
   getProfile,
@@ -507,6 +509,7 @@ export function AIAnalyticsDashboard() {
   const [anomalyAnalysis, setAnomalyAnalysis] = useState<AnomalyAnalysisResponse | null>(null);
   const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
   const [forecastRuns, setForecastRuns] = useState<ForecastRunRecord[]>([]);
+  const [forecastDrift, setForecastDrift] = useState<ForecastDriftResponse | null>(null);
   const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigationRecord[]>([]);
   const [savedPlaybooks, setSavedPlaybooks] = useState<SavedPlaybookRecord[]>([]);
   const [workflowActions, setWorkflowActions] = useState<WorkflowActionRecord[]>([]);
@@ -616,6 +619,7 @@ export function AIAnalyticsDashboard() {
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
       setForecastRuns([]);
+      setForecastDrift(null);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -634,6 +638,7 @@ export function AIAnalyticsDashboard() {
     async function hydrateSession() {
       try {
         setForecastRuns([]);
+        setForecastDrift(null);
         setSavedInvestigations([]);
         setSavedPlaybooks([]);
         setWorkflowActions([]);
@@ -669,6 +674,12 @@ export function AIAnalyticsDashboard() {
           const mlRunsResponse = await getForecastRuns(datasetId, userId);
           if (!active) return;
           setForecastRuns(mlRunsResponse.runs ?? []);
+        }
+
+        if (meta.artifacts?.ml_drift) {
+          const driftResponse = await getForecastDrift(datasetId, userId);
+          if (!active) return;
+          setForecastDrift(driftResponse);
         }
 
         if (meta.artifacts?.investigations) {
@@ -988,6 +999,7 @@ export function AIAnalyticsDashboard() {
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
       setForecastRuns([]);
+      setForecastDrift(null);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1069,6 +1081,7 @@ export function AIAnalyticsDashboard() {
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
       setForecastRuns([]);
+      setForecastDrift(null);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1111,6 +1124,7 @@ export function AIAnalyticsDashboard() {
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
       setForecastRuns([]);
+      setForecastDrift(null);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
@@ -1124,6 +1138,7 @@ export function AIAnalyticsDashboard() {
       setReportJob(null);
       setSelectedFile(null);
       setSessionMeta(await getSession(targetDatasetId, userId));
+      await refreshForecastRuns(targetDatasetId);
       setAuditEvents((await getAudit(targetDatasetId, userId)).events ?? []);
       setNotice(`${selectedFile.name} uploaded successfully.`);
     } catch (uploadError) {
@@ -1284,10 +1299,37 @@ export function AIAnalyticsDashboard() {
       await refreshForecastRuns(datasetId);
       setSessionMeta(await getSession(datasetId, userId));
       setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setForecastDrift(null);
       setForecastName('');
       setNotice(`Forecast run completed with champion model ${run.payload.champion_model}.`);
     } catch (forecastError) {
       setError(forecastError instanceof Error ? forecastError.message : 'Forecast training failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleScanForecastDrift(runId?: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (forecastRuns.length === 0) {
+      setError('Train or load a forecast run before scanning drift.');
+      return;
+    }
+
+    setBusyAction('forecast_drift');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await getForecastDrift(datasetId, userId, runId ?? forecastRuns[0]?.run_id);
+      setForecastDrift(response);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(`Forecast drift scanned for ${response.drift.metric_field}.`);
+    } catch (driftError) {
+      setError(driftError instanceof Error ? driftError.message : 'Forecast drift scan failed.');
     } finally {
       setBusyAction(null);
     }
@@ -2833,16 +2875,27 @@ export function AIAnalyticsDashboard() {
       </section>
 
       <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
-        <div className="flex items-center gap-2">
-          <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
-            <BarChart3 className="h-5 w-5" />
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-center gap-2">
+            <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+              <BarChart3 className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-lg font-medium text-foreground">Governed Forecast Lab</h3>
+              <p className="text-sm text-muted-foreground">
+                Train audited forecast runs on governed time-series fields, compare candidate models, and monitor drift after data refreshes.
+              </p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-lg font-medium text-foreground">Governed Forecast Lab</h3>
-            <p className="text-sm text-muted-foreground">
-              Train audited forecast runs on governed time-series fields, compare candidate models, and persist the champion run in session artifacts.
-            </p>
-          </div>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleScanForecastDrift()}
+            disabled={busyAction === 'forecast_drift' || forecastRuns.length === 0 || !datasetId || !canCompute}
+          >
+            {busyAction === 'forecast_drift' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            Scan Drift
+          </Button>
         </div>
 
         <div className="mt-4 grid gap-3 xl:grid-cols-[1.2fr_1fr_1fr_160px_150px_auto]">
@@ -2911,6 +2964,9 @@ export function AIAnalyticsDashboard() {
                 <Badge variant="outline">Metric: {latestForecastRun.payload.metric_field}</Badge>
                 <Badge variant="outline">Periods used: {latestForecastRun.payload.periods_used}</Badge>
                 <Badge variant="outline">Horizon: {latestForecastRun.payload.horizon}</Badge>
+                {latestForecastRun.payload.training_data_hash && sessionMeta?.file_hash && latestForecastRun.payload.training_data_hash !== sessionMeta.file_hash ? (
+                  <Badge variant="outline">Stale data</Badge>
+                ) : null}
               </div>
               <p className="mt-3 text-sm text-foreground">{latestForecastRun.payload.summary}</p>
               {latestForecastRun.payload.warnings.length > 0 ? (
@@ -2923,6 +2979,43 @@ export function AIAnalyticsDashboard() {
                 </div>
               ) : null}
             </div>
+
+            {forecastDrift ? (
+              <div className="rounded-xl border border-border bg-background p-4">
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="outline">Drift score: {forecastDrift.drift.drift_score.toFixed(2)}</Badge>
+                  <Badge variant="outline">Window: {forecastDrift.drift.periods_analyzed} periods</Badge>
+                  <Badge variant="outline">Stale model: {forecastDrift.drift.stale_model ? 'yes' : 'no'}</Badge>
+                </div>
+                <p className="mt-3 text-sm text-foreground">{forecastDrift.drift.summary}</p>
+                <div className="mt-4 grid gap-4 xl:grid-cols-2">
+                  <div className="rounded-lg border border-border/70 bg-card p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Signals</p>
+                    {forecastDrift.drift.signals.length === 0 ? (
+                      <p className="mt-2 text-xs text-muted-foreground">No material drift signals were detected.</p>
+                    ) : (
+                      <div className="mt-2 space-y-2">
+                        {forecastDrift.drift.signals.map((signal) => (
+                          <div key={`${signal.code}-${signal.message}`} className="rounded-md border border-border/60 px-3 py-2 text-xs text-foreground">
+                            <span className="font-medium">{signal.code}</span>: {signal.message}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-border/70 bg-card p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Recommended actions</p>
+                    <div className="mt-2 space-y-2">
+                      {forecastDrift.drift.recommended_actions.map((action) => (
+                        <div key={action} className="rounded-md border border-border/60 px-3 py-2 text-xs text-foreground">
+                          {action}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
 
             <div className="grid gap-4 xl:grid-cols-2">
               <div className="rounded-xl border border-border bg-background p-4">
@@ -3018,12 +3111,26 @@ export function AIAnalyticsDashboard() {
                             <p className="text-sm font-medium text-foreground">{run.payload.name}</p>
                             <p className="mt-1 text-xs text-muted-foreground">{run.payload.summary}</p>
                           </div>
-                          <Badge variant="outline">{run.payload.champion_model}</Badge>
+                          <div className="flex flex-wrap gap-2">
+                            {run.payload.training_data_hash && sessionMeta?.file_hash && run.payload.training_data_hash !== sessionMeta.file_hash ? (
+                              <Badge variant="outline">Stale</Badge>
+                            ) : null}
+                            <Badge variant="outline">{run.payload.champion_model}</Badge>
+                          </div>
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           <Badge variant="outline">{run.payload.metric_field}</Badge>
                           <Badge variant="outline">{run.payload.aggregation}</Badge>
                           <Badge variant="outline">{new Date(run.created_at).toLocaleString()}</Badge>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void handleScanForecastDrift(run.run_id)}
+                            disabled={busyAction === 'forecast_drift' || !canCompute}
+                          >
+                            Scan Drift
+                          </Button>
                         </div>
                       </div>
                     ))}

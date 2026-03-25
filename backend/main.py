@@ -239,6 +239,7 @@ class SessionMetaResponse(BaseModel):
     allow_sensitive_export: bool = False
     sensitive_export_approval: dict[str, Any] = Field(default_factory=dict)
     file: dict[str, Any] | None = None
+    file_hash: str | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
 
 
@@ -438,6 +439,10 @@ class ForecastRunPayload(BaseModel):
     holdout_points: int
     horizon: int
     champion_model: str
+    training_data_hash: str | None = None
+    baseline_mean: float | None = None
+    baseline_std: float | None = None
+    latest_actual: float | None = None
     summary: str
     warnings: list[str] = Field(default_factory=list)
     candidate_models: list[ForecastCandidateMetrics] = Field(default_factory=list)
@@ -457,6 +462,39 @@ class ForecastRunRecord(BaseModel):
 class ForecastRunsResponse(BaseModel):
     dataset_id: str
     runs: list[ForecastRunRecord] = Field(default_factory=list)
+
+
+class ForecastDriftSignal(BaseModel):
+    code: str
+    severity: str
+    message: str
+
+
+class ForecastDriftPayload(BaseModel):
+    generated_at: str
+    run_id: str
+    run_name: str
+    champion_model: str
+    time_field: str
+    metric_field: str
+    aggregation: str
+    training_data_hash: str | None = None
+    current_data_hash: str | None = None
+    stale_model: bool = False
+    drift_score: float
+    periods_analyzed: int
+    baseline_mean: float
+    recent_mean: float
+    baseline_std: float
+    recent_std: float
+    summary: str
+    signals: list[ForecastDriftSignal] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+
+
+class ForecastDriftResponse(BaseModel):
+    dataset_id: str
+    drift: ForecastDriftPayload
 
 
 class ReportResponse(BaseModel):
@@ -652,6 +690,10 @@ def _ml_runs_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "ml_runs.json"
 
 
+def _ml_drift_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "ml_drift.json"
+
+
 def _dashboard_spec_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "dashboard_spec.json"
 
@@ -787,6 +829,13 @@ def _save_ml_runs(dataset_id: str, runs: list[dict[str, Any]]) -> None:
             "runs": runs,
         },
     )
+
+
+def _load_ml_drift(dataset_id: str) -> dict[str, Any] | None:
+    path = _ml_drift_path(dataset_id)
+    if not path.exists():
+        return None
+    return _load_json(path)
 
 
 def _safe_directory_size(path: Path) -> int:
@@ -2579,7 +2628,13 @@ def _aggregate_forecast_series(
     return grouped
 
 
-def _build_forecast_run(df: pd.DataFrame, profile: dict[str, Any], request: ForecastTrainRequest) -> dict[str, Any]:
+def _build_forecast_run(
+    df: pd.DataFrame,
+    profile: dict[str, Any],
+    request: ForecastTrainRequest,
+    *,
+    dataset_hash: str,
+) -> dict[str, Any]:
     time_candidates = _time_candidates(profile)
     metric_candidates = _numeric_metric_candidates(profile)
 
@@ -2653,6 +2708,8 @@ def _build_forecast_run(df: pd.DataFrame, profile: dict[str, Any], request: Fore
         f"Champion model {champion_model} forecasted {metric_field} with {champion['mae']:.2f} MAE "
         f"across {holdout_points} holdout month(s). The governed projection for the next {request.horizon} month(s) is {direction}."
     )
+    baseline_mean = round(sum(values) / len(values), 4) if values else 0.0
+    baseline_std = round(float(pd.Series(values).std(ddof=0) or 0.0), 4) if values else 0.0
 
     latest_period = period_index[-1]
     forecast_points = [
@@ -2671,11 +2728,135 @@ def _build_forecast_run(df: pd.DataFrame, profile: dict[str, Any], request: Fore
         "holdout_points": holdout_points,
         "horizon": int(request.horizon),
         "champion_model": champion_model,
+        "training_data_hash": dataset_hash,
+        "baseline_mean": baseline_mean,
+        "baseline_std": baseline_std,
+        "latest_actual": round(float(values[-1]), 4) if values else None,
         "summary": summary,
         "warnings": warnings,
         "candidate_models": candidate_models,
         "historical": historical_points,
         "forecast": forecast_points,
+    }
+
+
+def _build_forecast_drift(
+    dataset_id: str,
+    meta: dict[str, Any],
+    df: pd.DataFrame,
+    run: dict[str, Any],
+    *,
+    window: int,
+) -> dict[str, Any]:
+    payload = run.get("payload") if isinstance(run, dict) else {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="The selected forecast run is malformed.")
+
+    time_field = str(payload.get("time_field") or "").strip()
+    metric_field = str(payload.get("metric_field") or "").strip()
+    aggregation = str(payload.get("aggregation") or "sum").strip().lower() or "sum"
+    if not time_field or not metric_field:
+        raise HTTPException(status_code=400, detail="The selected forecast run is missing its governed field configuration.")
+
+    grouped = _aggregate_forecast_series(df, time_field=time_field, metric_field=metric_field, aggregation=aggregation)
+    recent_window = max(3, min(window, len(grouped)))
+    recent_values = [float(value) for value in grouped.tail(recent_window).tolist()]
+
+    historical_points = payload.get("historical") if isinstance(payload.get("historical"), list) else []
+    baseline_values = [
+        float(item.get("value"))
+        for item in historical_points
+        if isinstance(item, dict) and item.get("value") is not None
+    ]
+    if not baseline_values:
+        raise HTTPException(status_code=400, detail="The selected forecast run does not include historical baseline values for drift analysis.")
+
+    baseline_window = baseline_values[-recent_window:]
+    baseline_mean = float(payload.get("baseline_mean")) if payload.get("baseline_mean") is not None else float(sum(baseline_window) / len(baseline_window))
+    baseline_std = float(payload.get("baseline_std")) if payload.get("baseline_std") is not None else float(pd.Series(baseline_window).std(ddof=0) or 0.0)
+    recent_mean = float(sum(recent_values) / len(recent_values))
+    recent_std = float(pd.Series(recent_values).std(ddof=0) or 0.0)
+
+    mean_shift = abs(recent_mean - baseline_mean) / abs(baseline_mean) if baseline_mean else 0.0
+    volatility_base = baseline_std if baseline_std > 0 else max(recent_std, 1.0)
+    volatility_shift = abs(recent_std - baseline_std) / volatility_base if volatility_base else 0.0
+
+    current_hash = str(meta.get("file_hash") or _dataset_signature(meta) or "")
+    training_hash = str(payload.get("training_data_hash") or "") or None
+    stale_model = bool(training_hash and current_hash and training_hash != current_hash)
+
+    signals: list[dict[str, Any]] = []
+    if stale_model:
+        signals.append(
+            {
+                "code": "data_refresh",
+                "severity": "medium",
+                "message": "The session file hash changed after this model run was trained, so the forecast should be revalidated.",
+            }
+        )
+    if mean_shift >= 0.2:
+        signals.append(
+            {
+                "code": "mean_shift",
+                "severity": "high" if mean_shift >= 0.35 else "medium",
+                "message": f"Recent monthly {metric_field} mean shifted by {mean_shift * 100:.1f}% versus the training baseline.",
+            }
+        )
+    if volatility_shift >= 0.2:
+        signals.append(
+            {
+                "code": "volatility_shift",
+                "severity": "high" if volatility_shift >= 0.35 else "medium",
+                "message": f"Recent monthly {metric_field} volatility shifted by {volatility_shift * 100:.1f}% versus the training baseline.",
+            }
+        )
+
+    drift_score = round(max(mean_shift, volatility_shift, 0.25 if stale_model else 0.0), 4)
+    if drift_score >= 0.35:
+        summary = (
+            f"Forecast drift is high for {metric_field}. Recent data moved materially away from the baseline used by "
+            f"{payload.get('champion_model', 'the champion model')}."
+        )
+    elif drift_score >= 0.2:
+        summary = (
+            f"Forecast drift is moderate for {metric_field}. Review the recent series before trusting existing projections."
+        )
+    else:
+        summary = f"Forecast drift is currently low for {metric_field}; the recent series is still close to the training baseline."
+
+    recommended_actions = (
+        [
+            "Retrain the forecast run on the refreshed dataset.",
+            "Compare candidate models again before promoting a new champion.",
+            "Review the latest monthly periods and any anomaly signals together.",
+        ]
+        if drift_score >= 0.2 or stale_model
+        else [
+            "Continue monitoring this model after the next data refresh.",
+            "Re-run drift analysis if operational conditions or seasonality change.",
+        ]
+    )
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "run_id": str(run.get("run_id") or ""),
+        "run_name": str(payload.get("name") or run.get("run_id") or "Forecast run"),
+        "champion_model": str(payload.get("champion_model") or "unknown"),
+        "time_field": time_field,
+        "metric_field": metric_field,
+        "aggregation": aggregation,
+        "training_data_hash": training_hash,
+        "current_data_hash": current_hash or None,
+        "stale_model": stale_model,
+        "drift_score": drift_score,
+        "periods_analyzed": recent_window,
+        "baseline_mean": round(baseline_mean, 4),
+        "recent_mean": round(recent_mean, 4),
+        "baseline_std": round(baseline_std, 4),
+        "recent_std": round(recent_std, 4),
+        "summary": summary,
+        "signals": signals,
+        "recommended_actions": recommended_actions,
     }
 
 
@@ -4107,12 +4288,16 @@ async def upload_file(
     file_meta["uploaded_at"] = _utc_now_iso()
     file_meta["uploaded_by"] = actor
 
-    # New upload invalidates derived artifacts.
+    preserved_artifacts: dict[str, str] = {}
+    if _ml_runs_path(dataset_id).exists():
+        preserved_artifacts["ml_runs"] = str(_ml_runs_path(dataset_id))
+
+    # New upload invalidates derived artifacts, but forecast runs remain visible so they can be drift-checked against refreshed data.
     meta["file"] = file_meta
     if not meta.get("display_name"):
         meta["display_name"] = Path(filename).stem
     meta["status"] = "uploaded"
-    meta["artifacts"] = {}
+    meta["artifacts"] = preserved_artifacts
     meta["allow_sensitive_export"] = False
     meta["sensitive_export_approval"] = _default_sensitive_export_approval()
     meta["file_hash"] = _dataset_signature(meta)
@@ -4356,7 +4541,12 @@ def train_forecast_run(
         _save_json(_profile_path(dataset_id), profile)
         meta.setdefault("artifacts", {})["profile"] = str(_profile_path(dataset_id))
 
-    payload = _build_forecast_run(df, profile, request)
+    payload = _build_forecast_run(
+        df,
+        profile,
+        request,
+        dataset_hash=str(meta.get("file_hash") or _dataset_signature(meta) or ""),
+    )
     record = {
         "run_id": str(uuid.uuid4()),
         "model_kind": "forecast",
@@ -4383,6 +4573,46 @@ def train_forecast_run(
         },
     )
     return ForecastRunRecord(**record)
+
+
+@app.get("/sessions/{dataset_id}/ml-runs/drift", response_model=ForecastDriftResponse)
+def get_forecast_drift(
+    dataset_id: str,
+    run_id: str | None = Query(default=None),
+    window: int = Query(default=6, ge=3, le=12),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ForecastDriftResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    runs = _load_ml_runs(dataset_id)
+    if not runs:
+        raise HTTPException(status_code=404, detail="No saved forecast runs are available for this session.")
+
+    selected = runs[0]
+    if run_id:
+        selected = next((item for item in runs if str(item.get("run_id")) == run_id), None)
+        if selected is None:
+            raise HTTPException(status_code=404, detail="Requested forecast run was not found.")
+
+    try:
+        df = _read_uploaded_file(meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    drift = _build_forecast_drift(dataset_id, meta, df, selected, window=window)
+    _save_json(_ml_drift_path(dataset_id), drift)
+    meta.setdefault("artifacts", {})["ml_drift"] = str(_ml_drift_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "ml_drift_scanned",
+        actor,
+        {"run_id": drift.get("run_id"), "drift_score": drift.get("drift_score"), "stale_model": drift.get("stale_model")},
+    )
+    return ForecastDriftResponse(dataset_id=dataset_id, drift=ForecastDriftPayload(**drift))
 
 
 @app.get("/sessions/{dataset_id}/workflow-actions", response_model=WorkflowActionsResponse)

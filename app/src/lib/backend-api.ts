@@ -24,6 +24,7 @@ export interface SessionMeta {
     size_bytes?: number;
     content_type?: string;
   } | null;
+  file_hash?: string | null;
   artifacts: Record<string, string>;
 }
 
@@ -204,6 +205,10 @@ export interface ForecastRunPayload {
   holdout_points: number;
   horizon: number;
   champion_model: string;
+  training_data_hash?: string | null;
+  baseline_mean?: number | null;
+  baseline_std?: number | null;
+  latest_actual?: number | null;
   summary: string;
   warnings: string[];
   candidate_models: ForecastCandidateMetrics[];
@@ -223,6 +228,39 @@ export interface ForecastRunRecord {
 export interface ForecastRunsResponse {
   dataset_id: string;
   runs: ForecastRunRecord[];
+}
+
+export interface ForecastDriftSignal {
+  code: string;
+  severity: string;
+  message: string;
+}
+
+export interface ForecastDriftPayload {
+  generated_at: string;
+  run_id: string;
+  run_name: string;
+  champion_model: string;
+  time_field: string;
+  metric_field: string;
+  aggregation: string;
+  training_data_hash?: string | null;
+  current_data_hash?: string | null;
+  stale_model: boolean;
+  drift_score: number;
+  periods_analyzed: number;
+  baseline_mean: number;
+  recent_mean: number;
+  baseline_std: number;
+  recent_std: number;
+  summary: string;
+  signals: ForecastDriftSignal[];
+  recommended_actions: string[];
+}
+
+export interface ForecastDriftResponse {
+  dataset_id: string;
+  drift: ForecastDriftPayload;
 }
 
 export interface AskResponsePayload {
@@ -691,6 +729,18 @@ export function getSavedPlaybooks(datasetId: string, userId: string) {
 
 export function getForecastRuns(datasetId: string, userId: string) {
   return apiRequest<ForecastRunsResponse>(`/sessions/${datasetId}/ml-runs`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function getForecastDrift(datasetId: string, userId: string, runId?: string, window = 6) {
+  const params = new URLSearchParams();
+  params.set('window', String(window));
+  if (runId) {
+    params.set('run_id', runId);
+  }
+  return apiRequest<ForecastDriftResponse>(`/sessions/${datasetId}/ml-runs/drift?${params.toString()}`, undefined, {
     userId,
     timeoutMs: 120000,
   });
