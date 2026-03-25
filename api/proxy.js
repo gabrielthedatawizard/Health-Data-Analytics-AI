@@ -75,6 +75,22 @@ function copyRequestHeaders(req) {
   return headers;
 }
 
+function isTextLikeContentType(contentType) {
+  if (!contentType) {
+    return false;
+  }
+  const normalized = contentType.toLowerCase();
+  return (
+    normalized.startsWith("text/") ||
+    normalized.includes("application/json") ||
+    normalized.includes("application/problem+json") ||
+    normalized.includes("application/javascript") ||
+    normalized.includes("application/xml") ||
+    normalized.includes("application/xhtml+xml") ||
+    normalized.includes("application/csv")
+  );
+}
+
 module.exports = async function handler(req, res) {
   const backendBase = normalizeBackendBase(process.env.BACKEND_API_URL);
   if (!backendBase) {
@@ -126,6 +142,17 @@ module.exports = async function handler(req, res) {
     }
     res.setHeader(key, value);
   });
+
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+
+  const contentType = upstream.headers.get("content-type") || "";
+  if (isTextLikeContentType(contentType)) {
+    res.end(await upstream.text());
+    return;
+  }
 
   const payload = Buffer.from(await upstream.arrayBuffer());
   res.end(payload);
