@@ -150,6 +150,81 @@ export interface WorkflowActionsResponse {
   actions: WorkflowActionRecord[];
 }
 
+export interface SavedInvestigationRecord {
+  investigation_id: string;
+  title: string;
+  question: string;
+  context_type: string;
+  note?: string | null;
+  result: Record<string, unknown>;
+  created_at: string;
+  created_by: string;
+}
+
+export interface SavedInvestigationsResponse {
+  dataset_id: string;
+  investigations: SavedInvestigationRecord[];
+}
+
+export interface SavedPlaybookRecord {
+  playbook_id: string;
+  name: string;
+  question_template: string;
+  description?: string | null;
+  context_type: string;
+  created_at: string;
+  created_by: string;
+}
+
+export interface SavedPlaybooksResponse {
+  dataset_id: string;
+  playbooks: SavedPlaybookRecord[];
+}
+
+export interface ForecastSeriesPoint {
+  period: string;
+  value: number;
+}
+
+export interface ForecastCandidateMetrics {
+  model_name: string;
+  mae: number;
+  rmse: number;
+  mape?: number | null;
+  holdout_points: number;
+}
+
+export interface ForecastRunPayload {
+  generated_at: string;
+  name: string;
+  time_field: string;
+  metric_field: string;
+  aggregation: string;
+  periods_used: number;
+  holdout_points: number;
+  horizon: number;
+  champion_model: string;
+  summary: string;
+  warnings: string[];
+  candidate_models: ForecastCandidateMetrics[];
+  historical: ForecastSeriesPoint[];
+  forecast: ForecastSeriesPoint[];
+}
+
+export interface ForecastRunRecord {
+  run_id: string;
+  model_kind: string;
+  status: string;
+  created_at: string;
+  created_by: string;
+  payload: ForecastRunPayload;
+}
+
+export interface ForecastRunsResponse {
+  dataset_id: string;
+  runs: ForecastRunRecord[];
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -576,6 +651,92 @@ export function getWorkflowActions(datasetId: string, userId: string) {
     userId,
     timeoutMs: 120000,
   });
+}
+
+export function getSavedInvestigations(datasetId: string, userId: string) {
+  return apiRequest<SavedInvestigationsResponse>(`/sessions/${datasetId}/investigations`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function saveInvestigation(
+  datasetId: string,
+  userId: string,
+  payload: {
+    title?: string;
+    question: string;
+    context_type?: string;
+    note?: string;
+    result: Record<string, unknown>;
+  }
+) {
+  return apiRequest<SavedInvestigationRecord>(
+    `/sessions/${datasetId}/investigations`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function getSavedPlaybooks(datasetId: string, userId: string) {
+  return apiRequest<SavedPlaybooksResponse>(`/sessions/${datasetId}/playbooks`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function getForecastRuns(datasetId: string, userId: string) {
+  return apiRequest<ForecastRunsResponse>(`/sessions/${datasetId}/ml-runs`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function trainForecastRun(
+  datasetId: string,
+  userId: string,
+  payload: {
+    name?: string;
+    time_field?: string;
+    metric_field?: string;
+    horizon?: number;
+    aggregation?: 'sum' | 'mean';
+  }
+) {
+  return apiRequest<ForecastRunRecord>(
+    `/sessions/${datasetId}/ml-runs/forecast`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function savePlaybook(
+  datasetId: string,
+  userId: string,
+  payload: {
+    name: string;
+    question_template: string;
+    description?: string;
+    context_type?: string;
+  }
+) {
+  return apiRequest<SavedPlaybookRecord>(
+    `/sessions/${datasetId}/playbooks`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
 }
 
 export function draftWorkflowAction(

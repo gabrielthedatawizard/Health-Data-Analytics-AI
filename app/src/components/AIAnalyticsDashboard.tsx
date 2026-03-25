@@ -31,6 +31,9 @@ import {
   type DocumentAskResponse,
   type DocumentSummary,
   type CohortAnalysisResponse,
+  type ForecastRunRecord,
+  type SavedInvestigationRecord,
+  type SavedPlaybookRecord,
   type WorkflowActionRecord,
   type AuthContextResponse,
   type BackendUserRole,
@@ -53,8 +56,11 @@ import {
   getCohortAnalysis,
   getDashboardSpec,
   getFacts,
+  getForecastRuns,
   getJobStatus,
   getProfile,
+  getSavedInvestigations,
+  getSavedPlaybooks,
   getSession,
   getWorkflowActions,
   inferBackendUserRole,
@@ -62,9 +68,12 @@ import {
   requestSensitiveExportApproval,
   reportHtmlUrl,
   reportPdfUrl,
+  saveInvestigation,
+  savePlaybook,
   reviewWorkflowAction,
   reviewSensitiveExportApproval,
   setSensitiveExportEnabled,
+  trainForecastRun,
   uploadDocument,
   uploadDataset,
 } from '@/lib/backend-api';
@@ -497,12 +506,24 @@ export function AIAnalyticsDashboard() {
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
   const [anomalyAnalysis, setAnomalyAnalysis] = useState<AnomalyAnalysisResponse | null>(null);
   const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
+  const [forecastRuns, setForecastRuns] = useState<ForecastRunRecord[]>([]);
+  const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigationRecord[]>([]);
+  const [savedPlaybooks, setSavedPlaybooks] = useState<SavedPlaybookRecord[]>([]);
   const [workflowActions, setWorkflowActions] = useState<WorkflowActionRecord[]>([]);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
+  const [investigationTitle, setInvestigationTitle] = useState('');
+  const [investigationNote, setInvestigationNote] = useState('');
+  const [playbookName, setPlaybookName] = useState('');
+  const [playbookDescription, setPlaybookDescription] = useState('');
   const [cohortName, setCohortName] = useState('Priority follow-up cohort');
   const [cohortDescription, setCohortDescription] = useState('');
   const [cohortCriteria, setCohortCriteria] = useState<CohortDraftCriterion[]>([{ id: 'criterion-initial', field: '', operator: 'eq', value: '' }]);
+  const [forecastName, setForecastName] = useState('');
+  const [forecastTimeField, setForecastTimeField] = useState('');
+  const [forecastMetricField, setForecastMetricField] = useState('');
+  const [forecastAggregation, setForecastAggregation] = useState<'sum' | 'mean'>('sum');
+  const [forecastHorizon, setForecastHorizon] = useState('3');
   const [workflowActionType, setWorkflowActionType] = useState<(typeof WORKFLOW_ACTION_OPTIONS)[number]['value']>('draft_email');
   const [workflowTitle, setWorkflowTitle] = useState('');
   const [workflowTarget, setWorkflowTarget] = useState('');
@@ -594,6 +615,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setForecastRuns([]);
+      setSavedInvestigations([]);
+      setSavedPlaybooks([]);
       setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
@@ -609,6 +633,9 @@ export function AIAnalyticsDashboard() {
 
     async function hydrateSession() {
       try {
+        setForecastRuns([]);
+        setSavedInvestigations([]);
+        setSavedPlaybooks([]);
         setWorkflowActions([]);
         const meta = await getSession(datasetId, userId);
         if (!active) return;
@@ -636,6 +663,24 @@ export function AIAnalyticsDashboard() {
           const cohortResponse = await getCohortAnalysis(datasetId, userId);
           if (!active) return;
           setCohortAnalysis(cohortResponse);
+        }
+
+        if (meta.artifacts?.ml_runs) {
+          const mlRunsResponse = await getForecastRuns(datasetId, userId);
+          if (!active) return;
+          setForecastRuns(mlRunsResponse.runs ?? []);
+        }
+
+        if (meta.artifacts?.investigations) {
+          const investigationsResponse = await getSavedInvestigations(datasetId, userId);
+          if (!active) return;
+          setSavedInvestigations(investigationsResponse.investigations ?? []);
+        }
+
+        if (meta.artifacts?.playbooks) {
+          const playbooksResponse = await getSavedPlaybooks(datasetId, userId);
+          if (!active) return;
+          setSavedPlaybooks(playbooksResponse.playbooks ?? []);
         }
 
         if (meta.artifacts?.workflow_actions) {
@@ -760,6 +805,24 @@ export function AIAnalyticsDashboard() {
     () => anomalyAnalysis?.analysis.suggested_questions ?? [],
     [anomalyAnalysis]
   );
+  const forecastTimeOptions = useMemo(() => {
+    const columns = Array.isArray(profile?.columns) ? profile.columns : [];
+    return columns
+      .map(asRecord)
+      .filter((column): column is Record<string, unknown> => Boolean(column))
+      .filter((column) => asString(column.inferred_type) === 'datetime' && !Boolean(column.is_pii_candidate) && !Boolean(column.is_id_like))
+      .map((column) => asString(column.name))
+      .filter((value): value is string => Boolean(value));
+  }, [profile]);
+  const forecastMetricOptions = useMemo(() => {
+    const columns = Array.isArray(profile?.columns) ? profile.columns : [];
+    return columns
+      .map(asRecord)
+      .filter((column): column is Record<string, unknown> => Boolean(column))
+      .filter((column) => asString(column.inferred_type) === 'number' && !Boolean(column.is_pii_candidate) && !Boolean(column.is_id_like))
+      .map((column) => asString(column.name))
+      .filter((value): value is string => Boolean(value));
+  }, [profile]);
   const cohortFieldOptions = useMemo(() => normalizeCohortFieldOptions(profile), [profile]);
   const cohortFieldLookup = useMemo(
     () =>
@@ -771,6 +834,7 @@ export function AIAnalyticsDashboard() {
   );
 
   const dashboardCharts = useMemo(() => normalizeDashboardCharts(dashboardSpec), [dashboardSpec]);
+  const latestForecastRun = forecastRuns[0] ?? null;
 
   const dashboardFilters = useMemo(() => {
     const items = Array.isArray(dashboardSpec?.filters) ? dashboardSpec.filters : [];
@@ -817,6 +881,7 @@ export function AIAnalyticsDashboard() {
   const effectiveRole = authContext?.role ?? userRole;
   const canCreateSession = permissionSet.has('sessions:create') || permissionSet.has('admin:all');
   const canCompute = permissionSet.has('sessions:compute_own') || permissionSet.has('sessions:compute_all') || permissionSet.has('admin:all');
+  const canWriteSession = permissionSet.has('sessions:write_own') || permissionSet.has('sessions:write_all') || permissionSet.has('admin:all');
   const canReviewSensitiveExport = permissionSet.has('sensitive_export:review') || permissionSet.has('admin:all');
   const canRequestSensitiveExport = permissionSet.has('sensitive_export:request_own') || permissionSet.has('admin:all');
   const canReadDocuments = permissionSet.has('docs:read_own') || permissionSet.has('docs:read_all') || permissionSet.has('admin:all');
@@ -852,6 +917,30 @@ export function AIAnalyticsDashboard() {
   }, [cohortFieldLookup, cohortFieldOptions]);
 
   useEffect(() => {
+    if (forecastTimeOptions.length === 0) {
+      if (forecastTimeField) {
+        setForecastTimeField('');
+      }
+      return;
+    }
+    if (!forecastTimeOptions.includes(forecastTimeField)) {
+      setForecastTimeField(forecastTimeOptions[0]);
+    }
+  }, [forecastTimeField, forecastTimeOptions]);
+
+  useEffect(() => {
+    if (forecastMetricOptions.length === 0) {
+      if (forecastMetricField) {
+        setForecastMetricField('');
+      }
+      return;
+    }
+    if (!forecastMetricOptions.includes(forecastMetricField)) {
+      setForecastMetricField(forecastMetricOptions[0]);
+    }
+  }, [forecastMetricField, forecastMetricOptions]);
+
+  useEffect(() => {
     if (dashboardCharts.length === 0) {
       setSelectedChartKey(null);
       return;
@@ -865,6 +954,21 @@ export function AIAnalyticsDashboard() {
   async function refreshDocuments() {
     const response = await listDocuments(userId);
     setDocuments(response.documents ?? []);
+  }
+
+  async function refreshSavedInvestigations(targetDatasetId: string) {
+    const response = await getSavedInvestigations(targetDatasetId, userId);
+    setSavedInvestigations(response.investigations ?? []);
+  }
+
+  async function refreshSavedPlaybooks(targetDatasetId: string) {
+    const response = await getSavedPlaybooks(targetDatasetId, userId);
+    setSavedPlaybooks(response.playbooks ?? []);
+  }
+
+  async function refreshForecastRuns(targetDatasetId: string) {
+    const response = await getForecastRuns(targetDatasetId, userId);
+    setForecastRuns(response.runs ?? []);
   }
 
   async function refreshWorkflowActions(targetDatasetId: string) {
@@ -883,6 +987,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setForecastRuns([]);
+      setSavedInvestigations([]);
+      setSavedPlaybooks([]);
       setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
@@ -902,7 +1009,7 @@ export function AIAnalyticsDashboard() {
 
   async function handleUploadDocument() {
     if (!selectedDocumentFile) {
-      setError('Choose a TXT, MD, HTML, or JSON document first.');
+      setError('Choose a TXT, MD, HTML, JSON, or text-based PDF document first.');
       return;
     }
 
@@ -961,6 +1068,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setForecastRuns([]);
+      setSavedInvestigations([]);
+      setSavedPlaybooks([]);
       setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
@@ -1000,6 +1110,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setForecastRuns([]);
+      setSavedInvestigations([]);
+      setSavedPlaybooks([]);
       setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
@@ -1119,6 +1232,62 @@ export function AIAnalyticsDashboard() {
       );
     } catch (anomalyError) {
       setError(anomalyError instanceof Error ? anomalyError.message : 'Anomaly detection failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleTrainForecast() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!profile) {
+      setBusyAction('forecast_profile');
+      setError(null);
+      setNotice(null);
+      try {
+        const response = await getProfile(datasetId, userId);
+        setProfile(response.profile);
+        setSessionMeta(await getSession(datasetId, userId));
+        setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+        setNotice('Profile loaded. Choose governed time and metric fields, then train the forecast again.');
+      } catch (profileError) {
+        setError(profileError instanceof Error ? profileError.message : 'Failed to load profile for forecast training.');
+      } finally {
+        setBusyAction(null);
+      }
+      return;
+    }
+    if (!forecastTimeField || !forecastMetricField) {
+      setError('Choose governed time and metric fields for the forecast.');
+      return;
+    }
+
+    const parsedHorizon = Number.parseInt(forecastHorizon, 10);
+    if (!Number.isFinite(parsedHorizon) || parsedHorizon < 1 || parsedHorizon > 12) {
+      setError('Forecast horizon must be between 1 and 12 periods.');
+      return;
+    }
+
+    setBusyAction('forecast');
+    setError(null);
+    setNotice(null);
+    try {
+      const run = await trainForecastRun(datasetId, userId, {
+        name: forecastName.trim() || undefined,
+        time_field: forecastTimeField,
+        metric_field: forecastMetricField,
+        horizon: parsedHorizon,
+        aggregation: forecastAggregation,
+      });
+      await refreshForecastRuns(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setForecastName('');
+      setNotice(`Forecast run completed with champion model ${run.payload.champion_model}.`);
+    } catch (forecastError) {
+      setError(forecastError instanceof Error ? forecastError.message : 'Forecast training failed.');
     } finally {
       setBusyAction(null);
     }
@@ -1247,6 +1416,77 @@ export function AIAnalyticsDashboard() {
       );
     } catch (cohortError) {
       setError(cohortError instanceof Error ? cohortError.message : 'Cohort generation failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleSaveInvestigation() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!askResult || !askQuestion.trim()) {
+      setError('Run a governed ask-data investigation before saving it.');
+      return;
+    }
+
+    setBusyAction('save_investigation');
+    setError(null);
+    setNotice(null);
+    try {
+      const saved = await saveInvestigation(datasetId, userId, {
+        title: investigationTitle.trim() || undefined,
+        question: askQuestion.trim(),
+        context_type: 'ask',
+        note: investigationNote.trim() || undefined,
+        result: askResult as unknown as Record<string, unknown>,
+      });
+      await refreshSavedInvestigations(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setInvestigationTitle('');
+      setInvestigationNote('');
+      setNotice(`Saved investigation: ${saved.title}.`);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Saving the investigation failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleSavePlaybook() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!askQuestion.trim()) {
+      setError('Enter a governed question before saving a playbook.');
+      return;
+    }
+    if (!playbookName.trim()) {
+      setError('Enter a playbook name first.');
+      return;
+    }
+
+    setBusyAction('save_playbook');
+    setError(null);
+    setNotice(null);
+    try {
+      const saved = await savePlaybook(datasetId, userId, {
+        name: playbookName.trim(),
+        question_template: askQuestion.trim(),
+        description: playbookDescription.trim() || undefined,
+        context_type: 'ask',
+      });
+      await refreshSavedPlaybooks(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setPlaybookName('');
+      setPlaybookDescription('');
+      setNotice(`Saved playbook: ${saved.name}.`);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Saving the playbook failed.');
     } finally {
       setBusyAction(null);
     }
@@ -2595,6 +2835,213 @@ export function AIAnalyticsDashboard() {
       <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
         <div className="flex items-center gap-2">
           <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+            <BarChart3 className="h-5 w-5" />
+          </div>
+          <div>
+            <h3 className="text-lg font-medium text-foreground">Governed Forecast Lab</h3>
+            <p className="text-sm text-muted-foreground">
+              Train audited forecast runs on governed time-series fields, compare candidate models, and persist the champion run in session artifacts.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 xl:grid-cols-[1.2fr_1fr_1fr_160px_150px_auto]">
+          <Input
+            value={forecastName}
+            onChange={(event) => setForecastName(event.target.value)}
+            placeholder="Optional run name"
+          />
+          <select
+            value={forecastTimeField}
+            onChange={(event) => setForecastTimeField(event.target.value)}
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+            disabled={forecastTimeOptions.length === 0}
+          >
+            {forecastTimeOptions.length === 0 ? <option value="">Load profile first</option> : null}
+            {forecastTimeOptions.map((field) => (
+              <option key={field} value={field}>
+                {field}
+              </option>
+            ))}
+          </select>
+          <select
+            value={forecastMetricField}
+            onChange={(event) => setForecastMetricField(event.target.value)}
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+            disabled={forecastMetricOptions.length === 0}
+          >
+            {forecastMetricOptions.length === 0 ? <option value="">Load profile first</option> : null}
+            {forecastMetricOptions.map((field) => (
+              <option key={field} value={field}>
+                {field}
+              </option>
+            ))}
+          </select>
+          <select
+            value={forecastAggregation}
+            onChange={(event) => setForecastAggregation(event.target.value as 'sum' | 'mean')}
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+          >
+            <option value="sum">Monthly sum</option>
+            <option value="mean">Monthly mean</option>
+          </select>
+          <Input
+            value={forecastHorizon}
+            onChange={(event) => setForecastHorizon(event.target.value)}
+            inputMode="numeric"
+            placeholder="Horizon"
+          />
+          <Button type="button" onClick={() => void handleTrainForecast()} disabled={busyAction === 'forecast' || busyAction === 'forecast_profile' || !datasetId || !canCompute}>
+            {busyAction === 'forecast' || busyAction === 'forecast_profile' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
+            Train Forecast
+          </Button>
+        </div>
+
+        {forecastTimeOptions.length === 0 || forecastMetricOptions.length === 0 ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            Load a governed profile with at least one datetime field and one numeric metric to enable forecast training.
+          </div>
+        ) : null}
+
+        {latestForecastRun ? (
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline">Champion: {latestForecastRun.payload.champion_model}</Badge>
+                <Badge variant="outline">Metric: {latestForecastRun.payload.metric_field}</Badge>
+                <Badge variant="outline">Periods used: {latestForecastRun.payload.periods_used}</Badge>
+                <Badge variant="outline">Horizon: {latestForecastRun.payload.horizon}</Badge>
+              </div>
+              <p className="mt-3 text-sm text-foreground">{latestForecastRun.payload.summary}</p>
+              {latestForecastRun.payload.warnings.length > 0 ? (
+                <div className="mt-3 space-y-2">
+                  {latestForecastRun.payload.warnings.map((warning) => (
+                    <div key={warning} className="rounded-lg border border-health-mint/20 bg-health-mint/10 px-3 py-2 text-xs text-foreground">
+                      {warning}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Candidate model comparison</p>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="min-w-full text-left text-xs">
+                    <thead className="text-muted-foreground">
+                      <tr>
+                        <th className="pb-2 pr-3 font-medium">Model</th>
+                        <th className="pb-2 pr-3 font-medium">MAE</th>
+                        <th className="pb-2 pr-3 font-medium">RMSE</th>
+                        <th className="pb-2 pr-3 font-medium">MAPE</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-foreground">
+                      {latestForecastRun.payload.candidate_models.map((candidate) => (
+                        <tr key={candidate.model_name} className="border-t border-border/60">
+                          <td className="py-2 pr-3">
+                            <div className="flex items-center gap-2">
+                              <span>{candidate.model_name}</span>
+                              {candidate.model_name === latestForecastRun.payload.champion_model ? <Badge variant="outline">Champion</Badge> : null}
+                            </div>
+                          </td>
+                          <td className="py-2 pr-3">{candidate.mae.toFixed(2)}</td>
+                          <td className="py-2 pr-3">{candidate.rmse.toFixed(2)}</td>
+                          <td className="py-2 pr-3">{candidate.mape !== null && candidate.mape !== undefined ? `${candidate.mape.toFixed(2)}%` : 'n/a'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Forecast output</p>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="min-w-full text-left text-xs">
+                    <thead className="text-muted-foreground">
+                      <tr>
+                        <th className="pb-2 pr-3 font-medium">Period</th>
+                        <th className="pb-2 pr-3 font-medium">Projected value</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-foreground">
+                      {latestForecastRun.payload.forecast.map((point) => (
+                        <tr key={point.period} className="border-t border-border/60">
+                          <td className="py-2 pr-3">{point.period}</td>
+                          <td className="py-2 pr-3">{point.value.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Recent historical periods</p>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="min-w-full text-left text-xs">
+                    <thead className="text-muted-foreground">
+                      <tr>
+                        <th className="pb-2 pr-3 font-medium">Period</th>
+                        <th className="pb-2 pr-3 font-medium">Actual value</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-foreground">
+                      {latestForecastRun.payload.historical.slice(-8).map((point) => (
+                        <tr key={point.period} className="border-t border-border/60">
+                          <td className="py-2 pr-3">{point.period}</td>
+                          <td className="py-2 pr-3">{point.value.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border bg-background p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-sm font-medium text-foreground">Saved model runs</p>
+                  <Badge variant="outline">{forecastRuns.length}</Badge>
+                </div>
+                {forecastRuns.length === 0 ? (
+                  <p className="mt-3 text-sm text-muted-foreground">No forecast runs have been saved for this session yet.</p>
+                ) : (
+                  <div className="mt-3 space-y-3">
+                    {forecastRuns.slice(0, 5).map((run) => (
+                      <div key={run.run_id} className="rounded-lg border border-border/70 bg-card p-3">
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-medium text-foreground">{run.payload.name}</p>
+                            <p className="mt-1 text-xs text-muted-foreground">{run.payload.summary}</p>
+                          </div>
+                          <Badge variant="outline">{run.payload.champion_model}</Badge>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Badge variant="outline">{run.payload.metric_field}</Badge>
+                          <Badge variant="outline">{run.payload.aggregation}</Badge>
+                          <Badge variant="outline">{new Date(run.created_at).toLocaleString()}</Badge>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            No governed forecast runs have been trained for this session yet.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <div className="flex items-center gap-2">
+          <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
             <Sparkles className="h-5 w-5" />
           </div>
           <div>
@@ -2623,6 +3070,139 @@ export function AIAnalyticsDashboard() {
               title="Result Rows"
               emptyRowsMessage="No tabular rows were returned for this question."
             />
+
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Save Investigation</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Capture this governed result with its question and inspector payload so it can be reopened later.
+                </p>
+                <div className="mt-3 space-y-3">
+                  <Input
+                    value={investigationTitle}
+                    onChange={(event) => setInvestigationTitle(event.target.value)}
+                    placeholder="Optional investigation title"
+                  />
+                  <Textarea
+                    value={investigationNote}
+                    onChange={(event) => setInvestigationNote(event.target.value)}
+                    placeholder="Optional note about why this investigation matters."
+                    className="min-h-[90px]"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void handleSaveInvestigation()}
+                    disabled={busyAction === 'save_investigation' || !canWriteSession}
+                  >
+                    {busyAction === 'save_investigation' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <FileText className="mr-2 h-4 w-4" />}
+                    Save Investigation
+                  </Button>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border bg-background p-4">
+                <p className="text-sm font-medium text-foreground">Save Playbook</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Turn the current governed question into a reusable playbook template for future runs.
+                </p>
+                <div className="mt-3 space-y-3">
+                  <Input
+                    value={playbookName}
+                    onChange={(event) => setPlaybookName(event.target.value)}
+                    placeholder="Playbook name"
+                  />
+                  <Textarea
+                    value={playbookDescription}
+                    onChange={(event) => setPlaybookDescription(event.target.value)}
+                    placeholder="Optional description of when to use this playbook."
+                    className="min-h-[90px]"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void handleSavePlaybook()}
+                    disabled={busyAction === 'save_playbook' || !canWriteSession}
+                  >
+                    {busyAction === 'save_playbook' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
+                    Save Playbook
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {(savedInvestigations.length > 0 || savedPlaybooks.length > 0) ? (
+          <div className="mt-4 grid gap-4 xl:grid-cols-2">
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-medium text-foreground">Saved Investigations</p>
+                <Badge variant="outline">{savedInvestigations.length}</Badge>
+              </div>
+              {savedInvestigations.length === 0 ? (
+                <p className="mt-3 text-sm text-muted-foreground">No investigations saved for this session yet.</p>
+              ) : (
+                <div className="mt-3 space-y-3">
+                  {savedInvestigations.slice(0, 6).map((item) => (
+                    <div key={item.investigation_id} className="rounded-lg border border-border/70 bg-card p-3">
+                      <p className="text-sm font-medium text-foreground">{item.title}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{item.question}</p>
+                      {item.note ? <p className="mt-2 text-xs text-muted-foreground">{item.note}</p> : null}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Badge variant="outline">{item.context_type}</Badge>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setAskQuestion(item.question);
+                            setAskResult(item.result as AskResponsePayload);
+                            setNotice(`Loaded saved investigation: ${item.title}.`);
+                          }}
+                        >
+                          Load
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-border bg-background p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-medium text-foreground">Saved Playbooks</p>
+                <Badge variant="outline">{savedPlaybooks.length}</Badge>
+              </div>
+              {savedPlaybooks.length === 0 ? (
+                <p className="mt-3 text-sm text-muted-foreground">No playbooks saved for this session yet.</p>
+              ) : (
+                <div className="mt-3 space-y-3">
+                  {savedPlaybooks.slice(0, 6).map((item) => (
+                    <div key={item.playbook_id} className="rounded-lg border border-border/70 bg-card p-3">
+                      <p className="text-sm font-medium text-foreground">{item.name}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{item.question_template}</p>
+                      {item.description ? <p className="mt-2 text-xs text-muted-foreground">{item.description}</p> : null}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Badge variant="outline">{item.context_type}</Badge>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setAskQuestion(item.question_template);
+                            setNotice(`Loaded playbook: ${item.name}.`);
+                          }}
+                        >
+                          Load
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         ) : null}
       </section>

@@ -361,6 +361,104 @@ class WorkflowActionsResponse(BaseModel):
     actions: list[WorkflowActionRecord] = Field(default_factory=list)
 
 
+class InvestigationSaveRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=180)
+    question: str = Field(min_length=3, max_length=2000)
+    context_type: str = Field(default="ask", max_length=64)
+    note: str | None = Field(default=None, max_length=1000)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class SavedInvestigationRecord(BaseModel):
+    investigation_id: str
+    title: str
+    question: str
+    context_type: str
+    note: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    created_by: str
+
+
+class SavedInvestigationsResponse(BaseModel):
+    dataset_id: str
+    investigations: list[SavedInvestigationRecord] = Field(default_factory=list)
+
+
+class PlaybookSaveRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=180)
+    question_template: str = Field(min_length=3, max_length=2000)
+    description: str | None = Field(default=None, max_length=1000)
+    context_type: str = Field(default="ask", max_length=64)
+
+
+class SavedPlaybookRecord(BaseModel):
+    playbook_id: str
+    name: str
+    question_template: str
+    description: str | None = None
+    context_type: str
+    created_at: str
+    created_by: str
+
+
+class SavedPlaybooksResponse(BaseModel):
+    dataset_id: str
+    playbooks: list[SavedPlaybookRecord] = Field(default_factory=list)
+
+
+class ForecastTrainRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=160)
+    time_field: str | None = Field(default=None, max_length=200)
+    metric_field: str | None = Field(default=None, max_length=200)
+    horizon: int = Field(default=3, ge=1, le=12)
+    aggregation: str = Field(default="sum", max_length=16)
+
+
+class ForecastSeriesPoint(BaseModel):
+    period: str
+    value: float
+
+
+class ForecastCandidateMetrics(BaseModel):
+    model_name: str
+    mae: float
+    rmse: float
+    mape: float | None = None
+    holdout_points: int
+
+
+class ForecastRunPayload(BaseModel):
+    generated_at: str
+    name: str
+    time_field: str
+    metric_field: str
+    aggregation: str
+    periods_used: int
+    holdout_points: int
+    horizon: int
+    champion_model: str
+    summary: str
+    warnings: list[str] = Field(default_factory=list)
+    candidate_models: list[ForecastCandidateMetrics] = Field(default_factory=list)
+    historical: list[ForecastSeriesPoint] = Field(default_factory=list)
+    forecast: list[ForecastSeriesPoint] = Field(default_factory=list)
+
+
+class ForecastRunRecord(BaseModel):
+    run_id: str
+    model_kind: str
+    status: str
+    created_at: str
+    created_by: str
+    payload: ForecastRunPayload
+
+
+class ForecastRunsResponse(BaseModel):
+    dataset_id: str
+    runs: list[ForecastRunRecord] = Field(default_factory=list)
+
+
 class ReportResponse(BaseModel):
     dataset_id: str
     report_html_path: str
@@ -542,6 +640,18 @@ def _workflow_actions_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "workflow_actions.json"
 
 
+def _saved_investigations_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "saved_investigations.json"
+
+
+def _saved_playbooks_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "saved_playbooks.json"
+
+
+def _ml_runs_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "ml_runs.json"
+
+
 def _dashboard_spec_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "dashboard_spec.json"
 
@@ -615,6 +725,66 @@ def _save_workflow_actions(dataset_id: str, actions: list[dict[str, Any]]) -> No
             "dataset_id": dataset_id,
             "generated_at": _utc_now_iso(),
             "actions": actions,
+        },
+    )
+
+
+def _load_saved_investigations(dataset_id: str) -> list[dict[str, Any]]:
+    path = _saved_investigations_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("investigations") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_saved_investigations(dataset_id: str, investigations: list[dict[str, Any]]) -> None:
+    _save_json(
+        _saved_investigations_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "investigations": investigations,
+        },
+    )
+
+
+def _load_saved_playbooks(dataset_id: str) -> list[dict[str, Any]]:
+    path = _saved_playbooks_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("playbooks") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_saved_playbooks(dataset_id: str, playbooks: list[dict[str, Any]]) -> None:
+    _save_json(
+        _saved_playbooks_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "playbooks": playbooks,
+        },
+    )
+
+
+def _load_ml_runs(dataset_id: str) -> list[dict[str, Any]]:
+    path = _ml_runs_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("runs") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_ml_runs(dataset_id: str, runs: list[dict[str, Any]]) -> None:
+    _save_json(
+        _ml_runs_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "runs": runs,
         },
     )
 
@@ -2335,6 +2505,180 @@ def _build_anomaly_analysis(df: pd.DataFrame, profile: dict[str, Any], limit: in
     }
 
 
+def _forecast_last_value(history: list[float], horizon: int) -> list[float]:
+    baseline = history[-1] if history else 0.0
+    return [round(float(baseline), 4) for _ in range(horizon)]
+
+
+def _forecast_moving_average(history: list[float], horizon: int, window: int = 3) -> list[float]:
+    rolling = [float(value) for value in history]
+    predictions: list[float] = []
+    for _ in range(horizon):
+        slice_width = min(window, len(rolling))
+        baseline = sum(rolling[-slice_width:]) / max(slice_width, 1) if slice_width else 0.0
+        baseline = round(float(baseline), 4)
+        predictions.append(baseline)
+        rolling.append(baseline)
+    return predictions
+
+
+def _forecast_linear_trend(history: list[float], horizon: int) -> list[float]:
+    if not history:
+        return [0.0 for _ in range(horizon)]
+    if len(history) == 1:
+        return [round(float(history[0]), 4) for _ in range(horizon)]
+
+    x_values = list(range(len(history)))
+    x_mean = sum(x_values) / len(x_values)
+    y_mean = sum(history) / len(history)
+    denominator = sum((x - x_mean) ** 2 for x in x_values)
+    slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, history, strict=True)) / denominator if denominator else 0.0
+    intercept = y_mean - (slope * x_mean)
+    return [round(float(max(intercept + (slope * (len(history) + step)), 0.0)), 4) for step in range(horizon)]
+
+
+def _forecast_error_metrics(actual: list[float], predicted: list[float]) -> dict[str, Any]:
+    absolute_errors = [abs(a - p) for a, p in zip(actual, predicted, strict=True)]
+    squared_errors = [(a - p) ** 2 for a, p in zip(actual, predicted, strict=True)]
+    percentage_errors = [abs((a - p) / a) * 100 for a, p in zip(actual, predicted, strict=True) if a != 0]
+    mae = round(sum(absolute_errors) / len(absolute_errors), 4) if absolute_errors else 0.0
+    rmse = round((sum(squared_errors) / len(squared_errors)) ** 0.5, 4) if squared_errors else 0.0
+    mape = round(sum(percentage_errors) / len(percentage_errors), 2) if percentage_errors else None
+    return {"mae": mae, "rmse": rmse, "mape": mape}
+
+
+def _aggregate_forecast_series(
+    df: pd.DataFrame,
+    *,
+    time_field: str,
+    metric_field: str,
+    aggregation: str,
+) -> pd.Series:
+    if aggregation not in {"sum", "mean"}:
+        raise HTTPException(status_code=400, detail="Aggregation must be one of: sum, mean.")
+    if time_field not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Time field {time_field} was not found in the dataset.")
+    if metric_field not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Metric field {metric_field} was not found in the dataset.")
+
+    scoped = df[[time_field, metric_field]].copy()
+    scoped[time_field] = pd.to_datetime(scoped[time_field], errors="coerce")
+    scoped[metric_field] = pd.to_numeric(scoped[metric_field], errors="coerce")
+    scoped = scoped.dropna()
+
+    if scoped.empty:
+        raise HTTPException(status_code=400, detail="The selected forecast fields did not produce any valid time-series rows.")
+
+    grouped_source = scoped.assign(period=scoped[time_field].dt.to_period("M")).groupby("period")[metric_field]
+    grouped = grouped_source.mean().sort_index() if aggregation == "mean" else grouped_source.sum().sort_index()
+    grouped = grouped.dropna()
+
+    if len(grouped) < 6:
+        raise HTTPException(status_code=400, detail="Forecast training requires at least 6 monthly periods with valid values.")
+
+    return grouped
+
+
+def _build_forecast_run(df: pd.DataFrame, profile: dict[str, Any], request: ForecastTrainRequest) -> dict[str, Any]:
+    time_candidates = _time_candidates(profile)
+    metric_candidates = _numeric_metric_candidates(profile)
+
+    time_field = request.time_field.strip() if request.time_field and request.time_field.strip() else (time_candidates[0] if time_candidates else "")
+    metric_field = request.metric_field.strip() if request.metric_field and request.metric_field.strip() else (metric_candidates[0] if metric_candidates else "")
+
+    if not time_field:
+        raise HTTPException(status_code=400, detail="No governed time field is available for forecasting.")
+    if not metric_field:
+        raise HTTPException(status_code=400, detail="No governed numeric metric is available for forecasting.")
+
+    grouped = _aggregate_forecast_series(
+        df,
+        time_field=time_field,
+        metric_field=metric_field,
+        aggregation=request.aggregation.strip().lower() or "sum",
+    )
+
+    values = [round(float(value), 4) for value in grouped.tolist()]
+    holdout_points = min(max(int(request.horizon), 2), max(2, len(values) // 3))
+    if len(values) - holdout_points < 4:
+        raise HTTPException(status_code=400, detail="Forecast training needs more historical periods before a holdout evaluation can run.")
+
+    train_values = values[:-holdout_points]
+    actual_values = values[-holdout_points:]
+    candidate_builders = {
+        "last_value": lambda history, horizon: _forecast_last_value(history, horizon),
+        "moving_average_3": lambda history, horizon: _forecast_moving_average(history, horizon, window=3),
+        "linear_trend": lambda history, horizon: _forecast_linear_trend(history, horizon),
+    }
+
+    candidate_models: list[dict[str, Any]] = []
+    for model_name, builder in candidate_builders.items():
+        holdout_predictions = builder(train_values, holdout_points)
+        metrics = _forecast_error_metrics(actual_values, holdout_predictions)
+        candidate_models.append(
+            {
+                "model_name": model_name,
+                "holdout_points": holdout_points,
+                **metrics,
+            }
+        )
+
+    candidate_models.sort(key=lambda item: (float(item["mae"]), float(item["rmse"])))
+    champion = candidate_models[0]
+    champion_model = str(champion["model_name"])
+    future_values = candidate_builders[champion_model](values, int(request.horizon))
+
+    period_index = grouped.index
+    warnings: list[str] = []
+    if len(grouped) < 12:
+        warnings.append("Forecast uses fewer than 12 monthly periods, so long-horizon confidence is limited.")
+    expected_index = pd.period_range(start=period_index[0], end=period_index[-1], freq="M")
+    if len(expected_index) != len(period_index):
+        warnings.append("Missing monthly periods were detected; the forecast treats gaps as missing history rather than zero activity.")
+
+    latest_actual = values[-1]
+    latest_forecast = future_values[-1]
+    if latest_actual == 0:
+        direction = "flat"
+    else:
+        delta_ratio = (latest_forecast - latest_actual) / latest_actual
+        if delta_ratio > 0.05:
+            direction = "upward"
+        elif delta_ratio < -0.05:
+            direction = "downward"
+        else:
+            direction = "stable"
+
+    summary = (
+        f"Champion model {champion_model} forecasted {metric_field} with {champion['mae']:.2f} MAE "
+        f"across {holdout_points} holdout month(s). The governed projection for the next {request.horizon} month(s) is {direction}."
+    )
+
+    latest_period = period_index[-1]
+    forecast_points = [
+        {"period": str(latest_period + step), "value": round(float(value), 4)}
+        for step, value in enumerate(future_values, start=1)
+    ]
+    historical_points = [{"period": str(period), "value": round(float(value), 4)} for period, value in grouped.tail(18).items()]
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "name": request.name.strip() if request.name and request.name.strip() else f"{metric_field} monthly forecast",
+        "time_field": time_field,
+        "metric_field": metric_field,
+        "aggregation": request.aggregation.strip().lower() or "sum",
+        "periods_used": len(grouped),
+        "holdout_points": holdout_points,
+        "horizon": int(request.horizon),
+        "champion_model": champion_model,
+        "summary": summary,
+        "warnings": warnings,
+        "candidate_models": candidate_models,
+        "historical": historical_points,
+        "forecast": forecast_points,
+    }
+
+
 def _pii_aliases(profile: dict[str, Any]) -> dict[str, str]:
     pii_columns = profile.get("pii_candidates", []) if profile else []
     return {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
@@ -3887,6 +4231,158 @@ def build_cohort_analysis(
         },
     )
     return CohortAnalysisResponse(dataset_id=dataset_id, cohort=CohortAnalysisPayload(**analysis))
+
+
+@app.get("/sessions/{dataset_id}/investigations", response_model=SavedInvestigationsResponse)
+def list_saved_investigations(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SavedInvestigationsResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return SavedInvestigationsResponse(
+        dataset_id=dataset_id,
+        investigations=[SavedInvestigationRecord(**item) for item in _load_saved_investigations(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/investigations", response_model=SavedInvestigationRecord)
+def save_investigation(
+    dataset_id: str,
+    payload: InvestigationSaveRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SavedInvestigationRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
+    title = payload.title.strip() if payload.title and payload.title.strip() else payload.question.strip()[:120]
+    record = {
+        "investigation_id": str(uuid.uuid4()),
+        "title": title,
+        "question": payload.question.strip(),
+        "context_type": payload.context_type.strip() or "ask",
+        "note": payload.note.strip() if payload.note and payload.note.strip() else None,
+        "result": payload.result,
+        "created_at": _utc_now_iso(),
+        "created_by": actor,
+    }
+    investigations = [record, *_load_saved_investigations(dataset_id)]
+    _save_saved_investigations(dataset_id, investigations)
+    meta.setdefault("artifacts", {})["investigations"] = str(_saved_investigations_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "investigation_saved",
+        actor,
+        {"investigation_id": record["investigation_id"], "context_type": record["context_type"], "title": title},
+    )
+    return SavedInvestigationRecord(**record)
+
+
+@app.get("/sessions/{dataset_id}/playbooks", response_model=SavedPlaybooksResponse)
+def list_saved_playbooks(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SavedPlaybooksResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return SavedPlaybooksResponse(
+        dataset_id=dataset_id,
+        playbooks=[SavedPlaybookRecord(**item) for item in _load_saved_playbooks(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/playbooks", response_model=SavedPlaybookRecord)
+def save_playbook(
+    dataset_id: str,
+    payload: PlaybookSaveRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SavedPlaybookRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
+    record = {
+        "playbook_id": str(uuid.uuid4()),
+        "name": payload.name.strip(),
+        "question_template": payload.question_template.strip(),
+        "description": payload.description.strip() if payload.description and payload.description.strip() else None,
+        "context_type": payload.context_type.strip() or "ask",
+        "created_at": _utc_now_iso(),
+        "created_by": actor,
+    }
+    playbooks = [record, *_load_saved_playbooks(dataset_id)]
+    _save_saved_playbooks(dataset_id, playbooks)
+    meta.setdefault("artifacts", {})["playbooks"] = str(_saved_playbooks_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "playbook_saved",
+        actor,
+        {"playbook_id": record["playbook_id"], "name": record["name"], "context_type": record["context_type"]},
+    )
+    return SavedPlaybookRecord(**record)
+
+
+@app.get("/sessions/{dataset_id}/ml-runs", response_model=ForecastRunsResponse)
+def list_ml_runs(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ForecastRunsResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return ForecastRunsResponse(
+        dataset_id=dataset_id,
+        runs=[ForecastRunRecord(**item) for item in _load_ml_runs(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/ml-runs/forecast", response_model=ForecastRunRecord)
+def train_forecast_run(
+    dataset_id: str,
+    request: ForecastTrainRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ForecastRunRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    try:
+        df = _read_uploaded_file(meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    profile = _load_profile_if_exists(dataset_id)
+    if profile is None:
+        profile = _build_profile(df)
+        _save_json(_profile_path(dataset_id), profile)
+        meta.setdefault("artifacts", {})["profile"] = str(_profile_path(dataset_id))
+
+    payload = _build_forecast_run(df, profile, request)
+    record = {
+        "run_id": str(uuid.uuid4()),
+        "model_kind": "forecast",
+        "status": "succeeded",
+        "created_at": _utc_now_iso(),
+        "created_by": actor,
+        "payload": payload,
+    }
+    runs = [record, *_load_ml_runs(dataset_id)]
+    _save_ml_runs(dataset_id, runs)
+    meta.setdefault("artifacts", {})["ml_runs"] = str(_ml_runs_path(dataset_id))
+    meta["status"] = "modeled"
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "ml_forecast_trained",
+        actor,
+        {
+            "run_id": record["run_id"],
+            "metric_field": payload["metric_field"],
+            "time_field": payload["time_field"],
+            "champion_model": payload["champion_model"],
+            "horizon": payload["horizon"],
+        },
+    )
+    return ForecastRunRecord(**record)
 
 
 @app.get("/sessions/{dataset_id}/workflow-actions", response_model=WorkflowActionsResponse)
