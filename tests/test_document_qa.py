@@ -9,8 +9,9 @@ import backend.main as main
 client = TestClient(main.app)
 
 
-def _upload_document(actor: str, filename: str, content: str) -> dict:
-    files = {"file": (filename, io.BytesIO(content.encode("utf-8")), "text/plain")}
+def _upload_document(actor: str, filename: str, content: str | bytes, content_type: str = "text/plain") -> dict:
+    payload = content.encode("utf-8") if isinstance(content, str) else content
+    files = {"file": (filename, io.BytesIO(payload), content_type)}
     response = client.post("/documents", files=files, headers={"X-API-Key": actor})
     assert response.status_code == 200
     return response.json()
@@ -50,6 +51,42 @@ def test_document_qa_returns_grounded_citations() -> None:
     assert payload["citations"]
     assert payload["citations"][0]["document_id"] == uploaded["document_id"]
     assert "Denominator exclusions" in payload["answer"]
+
+
+def test_pdf_documents_are_ingested_when_text_is_extractable(monkeypatch) -> None:
+    actor = f"doc_pdf_actor_{uuid4().hex}"
+
+    class _FakePdfPage:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class _FakePdfReader:
+        def __init__(self, _stream: io.BytesIO) -> None:
+            self.pages = [
+                _FakePdfPage("Policy update: denominator exclusions require clinical lead approval."),
+                _FakePdfPage("Escalate unresolved measure disputes within five business days."),
+            ]
+
+    monkeypatch.setattr(main, "PdfReader", _FakePdfReader)
+
+    uploaded = _upload_document(actor, "policy.pdf", b"%PDF-1.4 fake pdf bytes", "application/pdf")
+    assert uploaded["file_type"] == "pdf"
+
+    response = client.post(
+        "/documents/ask",
+        json={"question": "What do the trusted documents say about denominator exclusions?"},
+        headers={"X-API-Key": actor},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["grounded"] is True
+    assert payload["citations"]
+    assert payload["citations"][0]["document_id"] == uploaded["document_id"]
+    assert "denominator exclusions" in payload["answer"].lower()
 
 
 def test_viewer_cannot_upload_documents() -> None:

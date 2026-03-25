@@ -2004,7 +2004,7 @@ export function AIAnalyticsDashboard() {
         <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
           <Input
             type="file"
-            accept=".txt,.md,.html,.htm,.json"
+            accept=".txt,.md,.html,.htm,.json,.pdf"
             onChange={(event) => setSelectedDocumentFile(event.target.files?.[0] ?? null)}
           />
           <Button
@@ -2042,7 +2042,7 @@ export function AIAnalyticsDashboard() {
           </div>
         ) : (
           <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
-            No trusted documents uploaded yet. This first slice supports TXT, MD, HTML, and JSON sources.
+            No trusted documents uploaded yet. This slice supports TXT, MD, HTML, JSON, and text-based PDF sources.
           </div>
         )}
 

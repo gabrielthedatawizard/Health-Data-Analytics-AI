@@ -18,6 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
+try:
+    from pypdf import PdfReader
+except Exception:  # noqa: PERF203
+    PdfReader = None
+
 from backend.api import router as ai_analytics_router
 from backend.cache import CacheManager
 from backend.jobs import create_job, get_job, list_jobs, update_job
@@ -67,7 +72,7 @@ SAMPLE_MAX_ROWS = 250_000
 CACHE_VERSION = "v1"
 DOCUMENT_LIBRARY_DIR = DATA_DIR / "document_library"
 DOCUMENT_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-SUPPORTED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".pdf"}
 MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
 DOCUMENT_CHUNK_SIZE = 900
 DOCUMENT_CHUNK_OVERLAP = 120
@@ -912,6 +917,28 @@ def _read_document_text(content: bytes, extension: str) -> str:
         except Exception as exc:
             raise ValueError(f"Could not parse JSON document: {exc}") from exc
         return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+    if extension == ".pdf":
+        if PdfReader is None:
+            raise ValueError("PDF document support requires the pypdf package to be installed.")
+        try:
+            reader = PdfReader(io.BytesIO(content))
+        except Exception as exc:
+            raise ValueError(f"Could not parse PDF document: {exc}") from exc
+
+        pages: list[str] = []
+        for index, page in enumerate(reader.pages):
+            try:
+                extracted = page.extract_text() or ""
+            except Exception as exc:
+                raise ValueError(f"Could not extract text from PDF page {index + 1}: {exc}") from exc
+            extracted = extracted.strip()
+            if extracted:
+                pages.append(f"[Page {index + 1}]\n{extracted}")
+
+        if not pages:
+            raise ValueError("PDF did not contain extractable text. Scanned PDFs without a text layer are not supported yet.")
+        return "\n\n".join(pages)
 
     raise ValueError(f"Unsupported document type '{extension}'.")
 
