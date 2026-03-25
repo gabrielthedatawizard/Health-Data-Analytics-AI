@@ -108,6 +108,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:compute_own",
         "sessions:export_own",
         "sensitive_export:request_own",
+        "workflow:create_own",
+        "workflow:execute_own",
         "docs:create",
         "docs:read_own",
     ],
@@ -121,6 +123,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:export_all",
         "sensitive_export:request_own",
         "sensitive_export:review",
+        "workflow:create_own",
+        "workflow:review",
+        "workflow:execute_all",
         "docs:create",
         "docs:read_own",
         "docs:read_all",
@@ -132,11 +137,19 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "sessions:compute_all",
         "sessions:export_all",
         "sensitive_export:review",
+        "workflow:create_all",
+        "workflow:review",
+        "workflow:execute_all",
         "docs:create",
         "docs:read_all",
         "admin:all",
     ],
 }
+WORKFLOW_ACTION_TYPES = {"draft_email", "create_ticket", "action_plan", "schedule_report"}
+WORKFLOW_STATUS_PENDING = "pending_approval"
+WORKFLOW_STATUS_APPROVED = "approved"
+WORKFLOW_STATUS_REJECTED = "rejected"
+WORKFLOW_STATUS_EXECUTED = "executed"
 COHORT_OPERATOR_LABELS = {
     "eq": "equals",
     "neq": "does not equal",
@@ -298,6 +311,49 @@ class CohortAnalysisPayload(BaseModel):
 class CohortAnalysisResponse(BaseModel):
     dataset_id: str
     cohort: CohortAnalysisPayload
+
+
+class WorkflowDraftRequest(BaseModel):
+    action_type: str = Field(min_length=3, max_length=64)
+    title: str | None = Field(default=None, max_length=180)
+    target: str | None = Field(default=None, max_length=180)
+    objective: str | None = Field(default=None, max_length=1000)
+
+
+class WorkflowDecisionRequest(BaseModel):
+    approved: bool
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class WorkflowExecutionRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class WorkflowActionRecord(BaseModel):
+    action_id: str
+    action_type: str
+    status: str
+    title: str
+    target: str | None = None
+    objective: str | None = None
+    summary: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
+    generated_at: str
+    updated_at: str
+    created_by: str
+    review_note: str | None = None
+    reviewed_by: str | None = None
+    reviewed_at: str | None = None
+    executed_by: str | None = None
+    executed_at: str | None = None
+    execution_note: str | None = None
+    requires_approval: bool = True
+
+
+class WorkflowActionsResponse(BaseModel):
+    dataset_id: str
+    actions: list[WorkflowActionRecord] = Field(default_factory=list)
 
 
 class ReportResponse(BaseModel):
@@ -477,6 +533,9 @@ def _anomaly_path(dataset_id: str) -> Path:
 def _cohort_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "cohort_analysis.json"
 
+def _workflow_actions_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "workflow_actions.json"
+
 
 def _dashboard_spec_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "dashboard_spec.json"
@@ -533,6 +592,26 @@ def _load_document_meta(document_id: str) -> dict[str, Any]:
 def _save_document_meta(document_id: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = _utc_now_iso()
     _save_json(_document_meta_path(document_id), meta)
+
+
+def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
+    path = _workflow_actions_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    actions = payload.get("actions") if isinstance(payload, dict) else []
+    return [item for item in actions if isinstance(item, dict)]
+
+
+def _save_workflow_actions(dataset_id: str, actions: list[dict[str, Any]]) -> None:
+    _save_json(
+        _workflow_actions_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "actions": actions,
+        },
+    )
 
 
 def _safe_directory_size(path: Path) -> int:
@@ -689,6 +768,12 @@ def _session_action_allowed(meta: dict[str, Any], actor: str, role: str, action:
         return owner or role == "reviewer"
     if action in {"write", "compute"}:
         return owner and role in {"analyst", "reviewer"}
+    if action == "draft_workflow":
+        return owner and role in {"analyst", "reviewer"}
+    if action == "review_workflow":
+        return role == "reviewer"
+    if action == "execute_workflow":
+        return role == "reviewer" or (owner and role in {"analyst", "reviewer"})
     if action == "export_masked":
         return owner or role == "reviewer"
     if action == "export_sensitive":
@@ -1772,6 +1857,160 @@ def _build_cohort_analysis(
         "summary": summary,
         "suggested_questions": [item for item in suggested_questions if item][:4],
     }
+
+
+def _load_optional_json(path: Path) -> dict[str, Any] | None:
+    if path.exists():
+        return _load_json(path)
+    return None
+
+
+def _workflow_priority_from_context(profile: dict[str, Any] | None, anomalies: dict[str, Any] | None) -> str:
+    if anomalies and int(anomalies.get("anomaly_count") or 0) > 0:
+        strongest = (anomalies.get("anomalies") or [{}])[0]
+        return "high" if str(strongest.get("severity") or "").lower() == "high" else "medium"
+    if profile and float(profile.get("quality_score") or 100.0) < 70:
+        return "medium"
+    return "normal"
+
+
+def _workflow_evidence(
+    dataset_id: str,
+    meta: dict[str, Any],
+    profile: dict[str, Any] | None,
+    facts: dict[str, Any] | None,
+    anomalies: dict[str, Any] | None,
+    cohort: dict[str, Any] | None,
+) -> list[str]:
+    evidence: list[str] = []
+    dataset_label = str(meta.get("display_name") or (meta.get("file") or {}).get("filename") or dataset_id)
+    evidence.append(f"Session: {dataset_label}")
+
+    if profile:
+        shape = profile.get("shape") or {}
+        evidence.append(
+            f"Profile quality score {float(profile.get('quality_score') or 0.0):.1f} across "
+            f"{int(shape.get('rows') or 0)} rows and {int(shape.get('cols') or 0)} columns."
+        )
+
+    if facts:
+        coverage = facts.get("data_coverage") or {}
+        evidence.append(
+            f"Facts bundle coverage mode {coverage.get('mode', 'auto')} using {int(coverage.get('rows_used') or 0)} rows."
+        )
+
+    if anomalies and int(anomalies.get("anomaly_count") or 0) > 0:
+        first_anomaly = (anomalies.get("anomalies") or [{}])[0]
+        evidence.append(f"Strongest anomaly: {first_anomaly.get('title', 'governed anomaly')}.")
+
+    if cohort and int(cohort.get("row_count") or 0) > 0:
+        evidence.append(
+            f"Latest cohort matched {int(cohort.get('row_count') or 0)} of {int(cohort.get('population_row_count') or 0)} rows."
+        )
+
+    return evidence[:6]
+
+
+def _workflow_action_content(
+    dataset_id: str,
+    meta: dict[str, Any],
+    request: WorkflowDraftRequest,
+    profile: dict[str, Any] | None,
+    facts: dict[str, Any] | None,
+    anomalies: dict[str, Any] | None,
+    cohort: dict[str, Any] | None,
+) -> tuple[str, str, dict[str, Any], list[str]]:
+    action_type = request.action_type.strip().lower()
+    if action_type not in WORKFLOW_ACTION_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported workflow action type '{request.action_type}'.")
+
+    dataset_label = str(meta.get("display_name") or (meta.get("file") or {}).get("filename") or dataset_id)
+    target = request.target.strip() if request.target and request.target.strip() else None
+    objective = request.objective.strip() if request.objective and request.objective.strip() else None
+    evidence = _workflow_evidence(dataset_id, meta, profile, facts, anomalies, cohort)
+    priority = _workflow_priority_from_context(profile, anomalies)
+    signal = evidence[1] if len(evidence) > 1 else f"Governed analytics are available for {dataset_label}."
+    anomaly_signal = evidence[3] if len(evidence) > 3 else signal
+
+    if action_type == "draft_email":
+        title = request.title.strip() if request.title and request.title.strip() else f"Operations follow-up for {dataset_label}"
+        audience = target or "Operations team"
+        summary = f"Prepared a governed email draft for {audience} and queued it for approval before manual sending."
+        payload = {
+            "channel": "email",
+            "to": audience,
+            "subject": title,
+            "body": (
+                f"Hello {audience},\n\n"
+                f"We reviewed governed analytics for {dataset_label}. {signal} {anomaly_signal}\n\n"
+                f"Requested objective: {objective or 'Review the surfaced signal and agree on next steps.'}\n\n"
+                "This draft is approval-gated and has not been sent automatically."
+            ),
+        }
+        return title, summary, payload, evidence
+
+    if action_type == "create_ticket":
+        title = request.title.strip() if request.title and request.title.strip() else f"Investigate governed signal for {dataset_label}"
+        owner = target or "Quality operations"
+        summary = f"Prepared an investigation ticket draft for {owner} with evidence-backed context and approval controls."
+        payload = {
+            "system": "governed_investigation_queue",
+            "owner_recommendation": owner,
+            "priority": priority,
+            "title": title,
+            "description": (
+                f"Objective: {objective or 'Investigate the governed analytics signal and confirm impact.'}\n"
+                f"Dataset: {dataset_label}\n"
+                + "\n".join(f"- {item}" for item in evidence)
+            ),
+        }
+        return title, summary, payload, evidence
+
+    if action_type == "action_plan":
+        title = request.title.strip() if request.title and request.title.strip() else f"Action plan for {dataset_label}"
+        owner = target or "Quality improvement lead"
+        summary = f"Prepared a governed action plan for {owner} with explicit next steps and review requirements."
+        payload = {
+            "plan_owner": owner,
+            "objective": objective or "Stabilize the surfaced signal and confirm follow-up analysis.",
+            "steps": [
+                "Review the governed evidence with the responsible team.",
+                "Assign an owner and due date for the corrective action.",
+                "Run a follow-up governed analysis after the intervention.",
+            ],
+            "notes": evidence,
+        }
+        return title, summary, payload, evidence
+
+    title = request.title.strip() if request.title and request.title.strip() else f"Schedule report for {dataset_label}"
+    audience = target or "Quality committee"
+    summary = f"Prepared a governed report scheduling draft for {audience}; execution remains approval-gated."
+    payload = {
+        "schedule": "monthly",
+        "report_template": "health_report",
+        "audience": audience,
+        "objective": objective or "Deliver a recurring governed summary with approved evidence.",
+        "delivery_note": "Scheduler integration is not connected yet; execution is recorded as a manual governed task.",
+        "evidence": evidence,
+    }
+    return title, summary, payload, evidence
+
+
+def _workflow_action_execution_result(action_type: str) -> str:
+    if action_type == "draft_email":
+        return "Email draft marked ready for manual sending; external delivery integration is pending."
+    if action_type == "create_ticket":
+        return "Ticket draft marked executed in the governed workflow journal; external issue tracker integration is pending."
+    if action_type == "action_plan":
+        return "Action plan marked executed and ready for operational handoff."
+    return "Report scheduling request marked executed as a governed manual task."
+
+
+def _workflow_action_index(actions: list[dict[str, Any]], action_id: str) -> int:
+    for index, action in enumerate(actions):
+        if str(action.get("action_id")) == action_id:
+            return index
+    raise HTTPException(status_code=404, detail="Workflow action not found.")
 
 
 def _anomaly_priority(item: dict[str, Any]) -> tuple[int, float]:
@@ -3621,6 +3860,161 @@ def build_cohort_analysis(
         },
     )
     return CohortAnalysisResponse(dataset_id=dataset_id, cohort=CohortAnalysisPayload(**analysis))
+
+
+@app.get("/sessions/{dataset_id}/workflow-actions", response_model=WorkflowActionsResponse)
+def list_workflow_actions(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> WorkflowActionsResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    actions = _load_workflow_actions(dataset_id)
+    return WorkflowActionsResponse(
+        dataset_id=dataset_id,
+        actions=[WorkflowActionRecord(**action) for action in actions],
+    )
+
+
+@app.post("/sessions/{dataset_id}/workflow-actions/draft", response_model=WorkflowActionRecord)
+def draft_workflow_action(
+    dataset_id: str,
+    request: WorkflowDraftRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> WorkflowActionRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="draft_workflow", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    profile = _load_profile_if_exists(dataset_id)
+    if profile is None:
+        try:
+            df = _read_uploaded_file(meta)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+        profile = _build_profile(df)
+        _save_json(_profile_path(dataset_id), profile)
+        meta.setdefault("artifacts", {})["profile"] = str(_profile_path(dataset_id))
+
+    facts = _load_optional_json(_facts_path(dataset_id))
+    anomalies = _load_optional_json(_anomaly_path(dataset_id))
+    cohort = _load_optional_json(_cohort_path(dataset_id))
+    title, summary, payload, evidence = _workflow_action_content(
+        dataset_id,
+        meta,
+        request,
+        profile,
+        facts,
+        anomalies,
+        cohort,
+    )
+
+    timestamp = _utc_now_iso()
+    action = {
+        "action_id": str(uuid.uuid4()),
+        "action_type": request.action_type.strip().lower(),
+        "status": WORKFLOW_STATUS_PENDING,
+        "title": title,
+        "target": request.target.strip() if request.target and request.target.strip() else None,
+        "objective": request.objective.strip() if request.objective and request.objective.strip() else None,
+        "summary": summary,
+        "payload": payload,
+        "evidence": evidence,
+        "generated_at": timestamp,
+        "updated_at": timestamp,
+        "created_by": actor,
+        "review_note": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "executed_by": None,
+        "executed_at": None,
+        "execution_note": None,
+        "requires_approval": True,
+    }
+    actions = [action, *_load_workflow_actions(dataset_id)]
+    _save_workflow_actions(dataset_id, actions)
+    meta.setdefault("artifacts", {})["workflow_actions"] = str(_workflow_actions_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "workflow_action_drafted",
+        actor,
+        {"action_id": action["action_id"], "action_type": action["action_type"], "title": title},
+    )
+    return WorkflowActionRecord(**action)
+
+
+@app.post("/sessions/{dataset_id}/workflow-actions/{action_id}/decision", response_model=WorkflowActionRecord)
+def review_workflow_action(
+    dataset_id: str,
+    action_id: str,
+    request: WorkflowDecisionRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> WorkflowActionRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="review_workflow", x_api_key=x_api_key, x_user_role=x_user_role)
+    actions = _load_workflow_actions(dataset_id)
+    index = _workflow_action_index(actions, action_id)
+    current = dict(actions[index])
+    if current.get("status") == WORKFLOW_STATUS_EXECUTED:
+        raise HTTPException(status_code=400, detail="Executed workflow actions cannot be reviewed again.")
+
+    current["status"] = WORKFLOW_STATUS_APPROVED if request.approved else WORKFLOW_STATUS_REJECTED
+    current["review_note"] = request.note
+    current["reviewed_by"] = actor
+    current["reviewed_at"] = _utc_now_iso()
+    current["updated_at"] = current["reviewed_at"]
+    actions[index] = current
+    _save_workflow_actions(dataset_id, actions)
+    meta.setdefault("artifacts", {})["workflow_actions"] = str(_workflow_actions_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "workflow_action_reviewed",
+        actor,
+        {"action_id": action_id, "approved": request.approved, "status": current["status"]},
+    )
+    return WorkflowActionRecord(**current)
+
+
+@app.post("/sessions/{dataset_id}/workflow-actions/{action_id}/execute", response_model=WorkflowActionRecord)
+def execute_workflow_action(
+    dataset_id: str,
+    action_id: str,
+    request: WorkflowExecutionRequest | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> WorkflowActionRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="execute_workflow", x_api_key=x_api_key, x_user_role=x_user_role)
+    actions = _load_workflow_actions(dataset_id)
+    index = _workflow_action_index(actions, action_id)
+    current = dict(actions[index])
+
+    if current.get("status") != WORKFLOW_STATUS_APPROVED:
+        raise HTTPException(status_code=400, detail="Workflow actions must be approved before execution.")
+
+    executed_at = _utc_now_iso()
+    current["status"] = WORKFLOW_STATUS_EXECUTED
+    current["executed_by"] = actor
+    current["executed_at"] = executed_at
+    current["execution_note"] = request.note if request else None
+    current["updated_at"] = executed_at
+    payload = dict(current.get("payload") or {})
+    payload["execution_mode"] = "governed_manual"
+    payload["execution_result"] = _workflow_action_execution_result(str(current.get("action_type") or ""))
+    current["payload"] = payload
+    actions[index] = current
+    _save_workflow_actions(dataset_id, actions)
+    meta.setdefault("artifacts", {})["workflow_actions"] = str(_workflow_actions_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "workflow_action_executed",
+        actor,
+        {"action_id": action_id, "action_type": current.get("action_type")},
+    )
+    return WorkflowActionRecord(**current)
 
 
 @app.get("/sessions/{dataset_id}/anomalies", response_model=AnomalyAnalysisResponse)

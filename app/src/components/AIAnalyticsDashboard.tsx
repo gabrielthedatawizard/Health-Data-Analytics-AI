@@ -31,6 +31,7 @@ import {
   type DocumentAskResponse,
   type DocumentSummary,
   type CohortAnalysisResponse,
+  type WorkflowActionRecord,
   type AuthContextResponse,
   type BackendUserRole,
   type AuditEvent,
@@ -41,6 +42,8 @@ import {
   buildCohortAnalysis,
   createSession,
   datasetCsvUrl,
+  draftWorkflowAction,
+  executeWorkflowAction,
   factsJsonUrl,
   generateDashboardSpec,
   generateReport,
@@ -53,11 +56,13 @@ import {
   getJobStatus,
   getProfile,
   getSession,
+  getWorkflowActions,
   inferBackendUserRole,
   listDocuments,
   requestSensitiveExportApproval,
   reportHtmlUrl,
   reportPdfUrl,
+  reviewWorkflowAction,
   reviewSensitiveExportApproval,
   setSensitiveExportEnabled,
   uploadDocument,
@@ -226,6 +231,12 @@ const COHORT_OPERATOR_OPTIONS: Record<string, Array<{ value: string; label: stri
     { value: 'not_null', label: 'is present' },
   ],
 };
+const WORKFLOW_ACTION_OPTIONS = [
+  { value: 'draft_email', label: 'Draft Email' },
+  { value: 'create_ticket', label: 'Create Ticket' },
+  { value: 'action_plan', label: 'Action Plan' },
+  { value: 'schedule_report', label: 'Schedule Report' },
+] as const;
 
 function cohortOperatorsForType(inferredType: string) {
   return COHORT_OPERATOR_OPTIONS[inferredType] ?? COHORT_OPERATOR_OPTIONS.string;
@@ -486,11 +497,17 @@ export function AIAnalyticsDashboard() {
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
   const [anomalyAnalysis, setAnomalyAnalysis] = useState<AnomalyAnalysisResponse | null>(null);
   const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
+  const [workflowActions, setWorkflowActions] = useState<WorkflowActionRecord[]>([]);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
   const [cohortName, setCohortName] = useState('Priority follow-up cohort');
   const [cohortDescription, setCohortDescription] = useState('');
   const [cohortCriteria, setCohortCriteria] = useState<CohortDraftCriterion[]>([{ id: 'criterion-initial', field: '', operator: 'eq', value: '' }]);
+  const [workflowActionType, setWorkflowActionType] = useState<(typeof WORKFLOW_ACTION_OPTIONS)[number]['value']>('draft_email');
+  const [workflowTitle, setWorkflowTitle] = useState('');
+  const [workflowTarget, setWorkflowTarget] = useState('');
+  const [workflowObjective, setWorkflowObjective] = useState('');
+  const [workflowDecisionNote, setWorkflowDecisionNote] = useState('');
   const [askResult, setAskResult] = useState<AskResponsePayload | null>(null);
   const [documentQuestion, setDocumentQuestion] = useState('What do our trusted policy documents say about denominator exclusions?');
   const [documentAnswer, setDocumentAnswer] = useState<DocumentAskResponse | null>(null);
@@ -577,6 +594,7 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -591,6 +609,7 @@ export function AIAnalyticsDashboard() {
 
     async function hydrateSession() {
       try {
+        setWorkflowActions([]);
         const meta = await getSession(datasetId, userId);
         if (!active) return;
         setSessionMeta(meta);
@@ -617,6 +636,12 @@ export function AIAnalyticsDashboard() {
           const cohortResponse = await getCohortAnalysis(datasetId, userId);
           if (!active) return;
           setCohortAnalysis(cohortResponse);
+        }
+
+        if (meta.artifacts?.workflow_actions) {
+          const workflowResponse = await getWorkflowActions(datasetId, userId);
+          if (!active) return;
+          setWorkflowActions(workflowResponse.actions ?? []);
         }
 
         if (meta.artifacts?.dashboard_spec) {
@@ -796,6 +821,9 @@ export function AIAnalyticsDashboard() {
   const canRequestSensitiveExport = permissionSet.has('sensitive_export:request_own') || permissionSet.has('admin:all');
   const canReadDocuments = permissionSet.has('docs:read_own') || permissionSet.has('docs:read_all') || permissionSet.has('admin:all');
   const canUploadDocuments = permissionSet.has('docs:create') || permissionSet.has('admin:all');
+  const canDraftWorkflow = permissionSet.has('workflow:create_own') || permissionSet.has('workflow:create_all') || permissionSet.has('admin:all');
+  const canReviewWorkflow = permissionSet.has('workflow:review') || permissionSet.has('admin:all');
+  const canExecuteWorkflow = permissionSet.has('workflow:execute_own') || permissionSet.has('workflow:execute_all') || permissionSet.has('admin:all');
 
   useEffect(() => {
     if (cohortFieldOptions.length === 0) {
@@ -839,6 +867,11 @@ export function AIAnalyticsDashboard() {
     setDocuments(response.documents ?? []);
   }
 
+  async function refreshWorkflowActions(targetDatasetId: string) {
+    const response = await getWorkflowActions(targetDatasetId, userId);
+    setWorkflowActions(response.actions ?? []);
+  }
+
   async function handleCreateSession() {
     setBusyAction('create_session');
     setError(null);
@@ -850,6 +883,7 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -927,6 +961,7 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -965,6 +1000,7 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setAnomalyAnalysis(null);
       setCohortAnalysis(null);
+      setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -1211,6 +1247,91 @@ export function AIAnalyticsDashboard() {
       );
     } catch (cohortError) {
       setError(cohortError instanceof Error ? cohortError.message : 'Cohort generation failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleDraftWorkflow() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction('workflow_draft');
+    setError(null);
+    setNotice(null);
+    try {
+      const drafted = await draftWorkflowAction(datasetId, userId, {
+        action_type: workflowActionType,
+        title: workflowTitle.trim() || undefined,
+        target: workflowTarget.trim() || undefined,
+        objective: workflowObjective.trim() || undefined,
+      });
+      await refreshWorkflowActions(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setWorkflowTitle('');
+      setWorkflowTarget('');
+      setWorkflowObjective('');
+      setNotice(`Workflow draft ready for approval: ${drafted.title}.`);
+    } catch (workflowError) {
+      setError(workflowError instanceof Error ? workflowError.message : 'Workflow draft failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleReviewWorkflow(actionId: string, approved: boolean) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(approved ? `workflow_approve:${actionId}` : `workflow_reject:${actionId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      const action = await reviewWorkflowAction(datasetId, actionId, userId, {
+        approved,
+        note: workflowDecisionNote.trim() || undefined,
+      });
+      await refreshWorkflowActions(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setWorkflowDecisionNote('');
+      setNotice(
+        approved
+          ? `Workflow action approved: ${action.title}.`
+          : `Workflow action rejected: ${action.title}.`
+      );
+    } catch (workflowError) {
+      setError(workflowError instanceof Error ? workflowError.message : 'Workflow review failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleExecuteWorkflow(actionId: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(`workflow_execute:${actionId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      const action = await executeWorkflowAction(datasetId, actionId, userId, {
+        note: workflowDecisionNote.trim() || undefined,
+      });
+      await refreshWorkflowActions(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setWorkflowDecisionNote('');
+      setNotice(`Workflow action executed: ${action.title}.`);
+    } catch (workflowError) {
+      setError(workflowError instanceof Error ? workflowError.message : 'Workflow execution failed.');
     } finally {
       setBusyAction(null);
     }
@@ -1966,6 +2087,178 @@ export function AIAnalyticsDashboard() {
             ) : null}
           </div>
         ) : null}
+      </section>
+
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-center gap-2">
+            <div className="rounded-xl bg-health-mint/20 p-2 text-health-mint">
+              <Shield className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-lg font-medium text-foreground">Governed Workflow Assistant</h3>
+              <p className="text-sm text-muted-foreground">
+                Draft operational follow-ups, require reviewer approval, and record execution without bypassing governance controls.
+              </p>
+            </div>
+          </div>
+          <Button
+            type="button"
+            onClick={() => void handleDraftWorkflow()}
+            disabled={busyAction === 'workflow_draft' || !datasetId || !canDraftWorkflow}
+          >
+            {busyAction === 'workflow_draft' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Shield className="mr-2 h-4 w-4" />}
+            Draft Action
+          </Button>
+        </div>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-[220px_1fr_1fr]">
+          <select
+            value={workflowActionType}
+            onChange={(event) => setWorkflowActionType(event.target.value as (typeof WORKFLOW_ACTION_OPTIONS)[number]['value'])}
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+          >
+            {WORKFLOW_ACTION_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <Input
+            value={workflowTitle}
+            onChange={(event) => setWorkflowTitle(event.target.value)}
+            placeholder="Optional title override"
+          />
+          <Input
+            value={workflowTarget}
+            onChange={(event) => setWorkflowTarget(event.target.value)}
+            placeholder="Target team, owner, or audience"
+          />
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-[1.4fr_1fr]">
+          <Textarea
+            value={workflowObjective}
+            onChange={(event) => setWorkflowObjective(event.target.value)}
+            placeholder="Describe the operational objective for this workflow draft."
+            className="min-h-[110px]"
+          />
+          <Textarea
+            value={workflowDecisionNote}
+            onChange={(event) => setWorkflowDecisionNote(event.target.value)}
+            placeholder="Optional approval or execution note."
+            className="min-h-[110px]"
+          />
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Badge variant="outline">Draft enabled: {canDraftWorkflow ? 'yes' : 'no'}</Badge>
+          <Badge variant="outline">Review enabled: {canReviewWorkflow ? 'yes' : 'no'}</Badge>
+          <Badge variant="outline">Execute enabled: {canExecuteWorkflow ? 'yes' : 'no'}</Badge>
+          <Badge variant="outline">Saved actions: {workflowActions.length}</Badge>
+        </div>
+
+        {workflowActions.length === 0 ? (
+          <div className="mt-4 rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+            No governed workflow drafts yet. Start with a draft email, investigation ticket, action plan, or report schedule request.
+          </div>
+        ) : (
+          <div className="mt-4 grid gap-4 xl:grid-cols-2">
+            {workflowActions.map((action) => {
+              const actionLabel =
+                WORKFLOW_ACTION_OPTIONS.find((option) => option.value === action.action_type)?.label ?? action.action_type;
+              const canApproveThis = canReviewWorkflow && action.status === 'pending_approval';
+              const canExecuteThis = canExecuteWorkflow && action.status === 'approved';
+              const busyApprove = busyAction === `workflow_approve:${action.action_id}`;
+              const busyReject = busyAction === `workflow_reject:${action.action_id}`;
+              const busyExecute = busyAction === `workflow_execute:${action.action_id}`;
+
+              return (
+                <div key={action.action_id} className="rounded-xl border border-border bg-background p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{action.title}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{action.summary}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="outline">{actionLabel}</Badge>
+                      <Badge variant="outline">{action.status}</Badge>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {action.target ? <Badge variant="outline">Target: {action.target}</Badge> : null}
+                    {action.reviewed_by ? <Badge variant="outline">Reviewed by: {action.reviewed_by}</Badge> : null}
+                    {action.executed_by ? <Badge variant="outline">Executed by: {action.executed_by}</Badge> : null}
+                  </div>
+
+                  {action.evidence.length > 0 ? (
+                    <div className="mt-3 space-y-2">
+                      {action.evidence.map((item, index) => (
+                        <div key={`${action.action_id}-evidence-${index}`} className="rounded-lg border border-border/70 bg-card px-3 py-2 text-xs text-muted-foreground">
+                          {item}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <div className="mt-3 rounded-xl border border-border/70 bg-card p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Draft payload</p>
+                    <pre className="mt-2 overflow-auto text-xs text-muted-foreground">
+                      {JSON.stringify(action.payload, null, 2)}
+                    </pre>
+                  </div>
+
+                  {action.review_note ? (
+                    <p className="mt-3 text-xs text-muted-foreground">Review note: {action.review_note}</p>
+                  ) : null}
+                  {action.execution_note ? (
+                    <p className="mt-2 text-xs text-muted-foreground">Execution note: {action.execution_note}</p>
+                  ) : null}
+
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {canApproveThis ? (
+                      <>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleReviewWorkflow(action.action_id, true)}
+                          disabled={busyApprove}
+                        >
+                          {busyApprove ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                          Approve
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleReviewWorkflow(action.action_id, false)}
+                          disabled={busyReject}
+                        >
+                          {busyReject ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                          Reject
+                        </Button>
+                      </>
+                    ) : null}
+
+                    {canExecuteThis ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => void handleExecuteWorkflow(action.action_id)}
+                        disabled={busyExecute}
+                      >
+                        {busyExecute ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                        Execute
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <section className="grid gap-4 xl:grid-cols-2">

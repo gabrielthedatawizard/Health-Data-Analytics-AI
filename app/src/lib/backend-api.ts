@@ -123,6 +123,33 @@ export interface CohortAnalysisResponse {
   cohort: CohortAnalysisPayload;
 }
 
+export interface WorkflowActionRecord {
+  action_id: string;
+  action_type: string;
+  status: string;
+  title: string;
+  target?: string | null;
+  objective?: string | null;
+  summary: string;
+  payload: Record<string, unknown>;
+  evidence: string[];
+  generated_at: string;
+  updated_at: string;
+  created_by: string;
+  review_note?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  executed_by?: string | null;
+  executed_at?: string | null;
+  execution_note?: string | null;
+  requires_approval: boolean;
+}
+
+export interface WorkflowActionsResponse {
+  dataset_id: string;
+  actions: WorkflowActionRecord[];
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -539,6 +566,73 @@ export function buildCohortAnalysis(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function getWorkflowActions(datasetId: string, userId: string) {
+  return apiRequest<WorkflowActionsResponse>(`/sessions/${datasetId}/workflow-actions`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function draftWorkflowAction(
+  datasetId: string,
+  userId: string,
+  payload: {
+    action_type: string;
+    title?: string;
+    target?: string;
+    objective?: string;
+  }
+) {
+  return apiRequest<WorkflowActionRecord>(
+    `/sessions/${datasetId}/workflow-actions/draft`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function reviewWorkflowAction(
+  datasetId: string,
+  actionId: string,
+  userId: string,
+  payload: {
+    approved: boolean;
+    note?: string;
+  }
+) {
+  return apiRequest<WorkflowActionRecord>(
+    `/sessions/${datasetId}/workflow-actions/${actionId}/decision`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function executeWorkflowAction(
+  datasetId: string,
+  actionId: string,
+  userId: string,
+  payload?: {
+    note?: string;
+  }
+) {
+  return apiRequest<WorkflowActionRecord>(
+    `/sessions/${datasetId}/workflow-actions/${actionId}/execute`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload ?? {}),
     },
     { userId, timeoutMs: 120000 }
   );
