@@ -39,6 +39,31 @@ export interface DatasetRecord {
   metrics: Record<string, number>;
 }
 
+export interface InsightKpiSnapshot {
+  id?: string;
+  name: string;
+  value: string;
+  unit?: string;
+  factRefs?: string[];
+}
+
+export interface InsightInspection {
+  origin: 'upload' | 'analysis' | 'ask';
+  coverageMode?: string;
+  coverageNote?: string;
+  factCoverage?: number;
+  factsUsed?: string[];
+  queryPlan?: Record<string, unknown> | null;
+  chart?: Record<string, unknown> | null;
+  chartCandidates?: Array<Record<string, unknown>>;
+  governance?: Record<string, unknown>;
+  resultRows?: DatasetRow[];
+  resultColumns?: string[];
+  kpis?: InsightKpiSnapshot[];
+  qualityIssues?: string[];
+  notes?: string[];
+}
+
 export interface InsightRecord {
   id: string;
   datasetId?: string;
@@ -53,6 +78,7 @@ export interface InsightRecord {
   expanded: boolean;
   flagged?: boolean;
   sourceQuestion?: string;
+  inspection?: InsightInspection;
 }
 
 export interface AIEnvironmentState {

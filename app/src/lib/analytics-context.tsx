@@ -33,6 +33,8 @@ import {
   type DatasetFileType,
   type DatasetRecord,
   type DatasetRow,
+  type InsightInspection,
+  type InsightKpiSnapshot,
   type InsightRecord,
   type SampleDatasetKind,
   type UploadProgressHandler,
@@ -188,6 +190,49 @@ function normalizePreviewRows(rows: Array<Record<string, unknown>>): DatasetRow[
     );
     return normalized as DatasetRow;
   });
+}
+
+function formatNumericValue(value: number): string {
+  return Number.isInteger(value)
+    ? value.toLocaleString()
+    : value.toLocaleString(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2,
+      });
+}
+
+function formatMetricValue(value: unknown, unit?: string): string {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const formatted = formatNumericValue(value);
+    return unit && unit !== 'score' ? `${formatted} ${unit}` : formatted;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return value;
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  return 'N/A';
+}
+
+function buildInspectionKpis(factsBundle: Record<string, any>): InsightKpiSnapshot[] {
+  const kpis = Array.isArray(factsBundle.kpis) ? factsBundle.kpis : [];
+  return kpis.slice(0, 6).map((kpi: Record<string, any>) => ({
+    id: typeof kpi.id === 'string' ? kpi.id : undefined,
+    name: String(kpi.name ?? 'KPI'),
+    value: formatMetricValue(kpi.value, typeof kpi.unit === 'string' ? kpi.unit : undefined),
+    unit: typeof kpi.unit === 'string' ? kpi.unit : undefined,
+    factRefs: Array.isArray(kpi.facts_refs)
+      ? kpi.facts_refs.filter((value: unknown): value is string => typeof value === 'string')
+      : [],
+  }));
+}
+
+function buildCoverageNote(dataCoverage: Record<string, any>): string | undefined {
+  if (typeof dataCoverage.bias_notes === 'string' && dataCoverage.bias_notes.trim()) {
+    return dataCoverage.bias_notes.trim();
+  }
+  return undefined;
 }
 
 function toColumnProfile(column: Record<string, any>): DatasetColumnProfile {
@@ -377,6 +422,101 @@ function confidenceFromLabel(label?: string): number {
   return 78;
 }
 
+function buildUploadInspection(dataset: DatasetRecord): InsightInspection {
+  return {
+    origin: 'upload',
+    coverageMode: 'full',
+    kpis: [
+      { name: 'Rows', value: formatNumericValue(dataset.rowCount), unit: 'rows' },
+      { name: 'Columns', value: formatNumericValue(dataset.columnCount), unit: 'cols' },
+      { name: 'Quality Score', value: `${dataset.qualityScore}`, unit: 'score' },
+    ],
+    qualityIssues: dataset.issues,
+    notes: ['Profile generated through the governed backend control plane.'],
+  };
+}
+
+function buildAnalysisInspection(
+  dataset: DatasetRecord,
+  factsBundle: Record<string, any>,
+  overrides?: Partial<InsightInspection>
+): InsightInspection {
+  const dataCoverage = (factsBundle.data_coverage ?? {}) as Record<string, any>;
+  const qualityIssues = Array.isArray(factsBundle.quality?.issues)
+    ? factsBundle.quality.issues.map((issue: Record<string, any>) => formatQualityIssue(issue))
+    : [];
+  const factsUsed = Array.isArray(factsBundle.insight_facts)
+    ? factsBundle.insight_facts
+        .slice(0, 6)
+        .map((fact: Record<string, any>) => String(fact.id ?? ''))
+        .filter(Boolean)
+    : [];
+  const chartCandidates = Array.isArray(factsBundle.chart_candidates)
+    ? factsBundle.chart_candidates.slice(0, 4)
+    : [];
+  const baseNotes = [
+    buildCoverageNote(dataCoverage),
+    chartCandidates.length > 0
+      ? `${chartCandidates.length} chart candidate(s) were prepared from this analysis.`
+      : 'No chart candidates were generated for this analysis pass.',
+    `${dataset.name} remains governed by semantic validation and PII-aware blocking.`,
+  ].filter((note): note is string => Boolean(note));
+
+  return {
+    origin: 'analysis',
+    coverageMode: typeof dataCoverage.mode === 'string' ? dataCoverage.mode : 'full',
+    coverageNote: buildCoverageNote(dataCoverage),
+    factsUsed,
+    chartCandidates,
+    kpis: buildInspectionKpis(factsBundle),
+    qualityIssues,
+    notes: baseNotes,
+    ...overrides,
+  };
+}
+
+function buildAskInspection(dataset: DatasetRecord, response: AskResponsePayload): InsightInspection {
+  const resultRows = normalizePreviewRows(response.result_rows ?? []);
+  const chartPayload =
+    response.chart && typeof response.chart === 'object'
+      ? (response.chart as Record<string, unknown>)
+      : null;
+  const resultColumns =
+    resultRows.length > 0
+      ? Object.keys(resultRows[0])
+      : Array.isArray(chartPayload?.columns)
+        ? chartPayload.columns
+            .filter((value: unknown): value is string => typeof value === 'string')
+        : [];
+
+  const coverageMode = typeof response.data_coverage === 'string' ? response.data_coverage : 'unknown';
+  const coverageNote =
+    coverageMode === 'sample'
+      ? 'This answer was generated from sampled coverage. Validate before final reporting.'
+      : 'This answer was generated from full governed coverage.';
+  const governance =
+    response.governance && typeof response.governance === 'object' ? response.governance : {};
+
+  return {
+    origin: 'ask',
+    coverageMode,
+    coverageNote,
+    factCoverage: Number(response.fact_coverage ?? 0),
+    factsUsed: Array.isArray(response.facts_used) ? response.facts_used : [],
+    queryPlan: response.query_plan ?? null,
+    chart: chartPayload,
+    governance,
+    resultRows,
+    resultColumns,
+    notes: [
+      `${dataset.name} answered this question using governed semantic validation.`,
+      Array.isArray(response.facts_used) && response.facts_used.length > 0
+        ? `${response.facts_used.length} fact reference(s) grounded the answer.`
+        : 'No explicit fact references were returned for this answer.',
+    ],
+  };
+}
+
 function buildUploadInsight(dataset: DatasetRecord): InsightRecord {
   return {
     id: createEntityId('insight'),
@@ -389,6 +529,7 @@ function buildUploadInsight(dataset: DatasetRecord): InsightRecord {
     timestamp: new Date().toISOString(),
     verified: true,
     expanded: true,
+    inspection: buildUploadInspection(dataset),
   };
 }
 
@@ -407,6 +548,7 @@ function buildAnalysisInsights(
 ): InsightRecord[] {
   const now = new Date().toISOString();
   const coverageMode = String(factsBundle.data_coverage?.mode ?? 'full');
+  const baseInspection = buildAnalysisInspection(dataset, factsBundle);
   const insights: InsightRecord[] = [
     {
       id: createEntityId('insight'),
@@ -420,6 +562,7 @@ function buildAnalysisInsights(
       verified: true,
       expanded: true,
       sourceQuestion,
+      inspection: baseInspection,
     },
   ];
 
@@ -437,6 +580,12 @@ function buildAnalysisInsights(
       verified: true,
       expanded: false,
       sourceQuestion,
+      inspection: buildAnalysisInspection(dataset, factsBundle, {
+        factsUsed: [],
+        qualityIssues: qualityIssues
+          .slice(0, 4)
+          .map((issue: Record<string, any>) => formatQualityIssue(issue)),
+      }),
     });
   }
 
@@ -465,6 +614,13 @@ function buildAnalysisInsights(
       verified: true,
       expanded: false,
       sourceQuestion,
+      inspection: buildAnalysisInspection(dataset, factsBundle, {
+        factsUsed: [String(trendFact.id ?? 'fact')].filter(Boolean),
+        notes: [
+          `${metric} trend was selected as the strongest time-based fact for this dataset.`,
+          buildCoverageNote((factsBundle.data_coverage ?? {}) as Record<string, any>),
+        ].filter((note): note is string => Boolean(note)),
+      }),
     });
   }
 
@@ -487,6 +643,13 @@ function buildAnalysisInsights(
       verified: true,
       expanded: false,
       sourceQuestion,
+      inspection: buildAnalysisInspection(dataset, factsBundle, {
+        factsUsed: [String(comparisonFact.id ?? 'fact')].filter(Boolean),
+        notes: [
+          'This recommendation is grounded in the highest-ranked segment comparison available in the facts bundle.',
+          buildCoverageNote((factsBundle.data_coverage ?? {}) as Record<string, any>),
+        ].filter((note): note is string => Boolean(note)),
+      }),
     });
   }
 
@@ -507,6 +670,14 @@ function buildAnalysisInsights(
     verified: true,
     expanded: false,
     sourceQuestion,
+    inspection: buildAnalysisInspection(dataset, factsBundle, {
+      notes: [
+        dataset.qualityScore >= 85
+          ? 'The recommendation favors activation because data quality is above the release threshold.'
+          : 'The recommendation favors cleanup because the dataset remains below the quality threshold.',
+        buildCoverageNote((factsBundle.data_coverage ?? {}) as Record<string, any>),
+      ].filter((note): note is string => Boolean(note)),
+    }),
   });
 
   return insights;
@@ -544,6 +715,7 @@ function buildAskInsight(dataset: DatasetRecord, question: string, response: Ask
     verified: true,
     expanded: true,
     sourceQuestion: question.trim(),
+    inspection: buildAskInspection(dataset, response),
   };
 }
 

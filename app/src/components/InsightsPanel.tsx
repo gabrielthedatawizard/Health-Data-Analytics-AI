@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Database,
   Flag,
   Share2,
   Shield,
@@ -66,6 +67,96 @@ const typeConfig: Record<
   },
 };
 
+type InspectionView = 'sources' | 'logic' | 'preview' | 'governance';
+
+const inspectionViewConfig: Record<
+  InspectionView,
+  {
+    label: string;
+    icon: ElementType;
+  }
+> = {
+  sources: {
+    label: 'Show Sources',
+    icon: BarChart3,
+  },
+  logic: {
+    label: 'Show Logic',
+    icon: Brain,
+  },
+  preview: {
+    label: 'Show Preview',
+    icon: Database,
+  },
+  governance: {
+    label: 'Show Governance',
+    icon: Shield,
+  },
+};
+
+function hasTraceContent(insight: InsightRecord): boolean {
+  const inspection = insight.inspection;
+  if (!inspection) return false;
+  return Boolean(
+    (inspection.factsUsed?.length ?? 0) > 0 ||
+      inspection.queryPlan ||
+      inspection.chart ||
+      (inspection.chartCandidates?.length ?? 0) > 0 ||
+      (inspection.resultRows?.length ?? 0) > 0 ||
+      (inspection.kpis?.length ?? 0) > 0 ||
+      (inspection.qualityIssues?.length ?? 0) > 0 ||
+      (inspection.notes?.length ?? 0) > 0 ||
+      (inspection.governance && Object.keys(inspection.governance).length > 0)
+  );
+}
+
+function availableInspectionViews(insight: InsightRecord): InspectionView[] {
+  const inspection = insight.inspection;
+  if (!inspection) return [];
+
+  const views: InspectionView[] = [];
+  if (
+    inspection.coverageMode ||
+    inspection.coverageNote ||
+    (inspection.factsUsed?.length ?? 0) > 0 ||
+    (inspection.kpis?.length ?? 0) > 0 ||
+    (inspection.qualityIssues?.length ?? 0) > 0 ||
+    (inspection.notes?.length ?? 0) > 0
+  ) {
+    views.push('sources');
+  }
+  if (inspection.queryPlan || inspection.chart || (inspection.chartCandidates?.length ?? 0) > 0) {
+    views.push('logic');
+  }
+  if ((inspection.resultRows?.length ?? 0) > 0) {
+    views.push('preview');
+  }
+  if (inspection.governance && Object.keys(inspection.governance).length > 0) {
+    views.push('governance');
+  }
+  return views;
+}
+
+function defaultInspectionView(insight: InsightRecord): InspectionView {
+  const available = availableInspectionViews(insight);
+  return available[0] ?? 'sources';
+}
+
+function prettyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2) ?? '';
+}
+
+function formatInspectionCell(value: string | number | boolean | null | undefined): string {
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(2);
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  return String(value);
+}
+
 export function InsightsPanel() {
   const { t, formatTime } = useI18n();
   const {
@@ -79,6 +170,7 @@ export function InsightsPanel() {
   const [question, setQuestion] = useState('');
   const [isAsking, setIsAsking] = useState(false);
   const [copiedInsightId, setCopiedInsightId] = useState<string | null>(null);
+  const [inspectionViews, setInspectionViews] = useState<Record<string, InspectionView>>({});
 
   const sortedInsights = useMemo(() => {
     return [...insights].sort((left, right) => right.timestamp.localeCompare(left.timestamp));
@@ -123,6 +215,13 @@ export function InsightsPanel() {
     }
 
     await copyInsight(insight);
+  };
+
+  const setInspectionView = (insight: InsightRecord, nextView: InspectionView) => {
+    setInspectionViews((previous) => ({
+      ...previous,
+      [insight.id]: nextView,
+    }));
   };
 
   return (
@@ -246,6 +345,16 @@ export function InsightsPanel() {
         {sortedInsights.map((insight) => {
           const config = typeConfig[insight.type];
           const Icon = config.icon;
+          const inspection = insight.inspection;
+          const traceAvailable = hasTraceContent(insight);
+          const inspectionOptions = availableInspectionViews(insight);
+          const activeInspectionView = inspectionViews[insight.id] ?? defaultInspectionView(insight);
+          const previewColumns =
+            inspection?.resultColumns && inspection.resultColumns.length > 0
+              ? inspection.resultColumns
+              : inspection?.resultRows && inspection.resultRows.length > 0
+                ? Object.keys(inspection.resultRows[0])
+                : [];
           return (
             <Card
               key={insight.id}
@@ -344,6 +453,241 @@ export function InsightsPanel() {
                           ))}
                         </div>
                       </div>
+
+                      {traceAvailable && inspection && (
+                        <div className="mt-4 rounded-xl border border-border bg-muted/30">
+                          <div className="flex flex-col gap-3 border-b border-border px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground uppercase">Inspection</p>
+                              <p className="text-xs text-muted-foreground">
+                                Inspect governed sources, logic, previews, and policy checks.
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {inspectionOptions.map((view) => {
+                                const ViewIcon = inspectionViewConfig[view].icon;
+                                return (
+                                  <Button
+                                    key={`${insight.id}-${view}`}
+                                    variant={activeInspectionView === view ? 'default' : 'outline'}
+                                    size="sm"
+                                    className={cn(
+                                      'h-8 gap-1',
+                                      activeInspectionView === view &&
+                                        'bg-health-mint text-background hover:bg-health-mint/90'
+                                    )}
+                                    onClick={() => setInspectionView(insight, view)}
+                                  >
+                                    <ViewIcon className="w-3 h-3" />
+                                    {inspectionViewConfig[view].label}
+                                  </Button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="px-4 py-4">
+                            {activeInspectionView === 'sources' && (
+                              <div className="space-y-4">
+                                <div className="flex flex-wrap gap-2">
+                                  {inspection.coverageMode && (
+                                    <Badge variant="outline" className="text-xs">
+                                      Coverage: {inspection.coverageMode}
+                                    </Badge>
+                                  )}
+                                  {typeof inspection.factCoverage === 'number' && (
+                                    <Badge variant="outline" className="text-xs">
+                                      Fact coverage: {Math.round(inspection.factCoverage * 100)}%
+                                    </Badge>
+                                  )}
+                                  <Badge variant="outline" className="text-xs">
+                                    Trace origin: {inspection.origin}
+                                  </Badge>
+                                </div>
+
+                                {inspection.coverageNote && (
+                                  <div className="rounded-lg border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground">
+                                    {inspection.coverageNote}
+                                  </div>
+                                )}
+
+                                {(inspection.factsUsed?.length ?? 0) > 0 && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Fact References
+                                    </p>
+                                    <div className="flex flex-wrap gap-2">
+                                      {inspection.factsUsed?.map((factId) => (
+                                        <Badge key={`${insight.id}-${factId}`} variant="secondary" className="text-xs">
+                                          {factId}
+                                        </Badge>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {(inspection.kpis?.length ?? 0) > 0 && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      KPI Snapshot
+                                    </p>
+                                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                      {inspection.kpis?.map((kpi) => (
+                                        <div
+                                          key={`${insight.id}-${kpi.id ?? kpi.name}`}
+                                          className="rounded-lg border border-border bg-card/40 px-3 py-2"
+                                        >
+                                          <p className="text-xs text-muted-foreground">{kpi.name}</p>
+                                          <p className="text-sm font-medium text-foreground">{kpi.value}</p>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {(inspection.qualityIssues?.length ?? 0) > 0 && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Quality Issues
+                                    </p>
+                                    <div className="space-y-2">
+                                      {inspection.qualityIssues?.map((issue) => (
+                                        <div
+                                          key={`${insight.id}-${issue}`}
+                                          className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-300"
+                                        >
+                                          {issue}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {(inspection.notes?.length ?? 0) > 0 && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Notes
+                                    </p>
+                                    <div className="space-y-2">
+                                      {inspection.notes?.map((note) => (
+                                        <div
+                                          key={`${insight.id}-${note}`}
+                                          className="rounded-lg border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground"
+                                        >
+                                          {note}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {activeInspectionView === 'logic' && (
+                              <div className="space-y-4">
+                                {inspection.queryPlan && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Query Plan
+                                    </p>
+                                    <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-card/50 p-3 text-xs text-foreground">
+                                      {prettyJson(inspection.queryPlan)}
+                                    </pre>
+                                  </div>
+                                )}
+
+                                {inspection.chart && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Chart Payload
+                                    </p>
+                                    <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-card/50 p-3 text-xs text-foreground">
+                                      {prettyJson(inspection.chart)}
+                                    </pre>
+                                  </div>
+                                )}
+
+                                {(inspection.chartCandidates?.length ?? 0) > 0 && (
+                                  <div>
+                                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                                      Chart Candidates
+                                    </p>
+                                    <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-card/50 p-3 text-xs text-foreground">
+                                      {prettyJson(inspection.chartCandidates)}
+                                    </pre>
+                                  </div>
+                                )}
+
+                                {!inspection.queryPlan &&
+                                  !inspection.chart &&
+                                  (inspection.chartCandidates?.length ?? 0) === 0 && (
+                                    <div className="rounded-lg border border-border bg-card/40 px-3 py-3 text-xs text-muted-foreground">
+                                      No logic payload was captured for this insight.
+                                    </div>
+                                  )}
+                              </div>
+                            )}
+
+                            {activeInspectionView === 'preview' && (
+                              <div className="space-y-4">
+                                {(inspection.resultRows?.length ?? 0) > 0 ? (
+                                  <div className="overflow-auto rounded-lg border border-border">
+                                    <table className="w-full text-sm">
+                                      <thead className="sticky top-0 bg-card">
+                                        <tr className="border-b border-border">
+                                          {previewColumns.map((column) => (
+                                            <th
+                                              key={`${insight.id}-${column}`}
+                                              className="px-3 py-2 text-left text-xs font-medium text-muted-foreground"
+                                            >
+                                              {column}
+                                            </th>
+                                          ))}
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {inspection.resultRows?.slice(0, 8).map((row, rowIndex) => (
+                                          <tr
+                                            key={`${insight.id}-${rowIndex}`}
+                                            className="border-b border-border/50"
+                                          >
+                                            {previewColumns.map((column) => (
+                                              <td
+                                                key={`${insight.id}-${rowIndex}-${column}`}
+                                                className="px-3 py-2 text-xs text-foreground"
+                                              >
+                                                {formatInspectionCell(row[column])}
+                                              </td>
+                                            ))}
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                ) : (
+                                  <div className="rounded-lg border border-border bg-card/40 px-3 py-3 text-xs text-muted-foreground">
+                                    No tabular preview was returned for this insight.
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {activeInspectionView === 'governance' && (
+                              <div className="space-y-4">
+                                {inspection.governance && Object.keys(inspection.governance).length > 0 ? (
+                                  <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-card/50 p-3 text-xs text-foreground">
+                                    {prettyJson(inspection.governance)}
+                                  </pre>
+                                ) : (
+                                  <div className="rounded-lg border border-border bg-card/40 px-3 py-3 text-xs text-muted-foreground">
+                                    No governance payload was captured for this insight.
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mt-4 pt-4 border-t border-border gap-3">
                         <div className="flex items-center gap-2">
