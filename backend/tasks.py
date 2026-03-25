@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from weasyprint import HTML
-
 from backend.celery_app import celery_app
 from backend.jobs import update_job
 from backend.main import (
@@ -98,6 +96,8 @@ def generate_report_task(self, job_id: str, dataset_id: str, template: str | Non
         update_job(job_id, status="running", progress=80)
 
         pdf_path = _report_pdf_path(dataset_id)
+        from weasyprint import HTML
+
         HTML(string=report_html).write_pdf(str(pdf_path))
 
         meta["artifacts"]["profile"] = str(profile_path)

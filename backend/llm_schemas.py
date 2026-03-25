@@ -213,11 +213,15 @@ QUERY_PLAN_SCHEMA: dict = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["op", "field"],
                 "properties": {
+                    "metric_id": {"type": "string"},
                     "op": {"type": "string", "enum": ["sum", "mean", "count", "min", "max"]},
                     "field": {"type": "string"},
                 },
+                "anyOf": [
+                    {"required": ["metric_id"]},
+                    {"required": ["op", "field"]},
+                ],
             },
         },
         "group_by": {"type": "array", "items": {"type": "string"}},

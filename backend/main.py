@@ -24,6 +24,12 @@ from backend.jobs import create_job, get_job, list_jobs, update_job
 from backend.llm_client import LLMClient, create_llm_client_from_env
 from backend.llm_gate import FactsGroundingError, SchemaValidationError, validate_facts_references, validate_schema
 from backend.llm_schemas import ASK_NARRATIVE_SCHEMA, DASHBOARD_SPEC_SCHEMA, FACTS_BUNDLE_SCHEMA, QUERY_PLAN_SCHEMA
+from backend.semantic_layer import (
+    QueryPlanValidationError,
+    build_semantic_layer,
+    semantic_prompt_context,
+    validate_and_resolve_query_plan,
+)
 
 DATA_DIR = Path("data_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,6 +152,12 @@ class AskResponse(BaseModel):
     query_plan: dict[str, Any] | None = None
     result_rows: list[dict[str, Any]] = Field(default_factory=list)
     chart: dict[str, Any] | None = None
+    governance: dict[str, Any] = Field(default_factory=dict)
+
+
+class SemanticLayerResponse(BaseModel):
+    dataset_id: str
+    semantic_layer: dict[str, Any]
 
 
 class ReportRequest(BaseModel):
@@ -1018,19 +1030,24 @@ def _generate_dashboard_spec_llm(dataset_id: str, template: str, facts_bundle: d
     return output
 
 
-def _generate_query_plan_llm(question: str, facts_bundle: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+def _generate_query_plan_llm(
+    question: str,
+    facts_bundle: dict[str, Any],
+    profile: dict[str, Any],
+    semantic_layer: dict[str, Any],
+) -> dict[str, Any]:
     del facts_bundle  # facts are used later for grounding the narrative, not for plan schema.
     llm = _get_llm_client()
     context = {
         "question": question,
         "columns": [str(name) for name in profile.get("dtypes", {}).keys()][:120],
-        "numeric_columns": [str(name) for name in profile.get("numeric_cols", [])][:60],
-        "categorical_columns": [str(name) for name in profile.get("categorical_cols", [])][:60],
-        "datetime_columns": [str(name) for name in profile.get("datetime_cols", [])][:30],
+        "semantic_layer": semantic_prompt_context(semantic_layer),
     }
     system_prompt = (
         "You are a query planner for healthcare analytics. "
-        "Generate a safe query plan using only provided columns."
+        "Generate a safe query plan using only the approved semantic layer. "
+        "Prefer metric_id values instead of raw field names whenever possible. "
+        "Never use PII-blocked fields."
     )
     user_prompt = f"Build a query plan for this context:\n{json.dumps(context, ensure_ascii=True)}"
     output = llm.generate_json(QUERY_PLAN_SCHEMA, system_prompt, user_prompt, timeout=30)
@@ -1038,34 +1055,38 @@ def _generate_query_plan_llm(question: str, facts_bundle: dict[str, Any], profil
     return output
 
 
-def _fallback_query_plan(question: str, profile: dict[str, Any]) -> dict[str, Any]:
-    numeric_cols = [str(name) for name in profile.get("numeric_cols", [])]
-    categorical_cols = [str(name) for name in profile.get("categorical_cols", [])]
-    datetime_cols = [str(name) for name in profile.get("datetime_cols", [])]
-
-    metric_field = numeric_cols[0] if numeric_cols else (categorical_cols[0] if categorical_cols else "")
-    metric_op = "sum" if numeric_cols else "count"
+def _fallback_query_plan(question: str, profile: dict[str, Any], semantic_layer: dict[str, Any]) -> dict[str, Any]:
+    del profile
+    metrics = [item for item in semantic_layer.get("metrics", []) if isinstance(item, dict)]
+    dimensions = [item for item in semantic_layer.get("dimensions", []) if isinstance(item, dict)]
+    metric_id = str(metrics[0]["id"]) if metrics else ""
     group_by: list[str] = []
     chart_hint = "table"
     intent = "aggregate"
+    default_time_field = semantic_layer.get("default_time_field")
+    preferred_dimension = semantic_layer.get("preferred_dimension")
 
-    if datetime_cols and any(token in question.lower() for token in ("trend", "time", "month", "week", "year")):
-        group_by = [datetime_cols[0]]
+    if default_time_field and any(token in question.lower() for token in ("trend", "time", "month", "week", "year")):
+        group_by = [str(default_time_field)]
         chart_hint = "line"
         intent = "trend"
-    elif categorical_cols:
-        group_by = [categorical_cols[0]]
+    elif preferred_dimension:
+        group_by = [str(preferred_dimension)]
+        chart_hint = "bar"
+        intent = "compare"
+    elif dimensions:
+        group_by = [str(dimensions[0]["field"])]
         chart_hint = "bar"
         intent = "compare"
 
     return {
         "intent": intent,
-        "metrics": [{"op": metric_op, "field": metric_field}] if metric_field else [],
+        "metrics": [{"metric_id": metric_id}] if metric_id else [],
         "group_by": group_by,
         "filters": [],
         "time": {
-            "field": datetime_cols[0] if datetime_cols else None,
-            "grain": "month" if datetime_cols else None,
+            "field": default_time_field,
+            "grain": "month" if default_time_field else None,
             "start": None,
             "end": None,
         },
@@ -1793,6 +1814,29 @@ def profile_dataset(
     return ProfileResponse(dataset_id=dataset_id, profile=response_profile)
 
 
+@app.get("/sessions/{dataset_id}/semantic-layer", response_model=SemanticLayerResponse)
+def get_semantic_layer(
+    dataset_id: str,
+    mask_pii: bool | None = Query(default=None),
+) -> SemanticLayerResponse:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    profile_path = _profile_path(dataset_id)
+    if profile_path.exists():
+        profile = _load_json(profile_path)
+    else:
+        profile = _build_profile(_read_uploaded_file(meta))
+        _save_json(profile_path, profile)
+
+    mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
+    response_profile = _apply_profile_masking(profile, mask_enabled)
+    semantic_layer = build_semantic_layer(response_profile)
+    return SemanticLayerResponse(dataset_id=dataset_id, semantic_layer=semantic_layer)
+
+
 @app.get("/sessions/{dataset_id}/facts")
 def generate_facts(
     dataset_id: str,
@@ -2150,16 +2194,23 @@ def ask_dataset(
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
     df = _read_uploaded_file(meta)
+    semantic_layer = build_semantic_layer(profile)
 
     try:
-        query_plan = _generate_query_plan_llm(payload.question, facts_bundle, profile)
+        query_plan = _generate_query_plan_llm(payload.question, facts_bundle, profile, semantic_layer)
     except Exception:
-        query_plan = _fallback_query_plan(payload.question, profile)
+        query_plan = _fallback_query_plan(payload.question, profile, semantic_layer)
 
     try:
         validate_schema(query_plan, QUERY_PLAN_SCHEMA)
-    except SchemaValidationError as exc:
-        _append_audit(dataset_id, "ask_data", actor, {"question": payload.question, "status": "invalid_plan"})
+        query_plan = validate_and_resolve_query_plan(query_plan, profile, semantic_layer)
+    except (QueryPlanValidationError, SchemaValidationError) as exc:
+        _append_audit(
+            dataset_id,
+            "ask_data",
+            actor,
+            {"question": payload.question, "status": "invalid_plan", "error": str(exc)},
+        )
         raise HTTPException(status_code=422, detail=f"Invalid query plan: {exc}") from exc
 
     result_df, execution_note = _execute_query_plan(df, query_plan)
@@ -2185,6 +2236,11 @@ def ask_dataset(
     result_rows = json.loads(result_df.head(min(int(query_plan.get("limit", 25)), 100)).to_json(orient="records", date_format="iso"))
     chart_type = query_plan.get("chart_hint", "table")
     columns = list(result_df.columns)
+    used_metric_ids = [
+        str(metric["metric_id"])
+        for metric in query_plan.get("metrics", [])
+        if isinstance(metric, dict) and isinstance(metric.get("metric_id"), str)
+    ]
     chart_payload: dict[str, Any] | None = None
     if chart_type != "table" and columns:
         x_col = columns[0]
@@ -2208,6 +2264,11 @@ def ask_dataset(
         query_plan=query_plan,
         result_rows=result_rows,
         chart=chart_payload,
+        governance={
+            "validation_mode": "semantic_strict",
+            "semantic_metric_ids": used_metric_ids,
+            "blocked_fields": semantic_layer.get("pii_blocked_fields", []),
+        },
     )
 
 

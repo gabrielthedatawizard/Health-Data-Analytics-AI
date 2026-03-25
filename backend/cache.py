@@ -53,4 +53,7 @@ class CacheManager:
                 self._redis.delete(key)
         for path in CACHE_DIR.glob("*.json"):
             # file cache uses hashed keys; best-effort cleanup by clearing all
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                continue
