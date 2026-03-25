@@ -62,7 +62,7 @@ function AppContent() {
   const renderView = () => {
     switch (currentView) {
       case 'dashboard':
-        return <Dashboard />;
+        return <Dashboard onViewChange={handleViewChange} />;
       case 'upload':
         return <DataUpload onViewChange={handleViewChange} />;
       case 'datasets':
@@ -74,7 +74,7 @@ function AppContent() {
       case 'ai_analytics':
         return <AIAnalyticsDashboard />;
       default:
-        return <Dashboard />;
+        return <Dashboard onViewChange={handleViewChange} />;
     }
   };
 

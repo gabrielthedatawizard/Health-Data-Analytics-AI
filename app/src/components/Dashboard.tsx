@@ -1,526 +1,672 @@
-import { 
-  TrendingUp, 
-  TrendingDown,
-  Users, 
-  Activity, 
-  Baby, 
-  Heart,
-  Calendar,
-  Filter,
-  Download,
-  MoreHorizontal,
-  ArrowUpRight,
-  AlertCircle
-} from 'lucide-react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
+import { useMemo, useState, type ElementType } from 'react';
 import {
-  Line,
-  AreaChart,
+  Activity,
+  AlertCircle,
+  ArrowUpRight,
+  BarChart3,
+  CheckCircle2,
+  Database,
+  FileUp,
+  Flag,
+  Loader2,
+  Shield,
+  Sparkles,
+} from 'lucide-react';
+import {
   Area,
-  BarChart,
+  AreaChart,
   Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  PieChart,
-  Pie,
-  Cell,
 } from 'recharts';
+import type { ViewType } from '@/App';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useAnalytics } from '@/lib/analytics-context';
+import type { DatasetRecord, InsightRecord } from '@/lib/ai-engine';
 import { cn } from '@/lib/utils';
 
-// Mock data for charts
-const trendData = [
-  { month: 'Jan', anc: 62, delivery: 68, pnc: 55 },
-  { month: 'Feb', anc: 58, delivery: 65, pnc: 52 },
-  { month: 'Mar', anc: 65, delivery: 70, pnc: 58 },
-  { month: 'Apr', anc: 63, delivery: 69, pnc: 56 },
-  { month: 'May', anc: 67, delivery: 72, pnc: 61 },
-  { month: 'Jun', anc: 70, delivery: 74, pnc: 64 },
-  { month: 'Jul', anc: 68, delivery: 73, pnc: 62 },
-  { month: 'Aug', anc: 72, delivery: 76, pnc: 67 },
-  { month: 'Sep', anc: 75, delivery: 78, pnc: 70 },
-  { month: 'Oct', anc: 73, delivery: 77, pnc: 68 },
-  { month: 'Nov', anc: 76, delivery: 79, pnc: 71 },
-  { month: 'Dec', anc: 78, delivery: 81, pnc: 73 },
-];
-
-const districtData = [
-  { name: 'Chamwino', value: 82 },
-  { name: 'Bahi', value: 78 },
-  { name: 'Dodoma Muni', value: 75 },
-  { name: 'Chemba', value: 71 },
-  { name: 'Kondoa', value: 64 },
-  { name: 'Mpwapwa', value: 69 },
-];
-
-const ageDistribution = [
-  { name: '15-19', value: 15, color: '#34d399' },
-  { name: '20-24', value: 32, color: '#10b981' },
-  { name: '25-29', value: 28, color: '#059669' },
-  { name: '30-34', value: 18, color: '#047857' },
-  { name: '35+', value: 7, color: '#065f46' },
-];
-
-interface KPICardProps {
-  title: string;
-  value: string;
-  change: number;
-  changeLabel: string;
-  icon: React.ElementType;
-  trend: 'up' | 'down' | 'neutral';
-  target?: string;
-  confidence: 'high' | 'medium' | 'low';
+interface DashboardProps {
+  onViewChange: (view: ViewType) => void;
 }
 
-function KPICard({ title, value, change, changeLabel, icon: Icon, trend, target, confidence }: KPICardProps) {
+interface StatCardProps {
+  label: string;
+  value: string;
+  icon: ElementType;
+  tone: string;
+  hint: string;
+}
+
+const PIE_COLORS = ['#10b981', '#3b82f6', '#f59e0b'];
+
+function formatCompactNumber(value: number): string {
+  return new Intl.NumberFormat('en', {
+    notation: value >= 1000 ? 'compact' : 'standard',
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function shortenLabel(value: string, max = 18): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 1)}…`;
+}
+
+function insightTypeLabel(insight: InsightRecord): string {
+  if (insight.type === 'anomaly') return 'Anomaly';
+  if (insight.type === 'prediction') return 'Prediction';
+  if (insight.type === 'recommendation') return 'Recommendation';
+  return 'Trend';
+}
+
+function insightTone(insight: InsightRecord): string {
+  if (insight.type === 'anomaly') return 'border-amber-500/30 text-amber-400';
+  if (insight.type === 'prediction') return 'border-blue-500/30 text-blue-400';
+  if (insight.type === 'recommendation') return 'border-health-mint/30 text-health-mint';
+  return 'border-emerald-500/30 text-emerald-400';
+}
+
+function datasetStatusTone(dataset: DatasetRecord): string {
+  if (dataset.status === 'error') return 'border-red-500/30 text-red-400';
+  if (dataset.status === 'processing') return 'border-amber-500/30 text-amber-400';
+  return 'border-emerald-500/30 text-emerald-400';
+}
+
+function StatCard({ label, value, icon: Icon, tone, hint }: StatCardProps) {
   return (
-    <Card className="glass-card card-hover overflow-hidden">
-      <CardContent className="p-4 sm:p-5">
-        <div className="flex items-start justify-between">
-          <div className="flex-1">
-            <div className="flex items-center gap-2 mb-2">
-              <div className={cn(
-                "w-8 h-8 rounded-lg flex items-center justify-center",
-                trend === 'up' ? "bg-emerald-500/20" : 
-                trend === 'down' ? "bg-red-500/20" : "bg-blue-500/20"
-              )}>
-                <Icon className={cn(
-                  "w-4 h-4",
-                  trend === 'up' ? "text-emerald-400" : 
-                  trend === 'down' ? "text-red-400" : "text-blue-400"
-                )} />
-              </div>
-              <span className="text-xs text-muted-foreground uppercase tracking-wider">{title}</span>
-            </div>
-            
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-foreground sm:text-3xl">{value}</span>
-              {target && (
-                <span className="text-xs text-muted-foreground">/ {target}</span>
-              )}
-            </div>
-            
-            <div className="flex items-center gap-2 mt-2">
-              <div className={cn(
-                "flex items-center gap-1 text-sm font-medium",
-                trend === 'up' ? "text-emerald-400" : 
-                trend === 'down' ? "text-red-400" : "text-blue-400"
-              )}>
-                {trend === 'up' ? <TrendingUp className="w-4 h-4" /> : 
-                 trend === 'down' ? <TrendingDown className="w-4 h-4" /> : null}
-                <span>{change > 0 ? '+' : ''}{change}%</span>
-              </div>
-              <span className="text-xs text-muted-foreground">{changeLabel}</span>
-            </div>
-          </div>
-          
-          <div className="flex flex-col items-end gap-2">
-            <Badge 
-              variant="outline" 
-              className={cn(
-                "text-xs",
-                confidence === 'high' ? "border-emerald-500/30 text-emerald-400" :
-                confidence === 'medium' ? "border-amber-500/30 text-amber-400" :
-                "border-red-500/30 text-red-400"
-              )}
-            >
-              {confidence} confidence
-            </Badge>
-          </div>
+    <Card className="glass-card overflow-hidden">
+      <CardContent className="flex items-start gap-4 p-4">
+        <div className={cn('flex h-11 w-11 items-center justify-center rounded-xl', tone)}>
+          <Icon className="h-5 w-5" />
         </div>
-        
-        {target && (
-          <div className="mt-4">
-            <div className="flex justify-between text-xs mb-1">
-              <span className="text-muted-foreground">Progress to target</span>
-              <span className="text-foreground font-medium">87%</span>
-            </div>
-            <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-              <div className="h-full w-[87%] gradient-mint rounded-full" />
-            </div>
-          </div>
-        )}
+        <div className="min-w-0">
+          <p className="text-2xl font-bold text-foreground">{value}</p>
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
+        </div>
       </CardContent>
     </Card>
   );
 }
 
-export function Dashboard() {
+export function Dashboard({ onViewChange }: DashboardProps) {
+  const { datasets, insights, aiEnvironment, addSampleDataset, analyzeDataset } = useAnalytics();
+  const [isSeedingDemo, setIsSeedingDemo] = useState(false);
+  const [analyzingDatasetId, setAnalyzingDatasetId] = useState<string | null>(null);
+
+  const sortedDatasets = useMemo(
+    () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
+    [datasets]
+  );
+  const sortedInsights = useMemo(
+    () => [...insights].sort((left, right) => right.timestamp.localeCompare(left.timestamp)),
+    [insights]
+  );
+
+  const latestDataset = sortedDatasets[0] ?? null;
+  const latestInsight =
+    (latestDataset
+      ? sortedInsights.find((insight) => insight.datasetId === latestDataset.id)
+      : null) ?? sortedInsights[0] ?? null;
+
+  const stats = useMemo(() => {
+    const activeDatasets = datasets.filter((dataset) => dataset.status === 'active');
+    const averageQuality =
+      activeDatasets.length === 0
+        ? 0
+        : Math.round(
+            activeDatasets.reduce((sum, dataset) => sum + dataset.qualityScore, 0) / activeDatasets.length
+          );
+
+    return {
+      datasetCount: datasets.length,
+      rowCount: datasets.reduce((sum, dataset) => sum + dataset.rowCount, 0),
+      averageQuality,
+      insightCount: insights.length,
+      flaggedInsights: insights.filter((insight) => insight.flagged).length,
+      attentionCount: datasets.filter(
+        (dataset) => dataset.qualityScore < 80 || dataset.issues.length > 0 || dataset.status !== 'active'
+      ).length,
+    };
+  }, [datasets, insights]);
+
+  const qualityTrend = useMemo(() => {
+    return sortedDatasets
+      .slice(0, 6)
+      .reverse()
+      .map((dataset) => ({
+        name: shortenLabel(dataset.name, 14),
+        quality: dataset.qualityScore,
+        issues: dataset.issues.length,
+      }));
+  }, [sortedDatasets]);
+
+  const scaleTrend = useMemo(() => {
+    return sortedDatasets
+      .slice(0, 6)
+      .reverse()
+      .map((dataset) => ({
+        name: shortenLabel(dataset.name, 14),
+        rows: dataset.rowCount,
+        columns: dataset.columnCount,
+      }));
+  }, [sortedDatasets]);
+
+  const sourceMix = useMemo(() => {
+    return (['upload', 'sample', 'integration'] as const)
+      .map((source, index) => ({
+        name: source,
+        value: datasets.filter((dataset) => dataset.source === source).length,
+        color: PIE_COLORS[index],
+      }))
+      .filter((entry) => entry.value > 0);
+  }, [datasets]);
+
+  const datasetWatchlist = useMemo(() => {
+    return sortedDatasets
+      .flatMap((dataset) =>
+        dataset.issues.slice(0, 2).map((issue) => ({
+          datasetId: dataset.id,
+          datasetName: dataset.name,
+          qualityScore: dataset.qualityScore,
+          issue,
+        }))
+      )
+      .slice(0, 5);
+  }, [sortedDatasets]);
+
+  async function handleSeedDemo() {
+    setIsSeedingDemo(true);
+    try {
+      await addSampleDataset('demo');
+      onViewChange('datasets');
+    } finally {
+      setIsSeedingDemo(false);
+    }
+  }
+
+  async function handleAnalyzeLatest() {
+    if (!latestDataset) return;
+    setAnalyzingDatasetId(latestDataset.id);
+    try {
+      await analyzeDataset(latestDataset.id);
+      onViewChange('insights');
+    } finally {
+      setAnalyzingDatasetId(null);
+    }
+  }
+
+  if (datasets.length === 0) {
+    return (
+      <div className="space-y-6">
+        <section className="relative overflow-hidden rounded-3xl border border-health-mint/30 bg-card p-6 sm:p-8">
+          <div className="absolute inset-y-0 right-0 w-1/2 bg-gradient-to-l from-health-mint/10 via-transparent to-transparent" />
+          <div className="relative flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+            <div className="max-w-2xl">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline" className="border-health-mint/30 text-health-mint">
+                  Governed backend
+                </Badge>
+                <Badge variant="outline">{aiEnvironment.status}</Badge>
+                <Badge variant="outline">{aiEnvironment.mode}</Badge>
+              </div>
+              <h1 className="mt-4 text-2xl font-bold text-foreground sm:text-3xl">Build your governed analytics workspace</h1>
+              <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground sm:text-base">
+                Upload a real dataset or seed a demo one to start generating governed facts, explainable dashboard
+                specs, inspectable AI insights, and auditable chart narratives.
+              </p>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <Button className="gap-2 gradient-mint text-background hover:opacity-90" onClick={() => onViewChange('upload')}>
+                  <FileUp className="h-4 w-4" />
+                  Upload Dataset
+                </Button>
+                <Button variant="outline" className="gap-2" onClick={() => void handleSeedDemo()} disabled={isSeedingDemo}>
+                  {isSeedingDemo ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+                  Load Demo Dataset
+                </Button>
+                <Button variant="outline" className="gap-2" onClick={() => onViewChange('ai_analytics')}>
+                  <Sparkles className="h-4 w-4" />
+                  Open AI Analyst
+                </Button>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3 lg:w-[28rem]">
+              <Card className="border-border bg-background/80">
+                <CardContent className="p-4">
+                  <Shield className="h-5 w-5 text-health-mint" />
+                  <p className="mt-3 text-sm font-medium text-foreground">Governed reasoning</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Approved tools, semantic validation, and explicit evidence paths.</p>
+                </CardContent>
+              </Card>
+              <Card className="border-border bg-background/80">
+                <CardContent className="p-4">
+                  <Activity className="h-5 w-5 text-blue-400" />
+                  <p className="mt-3 text-sm font-medium text-foreground">Inspectable outputs</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Every answer can expose logic, chart payload, and result rows.</p>
+                </CardContent>
+              </Card>
+              <Card className="border-border bg-background/80">
+                <CardContent className="p-4">
+                  <ArrowUpRight className="h-5 w-5 text-amber-400" />
+                  <p className="mt-3 text-sm font-medium text-foreground">Stepwise buildout</p>
+                  <p className="mt-1 text-xs text-muted-foreground">We are replacing mock surfaces with real governed workflows one slice at a time.</p>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
-      {/* Welcome & Actions */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-bold text-foreground sm:text-2xl">
-            Welcome back, <span className="text-gradient-mint">Dr. Kimaro</span>
-          </h1>
-          <p className="text-sm text-muted-foreground mt-1 sm:text-base">
-            Here's what's happening in Dodoma Region health facilities
-          </p>
-        </div>
-        
-        <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
-          <Button variant="outline" size="sm" className="gap-2 flex-1 sm:flex-none">
-            <Calendar className="w-4 h-4" />
-            <span>Last 12 months</span>
-            <Filter className="w-3 h-3" />
-          </Button>
-          <Button variant="outline" size="sm" className="gap-2 flex-1 sm:flex-none">
-            <Download className="w-4 h-4" />
-            Export
-          </Button>
-        </div>
-      </div>
-
-      {/* AI Insights Banner */}
-      <div className="relative overflow-hidden rounded-2xl border border-health-mint/30 bg-gradient-to-r from-health-mint/10 via-health-purple/5 to-transparent p-4 sm:p-5">
-        <div className="absolute top-0 right-0 w-64 h-64 gradient-glow-mint opacity-50" />
-        <div className="relative flex flex-col gap-4 sm:flex-row sm:items-start">
-          <div className="w-10 h-10 rounded-xl bg-health-mint/20 flex items-center justify-center flex-shrink-0">
-            <Activity className="w-5 h-5 text-health-mint" />
-          </div>
-          <div className="flex-1">
-            <div className="mb-1 flex flex-wrap items-center gap-2">
-              <h3 className="font-semibold text-foreground">AI-Generated Insight</h3>
-              <Badge variant="outline" className="text-xs border-health-mint/30 text-health-mint">
-                94% confidence
-              </Badge>
-            </div>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              ANC coverage has improved <span className="text-emerald-400 font-medium">+12.3%</span> this quarter, 
-              with particularly strong gains in <span className="text-foreground">Chamwino (+18%)</span> and 
-              <span className="text-foreground"> Bahi (+15%)</span> districts. However, 
-              <span className="text-amber-400"> Kondoa remains below target at 52%</span> coverage.
-            </p>
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <Button size="sm" variant="outline" className="h-8 text-xs gap-1 border-health-mint/30 text-health-mint hover:bg-health-mint/10">
-                View Details
-                <ArrowUpRight className="w-3 h-3" />
-              </Button>
-              <Button size="sm" variant="ghost" className="h-8 text-xs gap-1 text-muted-foreground">
-                <AlertCircle className="w-3 h-3" />
-                Flag for Review
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* KPI Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <KPICard
-          title="ANC Coverage"
-          value="68.4%"
-          change={12.3}
-          changeLabel="vs last quarter"
-          icon={Users}
-          trend="up"
-          target="80%"
-          confidence="high"
-        />
-        <KPICard
-          title="Facility Delivery"
-          value="74.2%"
-          change={5.1}
-          changeLabel="vs last quarter"
-          icon={Baby}
-          trend="up"
-          target="85%"
-          confidence="high"
-        />
-        <KPICard
-          title="Maternal Mortality"
-          value="89"
-          change={-15}
-          changeLabel="vs last year"
-          icon={Heart}
-          trend="up"
-          confidence="medium"
-        />
-        <KPICard
-          title="Total ANC Visits"
-          value="12,473"
-          change={8.7}
-          changeLabel="vs last quarter"
-          icon={Activity}
-          trend="up"
-          confidence="high"
-        />
-      </div>
-
-      {/* Charts Row 1 */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Trend Chart */}
-        <Card className="glass-card lg:col-span-2">
-          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <CardTitle className="text-lg font-semibold">ANC Coverage Trend</CardTitle>
-              <p className="text-xs text-muted-foreground">Monthly coverage rate over time</p>
-            </div>
+      <section className="relative overflow-hidden rounded-3xl border border-health-mint/30 bg-card p-5 sm:p-6">
+        <div className="absolute right-0 top-0 h-64 w-64 rounded-full bg-health-mint/10 blur-3xl" />
+        <div className="relative flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
+          <div className="max-w-2xl">
             <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-full bg-emerald-500" />
-                <span className="text-xs text-muted-foreground">ANC</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-full bg-blue-500" />
-                <span className="text-xs text-muted-foreground">Delivery</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-full bg-purple-500" />
-                <span className="text-xs text-muted-foreground">PNC</span>
-              </div>
+              <Badge variant="outline" className="border-health-mint/30 text-health-mint">
+                Governed Workspace
+              </Badge>
+              <Badge variant="outline">{aiEnvironment.status}</Badge>
+              <Badge variant="outline">{aiEnvironment.mode}</Badge>
+              <Badge variant="outline">{aiEnvironment.version}</Badge>
             </div>
+            <h1 className="mt-4 text-2xl font-bold text-foreground sm:text-3xl">
+              Your analytics control plane is live
+            </h1>
+            <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground sm:text-base">
+              This dashboard now reflects governed workspace state instead of mock maternal-health samples. It
+              surfaces the current dataset pipeline, recent AI outputs, and the fastest next actions for analysis.
+            </p>
+
+            <div className="mt-5 flex flex-wrap gap-3">
+              <Button className="gap-2 gradient-mint text-background hover:opacity-90" onClick={() => onViewChange('upload')}>
+                <FileUp className="h-4 w-4" />
+                Upload Dataset
+              </Button>
+              <Button variant="outline" className="gap-2" onClick={() => onViewChange('ai_analytics')}>
+                <Sparkles className="h-4 w-4" />
+                Open AI Analyst
+              </Button>
+              <Button
+                variant="outline"
+                className="gap-2"
+                onClick={() => void handleAnalyzeLatest()}
+                disabled={!latestDataset || analyzingDatasetId === latestDataset?.id}
+              >
+                {analyzingDatasetId === latestDataset?.id ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <BarChart3 className="h-4 w-4" />
+                )}
+                Analyze Latest Dataset
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2 xl:w-[28rem]">
+            <Card className="border-border bg-background/80">
+              <CardContent className="p-4">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Latest dataset</p>
+                <p className="mt-2 truncate text-base font-semibold text-foreground">{latestDataset?.name ?? 'None'}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Badge variant="outline">{latestDataset?.rowCount.toLocaleString() ?? 0} rows</Badge>
+                  <Badge variant="outline">{latestDataset?.columnCount ?? 0} cols</Badge>
+                  <Badge variant="outline" className={latestDataset ? datasetStatusTone(latestDataset) : ''}>
+                    {latestDataset?.status ?? 'idle'}
+                  </Badge>
+                </div>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  Updated {latestDataset ? formatTimestamp(latestDataset.lastUpdated) : 'not yet'}
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-border bg-background/80">
+              <CardContent className="p-4">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Latest insight</p>
+                <p className="mt-2 text-base font-semibold text-foreground">
+                  {latestInsight?.title ?? 'No governed insight yet'}
+                </p>
+                <p className="mt-2 line-clamp-3 text-sm text-muted-foreground">
+                  {latestInsight?.content ?? 'Run analysis on a dataset to generate your first governed insight.'}
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {latestInsight ? (
+                    <>
+                      <Badge variant="outline" className={insightTone(latestInsight)}>
+                        {insightTypeLabel(latestInsight)}
+                      </Badge>
+                      <Badge variant="outline">{latestInsight.confidence}% confidence</Badge>
+                    </>
+                  ) : (
+                    <Badge variant="outline">Awaiting analysis</Badge>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </section>
+
+      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          label="Datasets"
+          value={stats.datasetCount.toLocaleString()}
+          icon={Database}
+          tone="bg-health-mint/20 text-health-mint"
+          hint="Governed sessions available in this workspace."
+        />
+        <StatCard
+          label="Rows Indexed"
+          value={formatCompactNumber(stats.rowCount)}
+          icon={BarChart3}
+          tone="bg-blue-500/20 text-blue-400"
+          hint="Combined row volume across active governed datasets."
+        />
+        <StatCard
+          label="Average Quality"
+          value={`${stats.averageQuality}%`}
+          icon={CheckCircle2}
+          tone="bg-emerald-500/20 text-emerald-400"
+          hint="Mean score across active datasets with backend profiling."
+        />
+        <StatCard
+          label="AI Insights"
+          value={stats.insightCount.toLocaleString()}
+          icon={Sparkles}
+          tone="bg-amber-500/20 text-amber-400"
+          hint={`${stats.flaggedInsights} flagged, ${stats.attentionCount} datasets needing attention.`}
+        />
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[1.7fr_1fr]">
+        <Card className="glass-card">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-lg font-semibold">Dataset Quality Trend</CardTitle>
+              <p className="text-xs text-muted-foreground">Recent governed sessions by quality score and surfaced issue count.</p>
+            </div>
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => onViewChange('datasets')}>
+              View Datasets
+              <ArrowUpRight className="h-3 w-3" />
+            </Button>
           </CardHeader>
           <CardContent>
-            <div className="h-60 sm:h-72">
+            <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={trendData}>
+                <AreaChart data={qualityTrend}>
                   <defs>
-                    <linearGradient id="ancGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
-                    </linearGradient>
-                    <linearGradient id="deliveryGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                    <linearGradient id="qualityFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 18%)" />
-                  <XAxis 
-                    dataKey="month" 
-                    stroke="hsl(220 10% 60%)" 
-                    fontSize={12}
-                    tickLine={false}
-                  />
-                  <YAxis 
-                    stroke="hsl(220 10% 60%)" 
-                    fontSize={12}
-                    tickLine={false}
-                    tickFormatter={(v) => `${v}%`}
-                  />
-                  <Tooltip 
-                    contentStyle={{ 
-                      backgroundColor: 'hsl(220 18% 8%)', 
+                  <XAxis dataKey="name" stroke="hsl(220 10% 60%)" fontSize={12} tickLine={false} />
+                  <YAxis stroke="hsl(220 10% 60%)" fontSize={12} tickLine={false} domain={[0, 100]} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: 'hsl(220 18% 8%)',
                       border: '1px solid hsl(220 15% 18%)',
-                      borderRadius: '8px'
+                      borderRadius: '12px',
                     }}
                   />
-                  <Area 
-                    type="monotone" 
-                    dataKey="anc" 
-                    stroke="#10b981" 
-                    fillOpacity={1} 
-                    fill="url(#ancGradient)" 
-                    strokeWidth={2}
-                  />
-                  <Area 
-                    type="monotone" 
-                    dataKey="delivery" 
-                    stroke="#3b82f6" 
-                    fillOpacity={1} 
-                    fill="url(#deliveryGradient)" 
-                    strokeWidth={2}
-                  />
-                  <Line 
-                    type="monotone" 
-                    dataKey="pnc" 
-                    stroke="#8b5cf6" 
-                    strokeWidth={2}
-                    dot={false}
-                  />
+                  <Area type="monotone" dataKey="quality" stroke="#10b981" fill="url(#qualityFill)" strokeWidth={2.5} />
+                  <Bar dataKey="issues" fill="#f59e0b" radius={[6, 6, 0, 0]} maxBarSize={18} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
           </CardContent>
         </Card>
 
-        {/* Age Distribution */}
         <Card className="glass-card">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-lg font-semibold">ANC by Age Group</CardTitle>
-            <p className="text-xs text-muted-foreground">Distribution of visits</p>
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Source Mix</CardTitle>
+            <p className="text-xs text-muted-foreground">How the current workspace is composed.</p>
           </CardHeader>
           <CardContent>
-            <div className="h-52 sm:h-56">
+            <div className="h-56">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Pie
-                    data={ageDistribution}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={60}
-                    outerRadius={80}
-                    paddingAngle={4}
-                    dataKey="value"
-                  >
-                    {ageDistribution.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
+                  <Pie data={sourceMix} dataKey="value" nameKey="name" innerRadius={52} outerRadius={78} paddingAngle={4}>
+                    {sourceMix.map((entry) => (
+                      <Cell key={entry.name} fill={entry.color} />
                     ))}
                   </Pie>
-                  <Tooltip 
-                    contentStyle={{ 
-                      backgroundColor: 'hsl(220 18% 8%)', 
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: 'hsl(220 18% 8%)',
                       border: '1px solid hsl(220 15% 18%)',
-                      borderRadius: '8px'
+                      borderRadius: '12px',
                     }}
                   />
                 </PieChart>
               </ResponsiveContainer>
             </div>
-            <div className="grid grid-cols-2 gap-2 mt-4 sm:grid-cols-3">
-              {ageDistribution.slice(0, 3).map((item) => (
-                <div key={item.name} className="text-center">
-                  <div className="flex items-center justify-center gap-1">
-                    <div className="w-2 h-2 rounded-full" style={{ backgroundColor: item.color }} />
-                    <span className="text-xs text-muted-foreground">{item.name}</span>
+
+            <div className="mt-4 grid gap-2">
+              {sourceMix.map((entry) => (
+                <div key={entry.name} className="flex items-center justify-between rounded-xl border border-border bg-background px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <div className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: entry.color }} />
+                    <span className="text-sm capitalize text-foreground">{entry.name}</span>
                   </div>
-                  <span className="text-sm font-medium">{item.value}%</span>
+                  <span className="text-sm text-muted-foreground">{entry.value}</span>
                 </div>
               ))}
             </div>
           </CardContent>
         </Card>
-      </div>
+      </section>
 
-      {/* Charts Row 2 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* District Comparison */}
+      <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
         <Card className="glass-card">
-          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <CardTitle className="text-lg font-semibold">ANC Coverage by District</CardTitle>
-              <p className="text-xs text-muted-foreground">Performance comparison</p>
+              <CardTitle className="text-lg font-semibold">Dataset Scale</CardTitle>
+              <p className="text-xs text-muted-foreground">Recent sessions compared by row and column footprint.</p>
             </div>
-            <Button variant="ghost" size="icon">
-              <MoreHorizontal className="w-4 h-4" />
-            </Button>
+            <Badge variant="outline">{sortedDatasets.length} governed sessions</Badge>
           </CardHeader>
           <CardContent>
-            <div className="h-60 sm:h-64">
+            <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={districtData} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 18%)" horizontal={false} />
-                  <XAxis 
-                    type="number" 
-                    stroke="hsl(220 10% 60%)" 
-                    fontSize={12}
-                    tickFormatter={(v) => `${v}%`}
-                  />
-                  <YAxis 
-                    type="category" 
-                    dataKey="name" 
-                    stroke="hsl(220 10% 60%)" 
-                    fontSize={12}
-                    width={90}
-                  />
-                  <Tooltip 
-                    contentStyle={{ 
-                      backgroundColor: 'hsl(220 18% 8%)', 
+                <BarChart data={scaleTrend}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 18%)" vertical={false} />
+                  <XAxis dataKey="name" stroke="hsl(220 10% 60%)" fontSize={12} tickLine={false} />
+                  <YAxis stroke="hsl(220 10% 60%)" fontSize={12} tickLine={false} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: 'hsl(220 18% 8%)',
                       border: '1px solid hsl(220 15% 18%)',
-                      borderRadius: '8px'
+                      borderRadius: '12px',
                     }}
-                    formatter={(v) => [`${v}%`, 'Coverage']}
                   />
-                  <Bar dataKey="value" radius={[0, 4, 4, 0]}>
-                    {districtData.map((entry, index) => (
-                      <Cell 
-                        key={`cell-${index}`} 
-                        fill={entry.value >= 75 ? '#10b981' : entry.value >= 65 ? '#f59e0b' : '#ef4444'}
-                      />
-                    ))}
-                  </Bar>
+                  <Bar dataKey="rows" fill="#3b82f6" radius={[6, 6, 0, 0]} maxBarSize={30} />
+                  <Bar dataKey="columns" fill="#10b981" radius={[6, 6, 0, 0]} maxBarSize={30} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
           </CardContent>
         </Card>
 
-        {/* Facility Performance Table */}
         <Card className="glass-card">
-          <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <CardTitle className="text-lg font-semibold">Facility Performance</CardTitle>
-              <p className="text-xs text-muted-foreground">Top performing facilities</p>
-            </div>
-            <Button variant="outline" size="sm" className="text-xs">
-              View All
-            </Button>
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Governance Watchlist</CardTitle>
+            <p className="text-xs text-muted-foreground">Quality and control-plane issues surfaced by the backend.</p>
           </CardHeader>
-          <CardContent>
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[560px]">
-                <thead>
-                  <tr className="border-b border-border">
-                    <th className="text-left py-3 px-2 text-xs font-medium text-muted-foreground uppercase">Facility</th>
-                    <th className="text-right py-3 px-2 text-xs font-medium text-muted-foreground uppercase">ANC Visits</th>
-                    <th className="text-right py-3 px-2 text-xs font-medium text-muted-foreground uppercase">Coverage</th>
-                    <th className="text-center py-3 px-2 text-xs font-medium text-muted-foreground uppercase">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[
-                    { name: 'Chamwino District Hospital', visits: 2847, coverage: 82, status: 'on-target' },
-                    { name: 'Bahi Health Center', visits: 1923, coverage: 78, status: 'on-target' },
-                    { name: 'Dodoma Regional Hospital', visits: 4521, coverage: 75, status: 'on-target' },
-                    { name: 'Chemba Dispensary', visits: 987, coverage: 71, status: 'at-risk' },
-                    { name: 'Kondoa Health Center', visits: 1456, coverage: 64, status: 'below-target' },
-                  ].map((facility, i) => (
-                    <tr key={i} className="border-b border-border/50 hover:bg-muted/30 transition-colors">
-                      <td className="py-3 px-2">
-                        <div>
-                          <p className="text-sm font-medium text-foreground">{facility.name}</p>
-                          <p className="text-xs text-muted-foreground">District {i + 1}</p>
-                        </div>
-                      </td>
-                      <td className="text-right py-3 px-2 text-sm">{facility.visits.toLocaleString()}</td>
-                      <td className="text-right py-3 px-2">
-                        <span className={cn(
-                          "text-sm font-medium",
-                          facility.coverage >= 75 ? "text-emerald-400" :
-                          facility.coverage >= 65 ? "text-amber-400" : "text-red-400"
-                        )}>
-                          {facility.coverage}%
-                        </span>
-                      </td>
-                      <td className="text-center py-3 px-2">
-                        <Badge 
-                          variant="outline" 
-                          className={cn(
-                            "text-xs",
-                            facility.status === 'on-target' ? "border-emerald-500/30 text-emerald-400" :
-                            facility.status === 'at-risk' ? "border-amber-500/30 text-amber-400" :
-                            "border-red-500/30 text-red-400"
-                          )}
-                        >
-                          {facility.status === 'on-target' ? 'On Target' :
-                           facility.status === 'at-risk' ? 'At Risk' : 'Below Target'}
-                        </Badge>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <CardContent className="space-y-3">
+            {datasetWatchlist.length === 0 ? (
+              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm text-muted-foreground">
+                No active watchlist items. Current datasets are not surfacing major quality issues.
+              </div>
+            ) : (
+              datasetWatchlist.map((item) => (
+                <div key={`${item.datasetId}-${item.issue}`} className="rounded-2xl border border-border bg-background p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className={item.qualityScore >= 80 ? 'border-emerald-500/30 text-emerald-400' : 'border-amber-500/30 text-amber-400'}>
+                      Quality {item.qualityScore}%
+                    </Badge>
+                    <span className="text-sm font-medium text-foreground">{item.datasetName}</span>
+                  </div>
+                  <p className="mt-2 text-sm text-muted-foreground">{item.issue}</p>
+                </div>
+              ))
+            )}
+
+            <div className="rounded-2xl border border-health-mint/30 bg-health-mint/5 p-4">
+              <div className="flex items-start gap-3">
+                <Shield className="mt-0.5 h-5 w-5 text-health-mint" />
+                <div>
+                  <p className="text-sm font-medium text-foreground">Trust layer status</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Answers now flow through governed sessions, inspectable insights, and approved ask-data execution.
+                  </p>
+                </div>
+              </div>
             </div>
           </CardContent>
         </Card>
-      </div>
+      </section>
 
-      {/* Data Quality Warning */}
-      <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
-        <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
-        <div>
-          <h4 className="font-medium text-amber-400 text-sm">Data Quality Warning</h4>
-          <p className="text-xs text-muted-foreground mt-1">
-            15% of ANC records are missing gestational age. This may affect coverage calculations. 
-            <button className="text-health-mint hover:underline ml-1">View affected records</button>
-          </p>
+      <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <Card className="glass-card">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-lg font-semibold">Recent Datasets</CardTitle>
+              <p className="text-xs text-muted-foreground">Latest governed sessions with quality and issue signals.</p>
+            </div>
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => onViewChange('datasets')}>
+              Open Datasets
+              <ArrowUpRight className="h-3 w-3" />
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {sortedDatasets.slice(0, 5).map((dataset) => (
+              <div key={dataset.id} className="rounded-2xl border border-border bg-background p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-sm font-medium text-foreground">{dataset.name}</p>
+                      <Badge variant="outline" className={datasetStatusTone(dataset)}>
+                        {dataset.status}
+                      </Badge>
+                      <Badge variant="outline">{dataset.type.toUpperCase()}</Badge>
+                    </div>
+                    <p className="mt-1 text-sm text-muted-foreground">{dataset.description}</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Badge variant="outline">{dataset.rowCount.toLocaleString()} rows</Badge>
+                      <Badge variant="outline">{dataset.columnCount} columns</Badge>
+                      <Badge variant="outline">Quality {dataset.qualityScore}%</Badge>
+                      <Badge variant="outline" className="capitalize">
+                        {dataset.source}
+                      </Badge>
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">Updated {formatTimestamp(dataset.lastUpdated)}</div>
+                </div>
+
+                {dataset.issues.length > 0 ? (
+                  <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+                    {dataset.issues[0]}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card className="glass-card">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-lg font-semibold">Recent Insights</CardTitle>
+              <p className="text-xs text-muted-foreground">Latest governed narratives produced in this workspace.</p>
+            </div>
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => onViewChange('insights')}>
+              Open Insights
+              <ArrowUpRight className="h-3 w-3" />
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {sortedInsights.length === 0 ? (
+              <div className="rounded-2xl border border-border bg-background p-5 text-sm text-muted-foreground">
+                No governed insights yet. Run analysis on the latest dataset to generate explainable findings.
+              </div>
+            ) : (
+              sortedInsights.slice(0, 4).map((insight) => (
+                <div key={insight.id} className="rounded-2xl border border-border bg-background p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className={insightTone(insight)}>
+                      {insightTypeLabel(insight)}
+                    </Badge>
+                    <Badge variant="outline">{insight.confidence}% confidence</Badge>
+                    {insight.flagged ? (
+                      <Badge variant="outline" className="border-amber-500/30 text-amber-400">
+                        <Flag className="mr-1 h-3 w-3" />
+                        Flagged
+                      </Badge>
+                    ) : null}
+                    {insight.verified ? (
+                      <Badge variant="outline" className="border-emerald-500/30 text-emerald-400">
+                        <CheckCircle2 className="mr-1 h-3 w-3" />
+                        Verified
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <p className="mt-3 text-sm font-medium text-foreground">{insight.title}</p>
+                  <p className="mt-1 line-clamp-3 text-sm text-muted-foreground">{insight.content}</p>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="outline">{insight.citations.length} citations</Badge>
+                      {insight.inspection?.factsUsed?.length ? (
+                        <Badge variant="outline">{insight.inspection.factsUsed.length} facts used</Badge>
+                      ) : null}
+                    </div>
+                    <span className="text-xs text-muted-foreground">{formatTimestamp(insight.timestamp)}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="rounded-2xl border border-border bg-card p-4 sm:p-5">
+        <div className="flex items-start gap-3">
+          <AlertCircle className="mt-0.5 h-5 w-5 text-health-mint" />
+          <div className="space-y-2">
+            <h3 className="font-medium text-foreground">Current Phase</h3>
+            <p className="text-sm text-muted-foreground">
+              The dashboard route is now governed workspace-aware. It surfaces live dataset and insight state instead
+              of mock health metrics, while deeper chart reasoning and audit details remain in the dedicated AI
+              analytics surface.
+            </p>
+          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 }
