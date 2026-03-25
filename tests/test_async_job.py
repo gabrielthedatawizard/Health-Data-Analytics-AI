@@ -12,13 +12,18 @@ client = TestClient(main.app)
 
 
 def test_generate_facts_task():
-    resp = client.post("/sessions", json={"created_by": "tester"})
+    resp = client.post("/sessions", json={"created_by": "tester"}, headers={"X-API-Key": "tester"})
     dataset_id = resp.json()["dataset_id"]
 
     df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     files = {"file": ("test.csv", io.BytesIO(csv_bytes), "text/csv")}
-    upload = client.post(f"/sessions/{dataset_id}/upload", files=files, data={"uploaded_by": "tester"})
+    upload = client.post(
+        f"/sessions/{dataset_id}/upload",
+        files=files,
+        data={"uploaded_by": "tester"},
+        headers={"X-API-Key": "tester"},
+    )
     assert upload.status_code == 200
 
     job = create_job("facts", dataset_id, {"mode": "full", "seed": 42})

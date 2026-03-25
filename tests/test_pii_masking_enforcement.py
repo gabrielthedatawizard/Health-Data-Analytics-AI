@@ -7,10 +7,11 @@ import backend.main as main
 
 
 client = TestClient(main.app)
+OWNER = "analyst_owner"
 
 
 def _create_pii_session() -> str:
-    session = client.post("/sessions", json={"created_by": "tester"}, headers={"X-API-Key": "user_1"})
+    session = client.post("/sessions", json={"created_by": OWNER}, headers={"X-API-Key": OWNER})
     assert session.status_code == 200
     dataset_id = session.json()["dataset_id"]
 
@@ -22,7 +23,12 @@ def _create_pii_session() -> str:
         }
     )
     files = {"file": ("pii.csv", io.BytesIO(df.to_csv(index=False).encode("utf-8")), "text/csv")}
-    upload = client.post(f"/sessions/{dataset_id}/upload", files=files, data={"uploaded_by": "tester"})
+    upload = client.post(
+        f"/sessions/{dataset_id}/upload",
+        files=files,
+        data={"uploaded_by": OWNER},
+        headers={"X-API-Key": OWNER},
+    )
     assert upload.status_code == 200
     return dataset_id
 
@@ -30,7 +36,7 @@ def _create_pii_session() -> str:
 def test_csv_export_masks_pii_by_default() -> None:
     dataset_id = _create_pii_session()
 
-    exported = client.get(f"/sessions/{dataset_id}/export/csv")
+    exported = client.get(f"/sessions/{dataset_id}/export/csv", headers={"X-API-Key": OWNER})
     assert exported.status_code == 200
     assert "patient_name" not in exported.text
     assert "pii_field_1" in exported.text
@@ -42,14 +48,14 @@ def test_sensitive_export_requires_request_and_approval() -> None:
     direct_enable = client.post(
         f"/sessions/{dataset_id}/sensitive-export",
         json={"enabled": True},
-        headers={"X-API-Key": "analyst_1"},
+        headers={"X-API-Key": OWNER},
     )
     assert direct_enable.status_code == 409
 
     requested = client.post(
         f"/sessions/{dataset_id}/sensitive-export/request",
         json={"justification": "Need reviewed patient outreach list for case investigation."},
-        headers={"X-API-Key": "analyst_1"},
+        headers={"X-API-Key": OWNER},
     )
     assert requested.status_code == 200
     assert requested.json()["sensitive_export_approval"]["status"] == "pending"
@@ -63,7 +69,7 @@ def test_sensitive_export_requires_request_and_approval() -> None:
     assert approved.json()["allow_sensitive_export"] is True
     assert approved.json()["sensitive_export_approval"]["status"] == "approved"
 
-    exported = client.get(f"/sessions/{dataset_id}/export/csv", headers={"X-API-Key": "analyst_1"})
+    exported = client.get(f"/sessions/{dataset_id}/export/csv", headers={"X-API-Key": OWNER})
     assert exported.status_code == 200
     assert "patient_name" in exported.text
 
@@ -74,7 +80,7 @@ def test_sensitive_export_rejection_keeps_masking() -> None:
     requested = client.post(
         f"/sessions/{dataset_id}/sensitive-export/request",
         json={"justification": "Need unmasked data for temporary quality validation."},
-        headers={"X-API-Key": "analyst_1"},
+        headers={"X-API-Key": OWNER},
     )
     assert requested.status_code == 200
 
@@ -87,7 +93,7 @@ def test_sensitive_export_rejection_keeps_masking() -> None:
     assert rejected.json()["allow_sensitive_export"] is False
     assert rejected.json()["sensitive_export_approval"]["status"] == "rejected"
 
-    exported = client.get(f"/sessions/{dataset_id}/export/csv", headers={"X-API-Key": "analyst_1"})
+    exported = client.get(f"/sessions/{dataset_id}/export/csv", headers={"X-API-Key": OWNER})
     assert exported.status_code == 200
     assert "patient_name" not in exported.text
     assert "pii_field_1" in exported.text

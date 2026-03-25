@@ -65,6 +65,38 @@ MID_ROW_MAX = 1_000_000
 MID_COL_MAX = 200
 SAMPLE_MAX_ROWS = 250_000
 CACHE_VERSION = "v1"
+VALID_USER_ROLES = {"viewer", "analyst", "reviewer", "admin"}
+ROLE_PERMISSIONS: dict[str, list[str]] = {
+    "viewer": ["sessions:read_own", "sessions:export_masked_own"],
+    "analyst": [
+        "sessions:create",
+        "sessions:read_own",
+        "sessions:write_own",
+        "sessions:compute_own",
+        "sessions:export_own",
+        "sensitive_export:request_own",
+    ],
+    "reviewer": [
+        "sessions:create",
+        "sessions:read_own",
+        "sessions:write_own",
+        "sessions:compute_own",
+        "sessions:export_own",
+        "sessions:read_all",
+        "sessions:export_all",
+        "sensitive_export:request_own",
+        "sensitive_export:review",
+    ],
+    "admin": [
+        "sessions:create",
+        "sessions:read_all",
+        "sessions:write_all",
+        "sessions:compute_all",
+        "sessions:export_all",
+        "sensitive_export:review",
+        "admin:all",
+    ],
+}
 
 
 app = FastAPI(title="AI Analytics Backend", version="0.1.0")
@@ -205,6 +237,12 @@ class ReportRequest(BaseModel):
 
 class DashboardSpecRequest(BaseModel):
     template: str = "health_core"
+
+
+class AuthContextResponse(BaseModel):
+    actor: str
+    role: str
+    permissions: list[str] = Field(default_factory=list)
 
 
 def _utc_now_iso() -> str:
@@ -374,6 +412,108 @@ def _actor_from_header(x_api_key: str | None, fallback: str = "anonymous") -> st
     if x_api_key and x_api_key.strip():
         return x_api_key.strip()
     return fallback
+
+
+def _normalize_role(role: str | None) -> str | None:
+    if not role:
+        return None
+    normalized = role.strip().lower()
+    if normalized in VALID_USER_ROLES:
+        return normalized
+    return None
+
+
+def _role_from_identity(actor: str, explicit_role: str | None = None) -> str:
+    normalized = _normalize_role(explicit_role)
+    if normalized:
+        return normalized
+
+    identity = (actor or "").strip().lower()
+    if not identity or identity == "anonymous":
+        return "viewer"
+    if identity == "admin" or identity.startswith("admin") or identity.endswith("_admin"):
+        return "admin"
+    if any(token in identity for token in ("manager", "reviewer", "approver", "auditor")):
+        return "reviewer"
+    if any(token in identity for token in ("viewer", "read_only", "readonly")):
+        return "viewer"
+    return "analyst"
+
+
+def _permissions_for_role(role: str) -> list[str]:
+    return list(ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["analyst"]))
+
+
+def _session_owner(meta: dict[str, Any]) -> str:
+    return str(meta.get("user_id") or meta.get("created_by") or "anonymous")
+
+
+def _resolve_auth_context(
+    x_api_key: str | None,
+    x_user_role: str | None = None,
+    *,
+    fallback_actor: str = "anonymous",
+    actor_query: str | None = None,
+    role_query: str | None = None,
+) -> tuple[str, str, list[str]]:
+    actor = _actor_from_header(x_api_key, fallback=actor_query.strip() if actor_query and actor_query.strip() else fallback_actor)
+    role = _role_from_identity(actor, explicit_role=(x_user_role or role_query))
+    return actor, role, _permissions_for_role(role)
+
+
+def _session_action_allowed(meta: dict[str, Any], actor: str, role: str, action: str) -> bool:
+    if role == "admin":
+        return True
+
+    owner = actor == _session_owner(meta)
+    if action == "read":
+        return owner or role == "reviewer"
+    if action in {"write", "compute"}:
+        return owner and role in {"analyst", "reviewer"}
+    if action == "export_masked":
+        return owner or role == "reviewer"
+    if action == "export_sensitive":
+        return role == "reviewer" or (owner and role in {"analyst", "reviewer"})
+    if action == "request_sensitive_export":
+        return owner and role in {"analyst", "reviewer"}
+    if action == "review_sensitive_export":
+        return role == "reviewer"
+    return False
+
+
+def _require_session_action(meta: dict[str, Any], actor: str, role: str, action: str) -> None:
+    if _session_action_allowed(meta, actor, role, action):
+        return
+
+    owner = _session_owner(meta)
+    role_label = role or "viewer"
+    raise HTTPException(
+        status_code=403,
+        detail=f"{role_label} is not allowed to {action.replace('_', ' ')} for session owned by {owner}.",
+    )
+
+
+def _authorized_session_context(
+    dataset_id: str,
+    *,
+    action: str,
+    x_api_key: str | None = None,
+    x_user_role: str | None = None,
+    fallback_actor: str = "anonymous",
+    actor_query: str | None = None,
+    role_query: str | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    actor, role, _ = _resolve_auth_context(
+        x_api_key,
+        x_user_role,
+        fallback_actor=fallback_actor,
+        actor_query=actor_query,
+        role_query=role_query,
+    )
+    _require_session_action(meta, actor, role, action)
+    return meta, actor, role
 
 
 def _sha256_text(value: str) -> str:
@@ -1770,11 +1910,28 @@ def health_check() -> dict[str, str]:
     return {"status": "ok", "timestamp": _utc_now_iso()}
 
 
+@app.get("/auth/me", response_model=AuthContextResponse)
+def get_auth_context(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> AuthContextResponse:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    return AuthContextResponse(actor=actor, role=role, permissions=permissions)
+
+
 @app.post("/sessions", response_model=CreateSessionResponse)
 def create_session(
-    payload: CreateSessionRequest | None = None, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    payload: CreateSessionRequest | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> CreateSessionResponse:
-    created_by = _actor_from_header(x_api_key, fallback=(payload.created_by if payload else "anonymous"))
+    created_by, role, permissions = _resolve_auth_context(
+        x_api_key,
+        x_user_role,
+        fallback_actor=(payload.created_by if payload else "anonymous"),
+    )
+    if "sessions:create" not in permissions:
+        raise HTTPException(status_code=403, detail=f"{role} is not allowed to create sessions.")
     dataset_id = str(uuid.uuid4())
     session_dir = _dataset_path(dataset_id)
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -1801,8 +1958,11 @@ def create_session(
 
 
 @app.get("/sessions")
-def list_sessions(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> dict[str, Any]:
-    actor = _actor_from_header(x_api_key, fallback="anonymous")
+def list_sessions(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
     items: list[SessionSummaryResponse] = []
 
     for child in sorted(DATA_DIR.iterdir(), reverse=True):
@@ -1814,7 +1974,7 @@ def list_sessions(x_api_key: str | None = Header(default=None, alias="X-API-Key"
         try:
             meta = _load_json(meta_path)
             created_by = str(meta.get("user_id") or meta.get("created_by") or "anonymous")
-            if actor != "anonymous" and created_by != actor:
+            if "sessions:read_all" not in permissions and created_by != actor:
                 continue
             dataset_id = str(meta.get("dataset_id") or child.name)
             items.append(_session_summary_from_meta(dataset_id, meta))
@@ -1826,9 +1986,12 @@ def list_sessions(x_api_key: str | None = Header(default=None, alias="X-API-Key"
 
 
 @app.get("/sessions/{dataset_id}", response_model=SessionMetaResponse)
-def get_session(dataset_id: str) -> SessionMetaResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+def get_session(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SessionMetaResponse:
+    meta, _, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     return SessionMetaResponse(
         dataset_id=meta["dataset_id"],
         status=meta.get("status", "unknown"),
@@ -1846,11 +2009,12 @@ def get_session(dataset_id: str) -> SessionMetaResponse:
 
 @app.patch("/sessions/{dataset_id}")
 def update_session(
-    dataset_id: str, payload: UpdateSessionRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: UpdateSessionRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
 
     if payload.display_name is not None:
         normalized_name = payload.display_name.strip()
@@ -1869,10 +2033,13 @@ def update_session(
 
 
 @app.delete("/sessions/{dataset_id}")
-def delete_session(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> dict[str, Any]:
+def delete_session(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
     session_dir = _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
     _append_audit(dataset_id, "session_deleted", actor, {})
     cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:")
 
@@ -1890,24 +2057,26 @@ def delete_session(dataset_id: str, x_api_key: str | None = Header(default=None,
 
 @app.post("/sessions/{dataset_id}/masking")
 def update_masking(
-    dataset_id: str, payload: MaskingRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: MaskingRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
     meta["pii_masking_enabled"] = bool(payload.enabled)
     _save_meta(dataset_id, meta)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
     _append_audit(dataset_id, "masking_toggled", actor, {"enabled": payload.enabled})
     return {"dataset_id": dataset_id, "pii_masking_enabled": meta["pii_masking_enabled"]}
 
 
 @app.post("/sessions/{dataset_id}/sensitive-export")
 def update_sensitive_export(
-    dataset_id: str, payload: SensitiveExportRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: SensitiveExportRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
     approval = _sensitive_export_approval(meta)
 
     if payload.enabled:
@@ -1943,9 +2112,12 @@ def update_sensitive_export(
 
 
 @app.get("/sessions/{dataset_id}/sensitive-export")
-def get_sensitive_export_status(dataset_id: str) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+def get_sensitive_export_status(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    meta, _, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     return {
         "dataset_id": dataset_id,
         "allow_sensitive_export": bool(meta.get("allow_sensitive_export", False)),
@@ -1958,10 +2130,14 @@ def request_sensitive_export_approval(
     dataset_id: str,
     payload: SensitiveExportApprovalRequest,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(
+        dataset_id,
+        action="request_sensitive_export",
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+    )
     approval = _sensitive_export_approval(meta)
 
     approval.update(
@@ -1996,10 +2172,14 @@ def decide_sensitive_export_approval(
     dataset_id: str,
     payload: SensitiveExportApprovalDecision,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(
+        dataset_id,
+        action="review_sensitive_export",
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+    )
     approval = _sensitive_export_approval(meta)
 
     if approval.get("status") != "pending":
@@ -2032,9 +2212,16 @@ async def upload_file(
     sheet_name: str | None = Query(default=None, description="Excel sheet to load. Defaults to first sheet."),
     uploaded_by: str = Form(default="anonymous"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
     session_dir = _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(
+        dataset_id,
+        action="write",
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+        fallback_actor=uploaded_by.strip() or "anonymous",
+    )
 
     filename = file.filename or "uploaded_file"
     extension = Path(filename).suffix.lower()
@@ -2069,7 +2256,6 @@ async def upload_file(
     with raw_path.open("wb") as handle:
         handle.write(content)
     file_meta["raw_path"] = str(raw_path)
-    actor = _actor_from_header(x_api_key, fallback=uploaded_by.strip() or meta.get("created_by", "anonymous"))
     file_meta["uploaded_at"] = _utc_now_iso()
     file_meta["uploaded_by"] = actor
 
@@ -2106,9 +2292,9 @@ def profile_dataset(
     response: FastAPIResponse,
     mask_pii: bool | None = Query(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> ProfileResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2135,7 +2321,6 @@ def profile_dataset(
     meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
     meta["status"] = "profiled"
     _save_meta(dataset_id, meta)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
     _append_audit(dataset_id, "profile_generated", actor, {})
 
     if response is not None:
@@ -2150,9 +2335,10 @@ def profile_dataset(
 def get_semantic_layer(
     dataset_id: str,
     mask_pii: bool | None = Query(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> SemanticLayerResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, _, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2176,9 +2362,9 @@ def generate_facts(
     mode: str = Query(default="auto"),
     force: bool = Query(default=False),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2245,7 +2431,6 @@ def generate_facts(
             from backend.tasks import generate_facts_task
 
             generate_facts_task.delay(job["job_id"], dataset_id, requested_mode, seed)
-            actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
             _append_audit(dataset_id, "facts_job_queued", actor, {"job_id": job["job_id"], "mode": requested_mode})
         except Exception as exc:
             try:
@@ -2304,7 +2489,6 @@ def generate_facts(
     meta["schema_hash"] = schema_hash
     meta["status"] = "facts_generated"
     _save_meta(dataset_id, meta)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
     _append_audit(dataset_id, "facts_generated", actor, {"mode": requested_mode})
 
     cache.set(cache_key, facts_bundle)
@@ -2325,9 +2509,9 @@ def regenerate_facts(
     mode: str = Query(default="full"),
     seed: int | None = Query(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2347,7 +2531,6 @@ def regenerate_facts(
         from backend.tasks import generate_facts_task
 
         generate_facts_task.delay(job["job_id"], dataset_id, mode, resolved_seed)
-        actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
         _append_audit(dataset_id, "facts_job_forced", actor, {"job_id": job["job_id"], "mode": mode})
     except Exception as exc:
         try:
@@ -2365,10 +2548,12 @@ def regenerate_facts(
 
 @app.post("/sessions/{dataset_id}/clean")
 def clean_dataset(
-    dataset_id: str, payload: CleanRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: CleanRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2384,7 +2569,7 @@ def clean_dataset(
     _append_audit(
         dataset_id,
         "dataset_cleaned",
-        _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
+        actor,
         {"actions": payload.actions, "pii_mask": payload.pii_mask},
     )
 
@@ -2399,9 +2584,9 @@ def generate_dashboard_spec(
     payload: DashboardSpecRequest | None = None,
     use_llm: bool = Query(default=True),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> DashboardSpecResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2449,7 +2634,7 @@ def generate_dashboard_spec(
             _append_audit(
                 dataset_id,
                 "dashboard_spec_generated",
-                _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
+                actor,
                 {"use_llm": False, "fallback_reason": str(exc), "template": template},
             )
     else:
@@ -2462,7 +2647,6 @@ def generate_dashboard_spec(
     meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
     meta["status"] = "dashboard_spec_generated"
     _save_meta(dataset_id, meta)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
     _append_audit(dataset_id, "dashboard_spec_generated", actor, {"use_llm": use_llm, "template": template})
     if response is not None:
         response.headers["ETag"] = _etag_for(
@@ -2472,8 +2656,12 @@ def generate_dashboard_spec(
 
 
 @app.get("/sessions/{dataset_id}/dashboard")
-def get_dashboard(dataset_id: str) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
+def get_dashboard(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     spec_path = _dashboard_spec_path(dataset_id)
     if not spec_path.exists():
         raise HTTPException(status_code=404, detail="Dashboard spec not generated yet.")
@@ -2483,11 +2671,12 @@ def get_dashboard(dataset_id: str) -> dict[str, Any]:
 
 @app.post("/sessions/{dataset_id}/ask", response_model=AskResponse)
 def ask_dataset(
-    dataset_id: str, payload: AskRequest, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: AskRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> AskResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     facts_path = _facts_path(dataset_id)
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
@@ -2605,9 +2794,13 @@ def ask_dataset(
 
 
 @app.get("/sessions/{dataset_id}/preview")
-def preview_dataset(dataset_id: str, limit: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+def preview_dataset(
+    dataset_id: str,
+    limit: int = Query(default=1000, ge=1, le=5000),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    meta, _, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2622,10 +2815,12 @@ def preview_dataset(dataset_id: str, limit: int = Query(default=1000, ge=1, le=5
 
 @app.post("/sessions/{dataset_id}/report")
 def generate_report(
-    dataset_id: str, payload: ReportRequest | None = None, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+    dataset_id: str,
+    payload: ReportRequest | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     if not meta.get("file"):
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
@@ -2640,7 +2835,6 @@ def generate_report(
         from backend.tasks import generate_report_task
 
         generate_report_task.delay(job["job_id"], dataset_id, payload.template, payload.sections)
-        actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
         _append_audit(dataset_id, "report_job_queued", actor, {"job_id": job["job_id"]})
     except Exception as exc:
         try:
@@ -2657,44 +2851,109 @@ def generate_report(
 
 
 @app.get("/sessions/{dataset_id}/report/html")
-def get_report_html(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> HTMLResponse:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+def get_report_html(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    actor: str | None = Query(default=None),
+    role: str | None = Query(default=None),
+) -> HTMLResponse:
+    meta, resolved_actor, _ = _authorized_session_context(
+        dataset_id,
+        action="export_masked",
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+        actor_query=actor,
+        role_query=role,
+    )
     path = _report_path(dataset_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report not generated yet.")
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
-    _append_audit(dataset_id, "export_html", actor, {"format": "html"})
+    _append_audit(dataset_id, "export_html", resolved_actor, {"format": "html"})
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
 @app.get("/sessions/{dataset_id}/report/pdf")
-def get_report_pdf(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> Response:
-    _require_session_dir(dataset_id)
-    meta = _load_meta(dataset_id)
+def get_report_pdf(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    actor: str | None = Query(default=None),
+    role: str | None = Query(default=None),
+) -> Response:
+    meta, resolved_actor, _ = _authorized_session_context(
+        dataset_id,
+        action="export_masked",
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+        actor_query=actor,
+        role_query=role,
+    )
     path = _report_pdf_path(dataset_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report PDF not generated yet.")
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
-    _append_audit(dataset_id, "export_pdf", actor, {"format": "pdf"})
+    _append_audit(dataset_id, "export_pdf", resolved_actor, {"format": "pdf"})
     return Response(content=path.read_bytes(), media_type="application/pdf")
 
 
 @app.get("/sessions/{dataset_id}/export/pdf")
-def export_pdf_direct(dataset_id: str, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> Response:
-    return get_report_pdf(dataset_id, x_api_key=x_api_key)
+def export_pdf_direct(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    actor: str | None = Query(default=None),
+    role: str | None = Query(default=None),
+) -> Response:
+    return get_report_pdf(dataset_id, x_api_key=x_api_key, x_user_role=x_user_role, actor=actor, role=role)
 
 
 @app.get("/jobs")
-def list_all_jobs(dataset_id: str | None = Query(default=None)) -> dict[str, Any]:
-    return {"jobs": [_normalize_job_payload(job) for job in list_jobs(dataset_id=dataset_id)]}
+def list_all_jobs(
+    dataset_id: str | None = Query(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    if dataset_id:
+        meta, _, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+        del meta
+        return {"jobs": [_normalize_job_payload(job) for job in list_jobs(dataset_id=dataset_id)]}
+
+    jobs = list_jobs(dataset_id=None)
+    if "sessions:read_all" in permissions:
+        return {"jobs": [_normalize_job_payload(job) for job in jobs]}
+
+    visible_jobs: list[dict[str, Any]] = []
+    for job in jobs:
+        job_dataset_id = str(job.get("dataset_id") or "")
+        if not job_dataset_id:
+            continue
+        try:
+            _authorized_session_context(
+                job_dataset_id,
+                action="read",
+                x_api_key=x_api_key,
+                x_user_role=x_user_role,
+                fallback_actor=actor,
+            )
+            visible_jobs.append(job)
+        except HTTPException:
+            continue
+    return {"jobs": [_normalize_job_payload(job) for job in visible_jobs]}
 
 
 @app.get("/jobs/{job_id}")
-def get_job_status(job_id: str) -> dict[str, Any]:
+def get_job_status(
+    job_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
+    dataset_id = str(job.get("dataset_id") or "")
+    if dataset_id:
+        _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     return _normalize_job_payload(job)
 
 
@@ -2704,6 +2963,9 @@ def export_dataset(
     format: str,
     limit: int = Query(default=5000, ge=1, le=50000),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    actor: str | None = Query(default=None),
+    role: str | None = Query(default=None),
 ) -> Response:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
@@ -2716,7 +2978,15 @@ def export_dataset(
         _save_meta(dataset_id, meta)
     aliases = _pii_aliases(profile or {})
     pii_detected = bool(aliases)
-    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    export_action = "export_sensitive" if format in {"csv", "json"} and pii_detected and _can_export_sensitive(meta) else "export_masked"
+    _, actor, _ = _authorized_session_context(
+        dataset_id,
+        action=export_action,
+        x_api_key=x_api_key,
+        x_user_role=x_user_role,
+        actor_query=actor,
+        role_query=role,
+    )
 
     if format in {"html", "report"}:
         path = _report_path(dataset_id)
@@ -2771,8 +3041,12 @@ def export_dataset(
 
 
 @app.get("/sessions/{dataset_id}/audit")
-def get_audit_log(dataset_id: str) -> dict[str, Any]:
-    _require_session_dir(dataset_id)
+def get_audit_log(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     path = _audit_log_path(dataset_id)
     if not path.exists():
         return {"dataset_id": dataset_id, "events": []}

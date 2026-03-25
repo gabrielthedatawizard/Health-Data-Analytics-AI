@@ -9,6 +9,7 @@ import {
   FileSpreadsheet,
   Loader2,
   RefreshCw,
+  Shield,
   Sparkles,
   Upload,
 } from 'lucide-react';
@@ -20,7 +21,11 @@ import { Progress } from '@/components/ui/progress';
 import { Textarea } from '@/components/ui/textarea';
 import {
   API_TARGET_LABEL,
+  BACKEND_ROLE_STORAGE_KEY,
+  BACKEND_USER_STORAGE_KEY,
   type AskResponsePayload,
+  type AuthContextResponse,
+  type BackendUserRole,
   type AuditEvent,
   type JobStatus,
   type SessionMeta,
@@ -31,11 +36,13 @@ import {
   generateDashboardSpec,
   generateReport,
   getAudit,
+  getAuthContext,
   getDashboardSpec,
   getFacts,
   getJobStatus,
   getProfile,
   getSession,
+  inferBackendUserRole,
   requestSensitiveExportApproval,
   reportHtmlUrl,
   reportPdfUrl,
@@ -45,7 +52,8 @@ import {
 } from '@/lib/backend-api';
 
 const DATASET_STORAGE_KEY = 'healthai_backend_dataset_id';
-const USER_STORAGE_KEY = 'healthai_backend_user_id';
+const USER_STORAGE_KEY = BACKEND_USER_STORAGE_KEY;
+const ROLE_STORAGE_KEY = BACKEND_ROLE_STORAGE_KEY;
 
 function asNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -291,9 +299,17 @@ function AskResponseInspector({
 
 export function AIAnalyticsDashboard() {
   const [userId, setUserId] = useState(() => localStorage.getItem(USER_STORAGE_KEY) || 'react_user');
+  const [userRole, setUserRole] = useState<BackendUserRole>(() => {
+    const storedRole = localStorage.getItem(ROLE_STORAGE_KEY);
+    if (storedRole === 'viewer' || storedRole === 'analyst' || storedRole === 'reviewer' || storedRole === 'admin') {
+      return storedRole;
+    }
+    return inferBackendUserRole(localStorage.getItem(USER_STORAGE_KEY) || 'react_user');
+  });
   const [datasetId, setDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
   const [loadDatasetId, setLoadDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [authContext, setAuthContext] = useState<AuthContextResponse | null>(null);
   const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null);
   const [profile, setProfile] = useState<Record<string, unknown> | null>(null);
   const [factsBundle, setFactsBundle] = useState<Record<string, unknown> | null>(null);
@@ -316,6 +332,10 @@ export function AIAnalyticsDashboard() {
   }, [userId]);
 
   useEffect(() => {
+    localStorage.setItem(ROLE_STORAGE_KEY, userRole);
+  }, [userRole]);
+
+  useEffect(() => {
     if (datasetId) {
       localStorage.setItem(DATASET_STORAGE_KEY, datasetId);
       setLoadDatasetId(datasetId);
@@ -323,6 +343,31 @@ export function AIAnalyticsDashboard() {
     }
     localStorage.removeItem(DATASET_STORAGE_KEY);
   }, [datasetId]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function resolveAuthContext() {
+      try {
+        const context = await getAuthContext(userId, userRole);
+        if (!active) return;
+        setAuthContext(context);
+      } catch {
+        if (!active) return;
+        setAuthContext({
+          actor: userId.trim() || 'anonymous',
+          role: userRole,
+          permissions: [],
+        });
+      }
+    }
+
+    void resolveAuthContext();
+
+    return () => {
+      active = false;
+    };
+  }, [userId, userRole]);
 
   useEffect(() => {
     if (!datasetId.trim()) {
@@ -506,6 +551,12 @@ export function AIAnalyticsDashboard() {
   const sensitiveExportApproval = sessionMeta?.sensitive_export_approval;
   const sensitiveExportStatus = asString(sensitiveExportApproval?.status) ?? 'not_requested';
   const maskedExportsActive = piiCandidates.length > 0 && !sessionMeta?.allow_sensitive_export;
+  const permissionSet = useMemo(() => new Set(authContext?.permissions ?? []), [authContext]);
+  const effectiveRole = authContext?.role ?? userRole;
+  const canCreateSession = permissionSet.has('sessions:create') || permissionSet.has('admin:all');
+  const canCompute = permissionSet.has('sessions:compute_own') || permissionSet.has('sessions:compute_all') || permissionSet.has('admin:all');
+  const canReviewSensitiveExport = permissionSet.has('sensitive_export:review') || permissionSet.has('admin:all');
+  const canRequestSensitiveExport = permissionSet.has('sensitive_export:request_own') || permissionSet.has('admin:all');
 
   useEffect(() => {
     if (dashboardCharts.length === 0) {
@@ -899,8 +950,18 @@ export function AIAnalyticsDashboard() {
           </div>
         </div>
 
-        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_1fr_auto]">
+        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_220px_1fr_auto]">
           <Input value={userId} onChange={(event) => setUserId(event.target.value)} placeholder="User ID" />
+          <select
+            value={userRole}
+            onChange={(event) => setUserRole(event.target.value as BackendUserRole)}
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm"
+          >
+            <option value="viewer">viewer</option>
+            <option value="analyst">analyst</option>
+            <option value="reviewer">reviewer</option>
+            <option value="admin">admin</option>
+          </select>
           <Input
             value={loadDatasetId}
             onChange={(event) => setLoadDatasetId(event.target.value)}
@@ -911,11 +972,31 @@ export function AIAnalyticsDashboard() {
               {isBusy('load_session') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Load
             </Button>
-            <Button type="button" onClick={() => void handleCreateSession()} disabled={isBusy('create_session')}>
+            <Button type="button" onClick={() => void handleCreateSession()} disabled={isBusy('create_session') || !canCreateSession}>
               {isBusy('create_session') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               New Session
             </Button>
           </div>
+        </div>
+
+        <div className="mt-3 rounded-xl border border-border bg-background px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="outline">Actor: {authContext?.actor ?? userId ?? 'anonymous'}</Badge>
+            <Badge variant="outline">Role: {effectiveRole}</Badge>
+            <Badge variant="outline">Permissions: {authContext?.permissions.length ?? 0}</Badge>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            This dev auth layer is permission-aware but still header-driven. Production rollout still needs real identity and policy enforcement.
+          </p>
+          {authContext?.permissions?.length ? (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {authContext.permissions.slice(0, 8).map((permission) => (
+                <Badge key={permission} variant="secondary">
+                  {permission}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
@@ -924,7 +1005,11 @@ export function AIAnalyticsDashboard() {
             accept=".csv,.xlsx"
             onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
           />
-          <Button type="button" onClick={() => void handleUpload()} disabled={isBusy('upload') || !selectedFile}>
+          <Button
+            type="button"
+            onClick={() => void handleUpload()}
+            disabled={isBusy('upload') || !selectedFile || (!datasetId && !canCreateSession)}
+          >
             {isBusy('upload') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
             Upload Dataset
           </Button>
@@ -986,11 +1071,16 @@ export function AIAnalyticsDashboard() {
 
       <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
         <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" onClick={() => void handleProfile()} disabled={isBusy('profile') || !datasetId}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleProfile()}
+            disabled={isBusy('profile') || !datasetId || !canCompute}
+          >
             {isBusy('profile') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
             Run Profiling
           </Button>
-          <Button type="button" variant="outline" onClick={() => void handleFacts()} disabled={isBusy('facts') || !datasetId}>
+          <Button type="button" variant="outline" onClick={() => void handleFacts()} disabled={isBusy('facts') || !datasetId || !canCompute}>
             {isBusy('facts') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
             Generate Facts
           </Button>
@@ -998,12 +1088,12 @@ export function AIAnalyticsDashboard() {
             type="button"
             variant="outline"
             onClick={() => void handleDashboardSpec()}
-            disabled={isBusy('dashboard') || !datasetId}
+            disabled={isBusy('dashboard') || !datasetId || !canCompute}
           >
             {isBusy('dashboard') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Database className="mr-2 h-4 w-4" />}
             Generate Dashboard
           </Button>
-          <Button type="button" variant="outline" onClick={() => void handleReport()} disabled={isBusy('report') || !datasetId}>
+          <Button type="button" variant="outline" onClick={() => void handleReport()} disabled={isBusy('report') || !datasetId || !canCompute}>
             {isBusy('report') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <FileDown className="mr-2 h-4 w-4" />}
             Generate Report
           </Button>
@@ -1111,7 +1201,7 @@ export function AIAnalyticsDashboard() {
                 variant="outline"
                 size="sm"
                 onClick={() => void handleExplainDashboard()}
-                disabled={!hasDashboardSpec || busyAction === 'dashboard_explanation'}
+                disabled={!hasDashboardSpec || busyAction === 'dashboard_explanation' || !canCompute}
               >
                 {busyAction === 'dashboard_explanation' ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1192,7 +1282,7 @@ export function AIAnalyticsDashboard() {
                                   size="sm"
                                   variant={explanation?.preset === preset.id ? 'default' : 'outline'}
                                   onClick={() => void handleExplainChart(chart, preset.id)}
-                                  disabled={busyAction === buttonBusyKey}
+                                  disabled={busyAction === buttonBusyKey || !canCompute}
                                 >
                                   {busyAction === buttonBusyKey ? (
                                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1263,7 +1353,7 @@ export function AIAnalyticsDashboard() {
             placeholder="Ask a governed analytics question..."
             className="min-h-[110px]"
           />
-          <Button type="button" onClick={() => void handleAsk()} disabled={isBusy('ask') || !datasetId}>
+          <Button type="button" onClick={() => void handleAsk()} disabled={isBusy('ask') || !datasetId || !canCompute}>
             {isBusy('ask') ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
             Ask Data
           </Button>
@@ -1354,7 +1444,7 @@ export function AIAnalyticsDashboard() {
                     />
 
                     <div className="flex flex-wrap gap-2">
-                      {sensitiveExportStatus !== 'pending' && !sessionMeta?.allow_sensitive_export ? (
+                      {canRequestSensitiveExport && sensitiveExportStatus !== 'pending' && !sessionMeta?.allow_sensitive_export ? (
                         <Button
                           type="button"
                           variant="outline"
@@ -1370,7 +1460,7 @@ export function AIAnalyticsDashboard() {
                         </Button>
                       ) : null}
 
-                      {sensitiveExportStatus === 'pending' ? (
+                      {canReviewSensitiveExport && sensitiveExportStatus === 'pending' ? (
                         <>
                           <Button
                             type="button"

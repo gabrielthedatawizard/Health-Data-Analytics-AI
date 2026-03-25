@@ -24,13 +24,18 @@ def _create_dataset() -> str:
         }
     )
     files = {"file": ("health.csv", io.BytesIO(df.to_csv(index=False).encode("utf-8")), "text/csv")}
-    upload = client.post(f"/sessions/{dataset_id}/upload", files=files, data={"uploaded_by": "tester"})
+    upload = client.post(
+        f"/sessions/{dataset_id}/upload",
+        files=files,
+        data={"uploaded_by": "user_1"},
+        headers={"X-API-Key": "user_1"},
+    )
     assert upload.status_code == 200
 
-    profile = client.get(f"/sessions/{dataset_id}/profile")
+    profile = client.get(f"/sessions/{dataset_id}/profile", headers={"X-API-Key": "user_1"})
     assert profile.status_code == 200
 
-    facts = client.get(f"/sessions/{dataset_id}/facts")
+    facts = client.get(f"/sessions/{dataset_id}/facts", headers={"X-API-Key": "user_1"})
     assert facts.status_code == 200
     return dataset_id
 
@@ -38,7 +43,7 @@ def _create_dataset() -> str:
 def test_semantic_layer_endpoint_excludes_pii() -> None:
     dataset_id = _create_dataset()
 
-    response = client.get(f"/sessions/{dataset_id}/semantic-layer")
+    response = client.get(f"/sessions/{dataset_id}/semantic-layer", headers={"X-API-Key": "user_1"})
 
     assert response.status_code == 200
     payload = response.json()["semantic_layer"]

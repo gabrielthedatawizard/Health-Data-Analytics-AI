@@ -127,6 +127,14 @@ export interface SensitiveExportStatusResponse {
   sensitive_export_approval: SensitiveExportApprovalState;
 }
 
+export type BackendUserRole = 'viewer' | 'analyst' | 'reviewer' | 'admin';
+
+export interface AuthContextResponse {
+  actor: string;
+  role: BackendUserRole;
+  permissions: string[];
+}
+
 export const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
 
 export function computeDefaultApiBase(): string {
@@ -143,6 +151,61 @@ export function computeDefaultApiBase(): string {
 export const API_BASE = ENV_API_BASE || computeDefaultApiBase();
 export const API_TARGET_LABEL = API_BASE || 'same-origin';
 export const BACKEND_USER_STORAGE_KEY = 'healthai_backend_user_id';
+export const BACKEND_ROLE_STORAGE_KEY = 'healthai_backend_user_role';
+
+const VALID_BACKEND_ROLES = new Set<BackendUserRole>(['viewer', 'analyst', 'reviewer', 'admin']);
+
+function normalizeBackendUserRole(role: string | null | undefined): BackendUserRole | undefined {
+  if (!role) {
+    return undefined;
+  }
+  const normalized = role.trim().toLowerCase();
+  return VALID_BACKEND_ROLES.has(normalized as BackendUserRole) ? (normalized as BackendUserRole) : undefined;
+}
+
+function storedBackendUserId(): string {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  return localStorage.getItem(BACKEND_USER_STORAGE_KEY)?.trim() ?? '';
+}
+
+function storedBackendUserRole(): BackendUserRole | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  return normalizeBackendUserRole(localStorage.getItem(BACKEND_ROLE_STORAGE_KEY));
+}
+
+export function inferBackendUserRole(userId: string): BackendUserRole {
+  const identity = userId.trim().toLowerCase();
+  if (!identity || identity === 'anonymous') {
+    return 'viewer';
+  }
+  if (identity === 'admin' || identity.startsWith('admin') || identity.endsWith('_admin')) {
+    return 'admin';
+  }
+  if (['manager', 'reviewer', 'approver', 'auditor'].some((token) => identity.includes(token))) {
+    return 'reviewer';
+  }
+  if (['viewer', 'read_only', 'readonly'].some((token) => identity.includes(token))) {
+    return 'viewer';
+  }
+  return 'analyst';
+}
+
+function authenticatedUrl(path: string, options?: { userId?: string; userRole?: BackendUserRole }): string {
+  const url = new URL(apiUrl(path), typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
+  const actor = options?.userId?.trim() || storedBackendUserId();
+  const role = options?.userRole || storedBackendUserRole();
+  if (actor) {
+    url.searchParams.set('actor', actor);
+  }
+  if (role) {
+    url.searchParams.set('role', role);
+  }
+  return API_BASE ? url.toString() : `${url.pathname}${url.search}`;
+}
 
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
@@ -188,6 +251,7 @@ export async function apiRequest<T>(
   options?: {
     timeoutMs?: number;
     userId?: string;
+    userRole?: BackendUserRole;
   }
 ): Promise<T> {
   const url = apiUrl(path);
@@ -195,8 +259,13 @@ export async function apiRequest<T>(
   const timeoutMs = options?.timeoutMs ?? 60000;
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   const headers = new Headers(init?.headers ?? {});
-  if (options?.userId?.trim()) {
-    headers.set('X-API-Key', options.userId.trim());
+  const resolvedUserId = options?.userId?.trim() || storedBackendUserId();
+  const resolvedUserRole = options?.userRole || storedBackendUserRole();
+  if (resolvedUserId) {
+    headers.set('X-API-Key', resolvedUserId);
+  }
+  if (resolvedUserRole) {
+    headers.set('X-User-Role', resolvedUserRole);
   }
 
   try {
@@ -217,6 +286,10 @@ export async function apiRequest<T>(
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+export function getAuthContext(userId: string, userRole?: BackendUserRole) {
+  return apiRequest<AuthContextResponse>('/auth/me', undefined, { userId, userRole });
 }
 
 export function createSession(
@@ -401,17 +474,17 @@ export function setSensitiveExportEnabled(datasetId: string, userId: string, ena
 }
 
 export function reportPdfUrl(datasetId: string): string {
-  return apiUrl(`/sessions/${datasetId}/export/pdf`);
+  return authenticatedUrl(`/sessions/${datasetId}/export/pdf`);
 }
 
 export function reportHtmlUrl(datasetId: string): string {
-  return apiUrl(`/sessions/${datasetId}/report/html`);
+  return authenticatedUrl(`/sessions/${datasetId}/report/html`);
 }
 
 export function factsJsonUrl(datasetId: string): string {
-  return apiUrl(`/sessions/${datasetId}/export/json`);
+  return authenticatedUrl(`/sessions/${datasetId}/export/json`);
 }
 
 export function datasetCsvUrl(datasetId: string): string {
-  return apiUrl(`/sessions/${datasetId}/export/csv`);
+  return authenticatedUrl(`/sessions/${datasetId}/export/csv`);
 }
