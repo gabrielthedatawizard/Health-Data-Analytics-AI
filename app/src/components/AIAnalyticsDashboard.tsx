@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  BarChart3,
   BadgeCheck,
   Bot,
   Database,
@@ -47,6 +48,244 @@ function asNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+type DashboardChartSpec = {
+  key: string;
+  title: string;
+  type: string;
+  x: string | null;
+  y: string | null;
+  groupBy: string | null;
+  aggregation: string | null;
+  factIds: string[];
+  layout: Record<string, unknown> | null;
+};
+
+type ExplainPreset = 'summary' | 'significance' | 'contributors';
+
+type ChartExplanationEntry = {
+  question: string;
+  preset: ExplainPreset;
+  result: AskResponsePayload;
+  generatedAt: string;
+};
+
+const EXPLAIN_PRESETS: Array<{
+  id: ExplainPreset;
+  label: string;
+  instruction: string;
+}> = [
+  {
+    id: 'summary',
+    label: 'Explain',
+    instruction: 'Explain the main pattern, likely drivers, and any caveats in plain English.',
+  },
+  {
+    id: 'significance',
+    label: 'Check Signal',
+    instruction: 'Assess whether the visible change looks materially meaningful and call out what should be validated next.',
+  },
+  {
+    id: 'contributors',
+    label: 'Top Drivers',
+    instruction: 'Identify which segment, category, or time slice appears to contribute most and what follow-up cut to inspect next.',
+  },
+];
+
+function summarizeFactReference(fact: unknown): string | null {
+  const item = asRecord(fact);
+  if (!item) return null;
+
+  const value = asRecord(item.value);
+  const metric =
+    asString(value?.metric) ??
+    asString(value?.name) ??
+    asString(item.metric) ??
+    asString(item.type) ??
+    'governed fact';
+  const summary =
+    asString(value?.narrative) ??
+    asString(value?.summary) ??
+    asString(value?.label) ??
+    asString(item.summary);
+
+  return summary ? `${metric}: ${summary}` : metric;
+}
+
+function normalizeDashboardCharts(spec: Record<string, unknown> | null): DashboardChartSpec[] {
+  const items = Array.isArray(spec?.charts) ? spec.charts : [];
+  return items
+    .map((item, index) => {
+      const chart = asRecord(item);
+      if (!chart) return null;
+      return {
+        key: `${index}-${asString(chart.title) ?? 'chart'}`,
+        title: asString(chart.title) ?? `Chart ${index + 1}`,
+        type: asString(chart.type) ?? 'table',
+        x: asString(chart.x),
+        y: asString(chart.y),
+        groupBy: asString(chart.group_by),
+        aggregation: asString(chart.aggregation),
+        factIds: Array.isArray(chart.fact_ids)
+          ? chart.fact_ids.map((value) => asString(value)).filter((value): value is string => Boolean(value))
+          : [],
+        layout: asRecord(chart.layout),
+      };
+    })
+    .filter((chart): chart is DashboardChartSpec => Boolean(chart));
+}
+
+function buildChartExplanationQuestion(
+  chart: DashboardChartSpec,
+  preset: ExplainPreset,
+  linkedFacts: string[],
+  dashboardTitle?: string | null
+): string {
+  const presetConfig = EXPLAIN_PRESETS.find((candidate) => candidate.id === preset) ?? EXPLAIN_PRESETS[0];
+  const parts = [
+    dashboardTitle ? `Dashboard title: ${dashboardTitle}.` : null,
+    `Explain the governed dashboard chart titled "${chart.title}".`,
+    `Chart type: ${chart.type}.`,
+    chart.x ? `X axis: ${chart.x}.` : null,
+    chart.y ? `Y axis: ${chart.y}.` : null,
+    chart.groupBy ? `Grouped by: ${chart.groupBy}.` : null,
+    chart.aggregation ? `Aggregation: ${chart.aggregation}.` : null,
+    linkedFacts.length ? `Linked governed facts: ${linkedFacts.join(' | ')}.` : null,
+    presetConfig.instruction,
+    'Use only approved dataset evidence, explain uncertainty clearly, and surface any metric or coverage caveats.',
+  ];
+
+  return parts.filter(Boolean).join(' ');
+}
+
+function buildDashboardExplanationQuestion(
+  dashboardTitle: string | null,
+  charts: DashboardChartSpec[],
+  filters: Array<{ field: string; type: string }>
+): string {
+  const chartSummary = charts
+    .slice(0, 4)
+    .map((chart) => {
+      const parts = [
+        `${chart.title} (${chart.type})`,
+        chart.x ? `x=${chart.x}` : null,
+        chart.y ? `y=${chart.y}` : null,
+        chart.groupBy ? `group_by=${chart.groupBy}` : null,
+      ];
+      return parts.filter(Boolean).join(', ');
+    })
+    .join(' | ');
+  const filterSummary = filters.map((filter) => `${filter.field}:${filter.type}`).join(', ');
+
+  return [
+    dashboardTitle ? `Summarize the governed dashboard "${dashboardTitle}".` : 'Summarize this governed dashboard.',
+    chartSummary ? `Chart layout: ${chartSummary}.` : null,
+    filterSummary ? `Available filters: ${filterSummary}.` : null,
+    'Highlight the most important patterns, caveats, and next investigation steps for an analyst or quality committee.',
+    'Use only governed facts and semantic query logic.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function ResultRowsTable({
+  rows,
+  emptyMessage,
+}: {
+  rows: Array<Record<string, unknown>>;
+  emptyMessage: string;
+}) {
+  if (rows.length === 0) {
+    return <p className="text-sm text-muted-foreground">{emptyMessage}</p>;
+  }
+
+  return (
+    <div className="overflow-auto rounded-xl border border-border">
+      <table className="min-w-full divide-y divide-border text-sm">
+        <thead className="bg-muted/50">
+          <tr>
+            {Object.keys(rows[0] ?? {}).map((column) => (
+              <th key={column} className="whitespace-nowrap px-3 py-2 text-left font-medium text-foreground">
+                {column}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, 20).map((row, index) => (
+            <tr key={index} className="border-t border-border">
+              {Object.entries(row).map(([column, value]) => (
+                <td key={`${index}-${column}`} className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                  {String(value)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AskResponseInspector({
+  result,
+  title,
+  emptyRowsMessage,
+}: {
+  result: AskResponsePayload;
+  title: string;
+  emptyRowsMessage: string;
+}) {
+  const queryRows = result.result_rows ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-border bg-background p-4">
+        <p className="text-sm text-foreground">{result.answer}</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Badge variant="outline">Confidence: {result.confidence}</Badge>
+          <Badge variant="outline">Fact coverage: {result.fact_coverage}</Badge>
+          <Badge variant="outline">Data coverage: {result.data_coverage}</Badge>
+          <Badge variant="outline">Facts used: {result.facts_used.length}</Badge>
+        </div>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-3">
+        <div>
+          <p className="mb-2 text-sm font-medium text-foreground">Governance</p>
+          <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
+            {JSON.stringify(result.governance, null, 2)}
+          </pre>
+        </div>
+        <div>
+          <p className="mb-2 text-sm font-medium text-foreground">Query Plan</p>
+          <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
+            {JSON.stringify(result.query_plan ?? {}, null, 2)}
+          </pre>
+        </div>
+        <div>
+          <p className="mb-2 text-sm font-medium text-foreground">Chart Payload</p>
+          <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
+            {JSON.stringify(result.chart ?? {}, null, 2)}
+          </pre>
+        </div>
+      </div>
+
+      <div>
+        <p className="mb-2 text-sm font-medium text-foreground">{title}</p>
+        <ResultRowsTable rows={queryRows} emptyMessage={emptyRowsMessage} />
+      </div>
+    </div>
+  );
+}
+
 export function AIAnalyticsDashboard() {
   const [userId, setUserId] = useState(() => localStorage.getItem(USER_STORAGE_KEY) || 'react_user');
   const [datasetId, setDatasetId] = useState(() => localStorage.getItem(DATASET_STORAGE_KEY) || '');
@@ -61,6 +300,9 @@ export function AIAnalyticsDashboard() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [factsJob, setFactsJob] = useState<JobStatus | null>(null);
   const [reportJob, setReportJob] = useState<JobStatus | null>(null);
+  const [dashboardExplanation, setDashboardExplanation] = useState<ChartExplanationEntry | null>(null);
+  const [chartExplanations, setChartExplanations] = useState<Record<string, ChartExplanationEntry>>({});
+  const [selectedChartKey, setSelectedChartKey] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -85,6 +327,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setDashboardSpec(null);
       setAskResult(null);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(null);
       setAuditEvents([]);
       return;
     }
@@ -220,6 +465,47 @@ export function AIAnalyticsDashboard() {
     return Array.isArray(issues) ? issues.slice(0, 5) : [];
   }, [factsBundle]);
 
+  const dashboardCharts = useMemo(() => normalizeDashboardCharts(dashboardSpec), [dashboardSpec]);
+
+  const dashboardFilters = useMemo(() => {
+    const items = Array.isArray(dashboardSpec?.filters) ? dashboardSpec.filters : [];
+    return items
+      .map((item) => {
+        const filter = asRecord(item);
+        const field = asString(filter?.field);
+        const type = asString(filter?.type);
+        if (!field || !type) return null;
+        return { field, type };
+      })
+      .filter((item): item is { field: string; type: string } => Boolean(item));
+  }, [dashboardSpec]);
+
+  const factReferenceLookup = useMemo(() => {
+    const facts = Array.isArray(factsBundle?.insight_facts) ? factsBundle.insight_facts : [];
+    return facts.reduce<Record<string, string>>((accumulator, fact) => {
+      const item = asRecord(fact);
+      const id = asString(item?.id);
+      const summary = summarizeFactReference(fact);
+      if (id && summary) {
+        accumulator[id] = summary;
+      }
+      return accumulator;
+    }, {});
+  }, [factsBundle]);
+
+  const activeChartExplanation = selectedChartKey ? chartExplanations[selectedChartKey] ?? null : null;
+
+  useEffect(() => {
+    if (dashboardCharts.length === 0) {
+      setSelectedChartKey(null);
+      return;
+    }
+
+    setSelectedChartKey((current) =>
+      current && dashboardCharts.some((chart) => chart.key === current) ? current : dashboardCharts[0].key
+    );
+  }, [dashboardCharts]);
+
   async function handleCreateSession() {
     setBusyAction('create_session');
     setError(null);
@@ -278,6 +564,9 @@ export function AIAnalyticsDashboard() {
       setFactsBundle(null);
       setDashboardSpec(null);
       setAskResult(null);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(null);
       setFactsJob(null);
       setReportJob(null);
       setSelectedFile(null);
@@ -357,6 +646,9 @@ export function AIAnalyticsDashboard() {
     try {
       const response = await generateDashboardSpec(datasetId, userId);
       setDashboardSpec(response.dashboard_spec);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(normalizeDashboardCharts(response.dashboard_spec)[0]?.key ?? null);
       setSessionMeta(await getSession(datasetId, userId));
       setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
       setNotice('Dashboard spec generated successfully.');
@@ -391,6 +683,78 @@ export function AIAnalyticsDashboard() {
     }
   }
 
+  async function handleExplainDashboard() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (dashboardCharts.length === 0) {
+      setError('Generate a dashboard spec first.');
+      return;
+    }
+
+    const question = buildDashboardExplanationQuestion(
+      asString(dashboardSpec?.title),
+      dashboardCharts,
+      dashboardFilters
+    );
+
+    setBusyAction('dashboard_explanation');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await askDataset(datasetId, userId, question);
+      setDashboardExplanation({
+        generatedAt: new Date().toISOString(),
+        preset: 'summary',
+        question,
+        result: response,
+      });
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice('Dashboard explanation generated successfully.');
+    } catch (explainError) {
+      setError(explainError instanceof Error ? explainError.message : 'Dashboard explanation failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleExplainChart(chart: DashboardChartSpec, preset: ExplainPreset) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    const linkedFacts = chart.factIds
+      .map((factId) => factReferenceLookup[factId] ?? factId)
+      .filter((value): value is string => Boolean(value));
+    const question = buildChartExplanationQuestion(chart, preset, linkedFacts, asString(dashboardSpec?.title));
+    const busyKey = `chart_explanation:${chart.key}:${preset}`;
+
+    setBusyAction(busyKey);
+    setSelectedChartKey(chart.key);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await askDataset(datasetId, userId, question);
+      setChartExplanations((previous) => ({
+        ...previous,
+        [chart.key]: {
+          generatedAt: new Date().toISOString(),
+          preset,
+          question,
+          result: response,
+        },
+      }));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(`${chart.title} explanation generated successfully.`);
+    } catch (explainError) {
+      setError(explainError instanceof Error ? explainError.message : 'Chart explanation failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleReport() {
     if (!datasetId) {
       setError('Create or load a session first.');
@@ -420,7 +784,6 @@ export function AIAnalyticsDashboard() {
   const reportReady = Boolean(sessionMeta?.artifacts?.report_pdf);
   const hasFacts = Boolean(factsBundle);
   const hasDashboardSpec = Boolean(dashboardSpec);
-  const queryRows = askResult?.result_rows ?? [];
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -652,13 +1015,34 @@ export function AIAnalyticsDashboard() {
 
         <Card className="border-border">
           <CardHeader>
-            <CardTitle className="text-base">Dashboard Spec</CardTitle>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle className="text-base">Dashboard Spec</CardTitle>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Inspect governed chart blueprints and run explanation flows against approved data.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleExplainDashboard()}
+                disabled={!hasDashboardSpec || busyAction === 'dashboard_explanation'}
+              >
+                {busyAction === 'dashboard_explanation' ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <BarChart3 className="mr-2 h-4 w-4" />
+                )}
+                Explain Dashboard
+              </Button>
+            </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-4">
             {!hasDashboardSpec ? (
               <p className="text-sm text-muted-foreground">Generate a dashboard spec to inspect governed chart layout.</p>
             ) : (
-              <div className="space-y-3">
+              <div className="space-y-4">
                 <div className="flex flex-wrap gap-2">
                   <Badge variant="outline">Title: {String(dashboardSpec?.title ?? 'Untitled')}</Badge>
                   <Badge variant="outline">
@@ -669,6 +1053,105 @@ export function AIAnalyticsDashboard() {
                     Filters: {Array.isArray(dashboardSpec?.filters) ? dashboardSpec.filters.length : 0}
                   </Badge>
                 </div>
+
+                {dashboardCharts.length > 0 ? (
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    {dashboardCharts.map((chart) => {
+                      const isSelected = selectedChartKey === chart.key;
+                      const explanation = chartExplanations[chart.key];
+
+                      return (
+                        <div
+                          key={chart.key}
+                          className={`rounded-xl border p-4 transition-colors ${
+                            isSelected ? 'border-health-mint/40 bg-health-mint/5' : 'border-border bg-background'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-foreground">{chart.title}</p>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {chart.type} chart
+                                {chart.layout?.row !== undefined && chart.layout?.col !== undefined
+                                  ? ` · layout ${String(chart.layout.row)},${String(chart.layout.col)}`
+                                  : ''}
+                              </p>
+                            </div>
+                            <Badge variant="outline">{chart.type}</Badge>
+                          </div>
+
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {chart.x ? <Badge variant="outline">X: {chart.x}</Badge> : null}
+                            {chart.y ? <Badge variant="outline">Y: {chart.y}</Badge> : null}
+                            {chart.groupBy ? <Badge variant="outline">Group: {chart.groupBy}</Badge> : null}
+                            {chart.aggregation ? <Badge variant="outline">Agg: {chart.aggregation}</Badge> : null}
+                            <Badge variant="outline">Facts: {chart.factIds.length}</Badge>
+                          </div>
+
+                          {chart.factIds.length > 0 ? (
+                            <div className="mt-3 space-y-2">
+                              {chart.factIds.slice(0, 2).map((factId) => (
+                                <div key={factId} className="rounded-lg border border-border/70 bg-card px-3 py-2 text-xs text-muted-foreground">
+                                  {factReferenceLookup[factId] ?? factId}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {EXPLAIN_PRESETS.map((preset) => {
+                              const buttonBusyKey = `chart_explanation:${chart.key}:${preset.id}`;
+                              return (
+                                <Button
+                                  key={preset.id}
+                                  type="button"
+                                  size="sm"
+                                  variant={explanation?.preset === preset.id ? 'default' : 'outline'}
+                                  onClick={() => void handleExplainChart(chart, preset.id)}
+                                  disabled={busyAction === buttonBusyKey}
+                                >
+                                  {busyAction === buttonBusyKey ? (
+                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                  ) : null}
+                                  {preset.label}
+                                </Button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
+                {dashboardExplanation ? (
+                  <div className="rounded-xl border border-border bg-background p-4">
+                    <div className="mb-3">
+                      <p className="text-sm font-medium text-foreground">Dashboard Narrative</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{dashboardExplanation.question}</p>
+                    </div>
+                    <AskResponseInspector
+                      result={dashboardExplanation.result}
+                      title="Dashboard result rows"
+                      emptyRowsMessage="No tabular rows were returned for the dashboard summary."
+                    />
+                  </div>
+                ) : null}
+
+                {selectedChartKey && activeChartExplanation ? (
+                  <div className="rounded-xl border border-border bg-background p-4">
+                    <div className="mb-3">
+                      <p className="text-sm font-medium text-foreground">Selected Chart Explanation</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{activeChartExplanation.question}</p>
+                    </div>
+                    <AskResponseInspector
+                      result={activeChartExplanation.result}
+                      title="Chart result rows"
+                      emptyRowsMessage="No tabular rows were returned for this chart explanation."
+                    />
+                  </div>
+                ) : null}
+
                 <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
                   {JSON.stringify(dashboardSpec, null, 2)}
                 </pre>
@@ -704,62 +1187,11 @@ export function AIAnalyticsDashboard() {
 
         {askResult ? (
           <div className="mt-4 space-y-4">
-            <div className="rounded-xl border border-border bg-background p-4">
-              <p className="text-sm text-foreground">{askResult.answer}</p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Badge variant="outline">Confidence: {askResult.confidence}</Badge>
-                <Badge variant="outline">Fact coverage: {askResult.fact_coverage}</Badge>
-                <Badge variant="outline">Data coverage: {askResult.data_coverage}</Badge>
-                <Badge variant="outline">Facts used: {askResult.facts_used.length}</Badge>
-              </div>
-            </div>
-
-            <div className="grid gap-4 xl:grid-cols-2">
-              <div>
-                <p className="mb-2 text-sm font-medium text-foreground">Governance</p>
-                <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
-                  {JSON.stringify(askResult.governance, null, 2)}
-                </pre>
-              </div>
-              <div>
-                <p className="mb-2 text-sm font-medium text-foreground">Query Plan</p>
-                <pre className="overflow-auto rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
-                  {JSON.stringify(askResult.query_plan ?? {}, null, 2)}
-                </pre>
-              </div>
-            </div>
-
-            <div>
-              <p className="mb-2 text-sm font-medium text-foreground">Result Rows</p>
-              {queryRows.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No tabular rows were returned for this question.</p>
-              ) : (
-                <div className="overflow-auto rounded-xl border border-border">
-                  <table className="min-w-full divide-y divide-border text-sm">
-                    <thead className="bg-muted/50">
-                      <tr>
-                        {Object.keys(queryRows[0] ?? {}).map((column) => (
-                          <th key={column} className="whitespace-nowrap px-3 py-2 text-left font-medium text-foreground">
-                            {column}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {queryRows.slice(0, 20).map((row, index) => (
-                        <tr key={index} className="border-t border-border">
-                          {Object.entries(row).map(([column, value]) => (
-                            <td key={`${index}-${column}`} className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                              {String(value)}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+            <AskResponseInspector
+              result={askResult}
+              title="Result Rows"
+              emptyRowsMessage="No tabular rows were returned for this question."
+            />
           </div>
         ) : null}
       </section>
@@ -841,8 +1273,9 @@ export function AIAnalyticsDashboard() {
           <div>
             <h3 className="font-medium text-foreground">Current Phase</h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              This restores the governed React surface and fixes the broken build. The rest of the product still
-              needs migration away from the legacy browser-local analytics context.
+              This governed React surface now supports inspectable ask-data, dashboard summaries, and chart-level
+              explanations. The rest of the product still needs migration away from the legacy browser-local analytics
+              context.
             </p>
           </div>
         </div>
