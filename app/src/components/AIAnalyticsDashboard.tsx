@@ -36,8 +36,11 @@ import {
   getJobStatus,
   getProfile,
   getSession,
+  requestSensitiveExportApproval,
   reportHtmlUrl,
   reportPdfUrl,
+  reviewSensitiveExportApproval,
+  setSensitiveExportEnabled,
   uploadDataset,
 } from '@/lib/backend-api';
 
@@ -303,6 +306,7 @@ export function AIAnalyticsDashboard() {
   const [dashboardExplanation, setDashboardExplanation] = useState<ChartExplanationEntry | null>(null);
   const [chartExplanations, setChartExplanations] = useState<Record<string, ChartExplanationEntry>>({});
   const [selectedChartKey, setSelectedChartKey] = useState<string | null>(null);
+  const [exportApprovalInput, setExportApprovalInput] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -330,6 +334,7 @@ export function AIAnalyticsDashboard() {
       setDashboardExplanation(null);
       setChartExplanations({});
       setSelectedChartKey(null);
+      setExportApprovalInput('');
       setAuditEvents([]);
       return;
     }
@@ -494,6 +499,13 @@ export function AIAnalyticsDashboard() {
   }, [factsBundle]);
 
   const activeChartExplanation = selectedChartKey ? chartExplanations[selectedChartKey] ?? null : null;
+  const piiCandidates = useMemo(() => {
+    const raw = profile?.pii_candidates;
+    return Array.isArray(raw) ? raw.map((value) => String(value)).slice(0, 6) : [];
+  }, [profile]);
+  const sensitiveExportApproval = sessionMeta?.sensitive_export_approval;
+  const sensitiveExportStatus = asString(sensitiveExportApproval?.status) ?? 'not_requested';
+  const maskedExportsActive = piiCandidates.length > 0 && !sessionMeta?.allow_sensitive_export;
 
   useEffect(() => {
     if (dashboardCharts.length === 0) {
@@ -567,6 +579,7 @@ export function AIAnalyticsDashboard() {
       setDashboardExplanation(null);
       setChartExplanations({});
       setSelectedChartKey(null);
+      setExportApprovalInput('');
       setFactsJob(null);
       setReportJob(null);
       setSelectedFile(null);
@@ -678,6 +691,77 @@ export function AIAnalyticsDashboard() {
       setNotice('Ask-data answer generated successfully.');
     } catch (askError) {
       setError(askError instanceof Error ? askError.message : 'Ask-data request failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRequestSensitiveExportApproval() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (exportApprovalInput.trim().length < 8) {
+      setError('Enter a short justification before requesting sensitive export access.');
+      return;
+    }
+
+    setBusyAction('request_sensitive_export');
+    setError(null);
+    setNotice(null);
+    try {
+      await requestSensitiveExportApproval(datasetId, userId, exportApprovalInput.trim());
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice('Sensitive export approval requested.');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not request export approval.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleReviewSensitiveExportApproval(approved: boolean) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(approved ? 'approve_sensitive_export' : 'reject_sensitive_export');
+    setError(null);
+    setNotice(null);
+    try {
+      await reviewSensitiveExportApproval(datasetId, userId, {
+        approved,
+        note: exportApprovalInput.trim() || undefined,
+      });
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(approved ? 'Sensitive export approved and enabled.' : 'Sensitive export request rejected.');
+      setExportApprovalInput('');
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : 'Could not review export approval.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleDisableSensitiveExport() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction('disable_sensitive_export');
+    setError(null);
+    setNotice(null);
+    try {
+      await setSensitiveExportEnabled(datasetId, userId, false);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice('Sensitive export disabled. Future CSV and JSON downloads will be masked again.');
+    } catch (disableError) {
+      setError(disableError instanceof Error ? disableError.message : 'Could not disable sensitive export.');
     } finally {
       setBusyAction(null);
     }
@@ -1204,37 +1288,169 @@ export function AIAnalyticsDashboard() {
           <CardContent className="space-y-3">
             {!datasetId ? <p className="text-sm text-muted-foreground">Create or load a session to enable exports.</p> : null}
             {datasetId ? (
-              <div className="flex flex-wrap gap-2">
-                <a href={factsJsonUrl(datasetId)} target="_blank" rel="noreferrer">
-                  <Button type="button" variant="outline">
-                    <Database className="mr-2 h-4 w-4" />
-                    Facts JSON
-                  </Button>
-                </a>
-                <a href={datasetCsvUrl(datasetId)} target="_blank" rel="noreferrer">
-                  <Button type="button" variant="outline">
-                    <FileSpreadsheet className="mr-2 h-4 w-4" />
-                    CSV Export
-                  </Button>
-                </a>
-                {reportReady ? (
-                  <>
-                    <a href={reportPdfUrl(datasetId)} target="_blank" rel="noreferrer">
-                      <Button type="button" variant="outline">
-                        <FileDown className="mr-2 h-4 w-4" />
-                        Report PDF
-                      </Button>
-                    </a>
-                    <a href={reportHtmlUrl(datasetId)} target="_blank" rel="noreferrer">
-                      <Button type="button" variant="outline">
-                        <FileDown className="mr-2 h-4 w-4" />
-                        Report HTML
-                      </Button>
-                    </a>
-                  </>
+              <div className="space-y-4">
+                {profile ? (
+                  <div
+                    className={`rounded-xl border px-4 py-3 ${
+                      piiCandidates.length > 0
+                        ? maskedExportsActive
+                          ? 'border-amber-500/30 bg-amber-500/10'
+                          : 'border-red-500/30 bg-red-500/10'
+                        : 'border-emerald-500/30 bg-emerald-500/10'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="outline">
+                        Approval: {sensitiveExportStatus}
+                      </Badge>
+                      <Badge variant="outline">
+                        Mode: {maskedExportsActive ? 'masked' : sessionMeta?.allow_sensitive_export ? 'sensitive' : 'standard'}
+                      </Badge>
+                      <Badge variant="outline">
+                        PII fields: {piiCandidates.length}
+                      </Badge>
+                    </div>
+                    <p className="mt-3 text-sm text-foreground">
+                      {piiCandidates.length > 0
+                        ? maskedExportsActive
+                          ? 'CSV and JSON exports are currently masked because potential PII was detected.'
+                          : 'Sensitive export is enabled. CSV and JSON downloads may include raw PII field names and values.'
+                        : 'No likely PII columns were detected in the current profile. Standard exports are available.'}
+                    </p>
+                    {piiCandidates.length > 0 ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Candidate fields: {piiCandidates.join(', ')}
+                      </p>
+                    ) : null}
+                    {sensitiveExportApproval?.justification ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Request rationale: {sensitiveExportApproval.justification}
+                      </p>
+                    ) : null}
+                    {sensitiveExportApproval?.review_note ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Review note: {sensitiveExportApproval.review_note}
+                      </p>
+                    ) : null}
+                  </div>
                 ) : (
-                  <p className="text-sm text-muted-foreground">Report PDF will appear here after the report job succeeds.</p>
+                  <div className="rounded-xl border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+                    Run profiling to evaluate PII exposure before requesting sensitive export approval.
+                  </div>
                 )}
+
+                {piiCandidates.length > 0 ? (
+                  <div className="rounded-xl border border-border bg-background p-4 space-y-3">
+                    <p className="text-sm font-medium text-foreground">Sensitive Export Approval</p>
+                    <Textarea
+                      value={exportApprovalInput}
+                      onChange={(event) => setExportApprovalInput(event.target.value)}
+                      placeholder={
+                        sensitiveExportStatus === 'pending'
+                          ? 'Optional reviewer note before approving or rejecting...'
+                          : 'Describe why unmasked export is necessary and how it will be handled safely.'
+                      }
+                      className="min-h-[96px]"
+                    />
+
+                    <div className="flex flex-wrap gap-2">
+                      {sensitiveExportStatus !== 'pending' && !sessionMeta?.allow_sensitive_export ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => void handleRequestSensitiveExportApproval()}
+                          disabled={busyAction === 'request_sensitive_export'}
+                        >
+                          {busyAction === 'request_sensitive_export' ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <AlertCircle className="mr-2 h-4 w-4" />
+                          )}
+                          Request Approval
+                        </Button>
+                      ) : null}
+
+                      {sensitiveExportStatus === 'pending' ? (
+                        <>
+                          <Button
+                            type="button"
+                            onClick={() => void handleReviewSensitiveExportApproval(true)}
+                            disabled={busyAction === 'approve_sensitive_export'}
+                          >
+                            {busyAction === 'approve_sensitive_export' ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <BadgeCheck className="mr-2 h-4 w-4" />
+                            )}
+                            Approve Request
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void handleReviewSensitiveExportApproval(false)}
+                            disabled={busyAction === 'reject_sensitive_export'}
+                          >
+                            {busyAction === 'reject_sensitive_export' ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <AlertCircle className="mr-2 h-4 w-4" />
+                            )}
+                            Reject Request
+                          </Button>
+                        </>
+                      ) : null}
+
+                      {sessionMeta?.allow_sensitive_export ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => void handleDisableSensitiveExport()}
+                          disabled={busyAction === 'disable_sensitive_export'}
+                        >
+                          {busyAction === 'disable_sensitive_export' ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Shield className="mr-2 h-4 w-4" />
+                          )}
+                          Disable Sensitive Export
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap gap-2">
+                  <a href={factsJsonUrl(datasetId)} target="_blank" rel="noreferrer">
+                    <Button type="button" variant="outline">
+                      <Database className="mr-2 h-4 w-4" />
+                      Facts JSON
+                    </Button>
+                  </a>
+                  <a href={datasetCsvUrl(datasetId)} target="_blank" rel="noreferrer">
+                    <Button type="button" variant="outline">
+                      <FileSpreadsheet className="mr-2 h-4 w-4" />
+                      CSV Export
+                    </Button>
+                  </a>
+                  {reportReady ? (
+                    <>
+                      <a href={reportPdfUrl(datasetId)} target="_blank" rel="noreferrer">
+                        <Button type="button" variant="outline">
+                          <FileDown className="mr-2 h-4 w-4" />
+                          Report PDF
+                        </Button>
+                      </a>
+                      <a href={reportHtmlUrl(datasetId)} target="_blank" rel="noreferrer">
+                        <Button type="button" variant="outline">
+                          <FileDown className="mr-2 h-4 w-4" />
+                          Report HTML
+                        </Button>
+                      </a>
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">Report PDF will appear here after the report job succeeds.</p>
+                  )}
+                </div>
               </div>
             ) : null}
           </CardContent>

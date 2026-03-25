@@ -1,3 +1,13 @@
+export interface SensitiveExportApprovalState {
+  status: string;
+  requested_by?: string | null;
+  requested_at?: string | null;
+  justification?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  review_note?: string | null;
+}
+
 export interface SessionMeta {
   dataset_id: string;
   status: string;
@@ -7,6 +17,7 @@ export interface SessionMeta {
   user_id?: string | null;
   pii_masking_enabled: boolean;
   allow_sensitive_export: boolean;
+  sensitive_export_approval: SensitiveExportApprovalState;
   file?: {
     name?: string;
     rows?: number;
@@ -26,6 +37,7 @@ export interface SessionSummary {
   created_by: string;
   pii_masking_enabled: boolean;
   allow_sensitive_export: boolean;
+  sensitive_export_approval?: SensitiveExportApprovalState;
   file_name?: string | null;
   file_type?: string | null;
   size_bytes: number;
@@ -107,6 +119,12 @@ export interface PreviewResponse {
   rows: Array<Record<string, unknown>>;
   columns: string[];
   row_count: number;
+}
+
+export interface SensitiveExportStatusResponse {
+  dataset_id: string;
+  allow_sensitive_export: boolean;
+  sensitive_export_approval: SensitiveExportApprovalState;
 }
 
 export const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
@@ -333,6 +351,53 @@ export function getJobStatus(jobId: string, userId: string) {
 
 export function getAudit(datasetId: string, userId: string) {
   return apiRequest<AuditResponse>(`/sessions/${datasetId}/audit`, undefined, { userId });
+}
+
+export function getSensitiveExportStatus(datasetId: string, userId: string) {
+  return apiRequest<SensitiveExportStatusResponse>(`/sessions/${datasetId}/sensitive-export`, undefined, { userId });
+}
+
+export function requestSensitiveExportApproval(datasetId: string, userId: string, justification: string) {
+  return apiRequest<SensitiveExportStatusResponse>(
+    `/sessions/${datasetId}/sensitive-export/request`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ justification }),
+    },
+    { userId }
+  );
+}
+
+export function reviewSensitiveExportApproval(
+  datasetId: string,
+  userId: string,
+  payload: {
+    approved: boolean;
+    note?: string;
+  }
+) {
+  return apiRequest<SensitiveExportStatusResponse>(
+    `/sessions/${datasetId}/sensitive-export/decision`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId }
+  );
+}
+
+export function setSensitiveExportEnabled(datasetId: string, userId: string, enabled: boolean) {
+  return apiRequest<SensitiveExportStatusResponse>(
+    `/sessions/${datasetId}/sensitive-export`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    },
+    { userId }
+  );
 }
 
 export function reportPdfUrl(datasetId: string): string {

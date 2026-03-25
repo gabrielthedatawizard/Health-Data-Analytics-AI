@@ -109,6 +109,7 @@ class SessionSummaryResponse(BaseModel):
     column_count: int = 0
     quality_score: float = 0.0
     quality_issues: list[str] = Field(default_factory=list)
+    sensitive_export_approval: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
 
 
@@ -126,6 +127,7 @@ class SessionMetaResponse(BaseModel):
     user_id: str | None = None
     pii_masking_enabled: bool
     allow_sensitive_export: bool = False
+    sensitive_export_approval: dict[str, Any] = Field(default_factory=dict)
     file: dict[str, Any] | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
 
@@ -157,6 +159,15 @@ class MaskingRequest(BaseModel):
 
 class SensitiveExportRequest(BaseModel):
     enabled: bool
+
+
+class SensitiveExportApprovalRequest(BaseModel):
+    justification: str = Field(min_length=8, max_length=1000)
+
+
+class SensitiveExportApprovalDecision(BaseModel):
+    approved: bool
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class CleanRequest(BaseModel):
@@ -341,6 +352,7 @@ def _session_summary_from_meta(dataset_id: str, meta: dict[str, Any]) -> Session
         column_count=column_count,
         quality_score=round(quality_score, 2),
         quality_issues=quality_issues,
+        sensitive_export_approval=_sensitive_export_approval(meta),
         artifacts=meta.get("artifacts", {}),
     )
 
@@ -747,6 +759,37 @@ def _apply_profile_masking(profile: dict[str, Any], mask_enabled: bool) -> dict[
 
 def _can_export_sensitive(meta: dict[str, Any]) -> bool:
     return bool(meta.get("allow_sensitive_export", False))
+
+
+def _default_sensitive_export_approval() -> dict[str, Any]:
+    return {
+        "status": "not_requested",
+        "requested_by": None,
+        "requested_at": None,
+        "justification": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "review_note": None,
+    }
+
+
+def _sensitive_export_approval(meta: dict[str, Any]) -> dict[str, Any]:
+    approval = meta.get("sensitive_export_approval")
+    if not isinstance(approval, dict):
+        approval = _default_sensitive_export_approval()
+        meta["sensitive_export_approval"] = dict(approval)
+        return dict(approval)
+
+    normalized = _default_sensitive_export_approval()
+    normalized.update(
+        {
+            key: approval.get(key)
+            for key in normalized
+            if key in approval
+        }
+    )
+    meta["sensitive_export_approval"] = normalized
+    return dict(normalized)
 
 
 def _load_profile_if_exists(dataset_id: str) -> dict[str, Any] | None:
@@ -1748,6 +1791,7 @@ def create_session(
         "description": (payload.description.strip() if payload and payload.description else "") or "",
         "pii_masking_enabled": False,
         "allow_sensitive_export": False,
+        "sensitive_export_approval": _default_sensitive_export_approval(),
         "file": None,
         "artifacts": {},
     }
@@ -1794,6 +1838,7 @@ def get_session(dataset_id: str) -> SessionMetaResponse:
         user_id=meta.get("user_id"),
         pii_masking_enabled=bool(meta.get("pii_masking_enabled", False)),
         allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
+        sensitive_export_approval=_sensitive_export_approval(meta),
         file=meta.get("file"),
         artifacts=meta.get("artifacts", {}),
     )
@@ -1862,15 +1907,122 @@ def update_sensitive_export(
 ) -> dict[str, Any]:
     _require_session_dir(dataset_id)
     meta = _load_meta(dataset_id)
-    meta["allow_sensitive_export"] = bool(payload.enabled)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    approval = _sensitive_export_approval(meta)
+
+    if payload.enabled:
+        if approval.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail="Sensitive export approval is required before enabling unmasked export.",
+            )
+        meta["allow_sensitive_export"] = True
+    else:
+        meta["allow_sensitive_export"] = False
+        if approval.get("status") == "pending":
+            approval["status"] = "cancelled"
+        elif approval.get("status") == "approved":
+            approval["status"] = "revoked"
+        approval["reviewed_by"] = actor
+        approval["reviewed_at"] = _utc_now_iso()
+        approval["review_note"] = "Sensitive export disabled."
+        meta["sensitive_export_approval"] = approval
+
     _save_meta(dataset_id, meta)
     _append_audit(
         dataset_id,
         "sensitive_export_toggled",
-        _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous")),
-        {"enabled": payload.enabled},
+        actor,
+        {"enabled": payload.enabled, "approval_status": approval.get("status")},
     )
-    return {"dataset_id": dataset_id, "allow_sensitive_export": meta["allow_sensitive_export"]}
+    return {
+        "dataset_id": dataset_id,
+        "allow_sensitive_export": meta["allow_sensitive_export"],
+        "sensitive_export_approval": _sensitive_export_approval(meta),
+    }
+
+
+@app.get("/sessions/{dataset_id}/sensitive-export")
+def get_sensitive_export_status(dataset_id: str) -> dict[str, Any]:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    return {
+        "dataset_id": dataset_id,
+        "allow_sensitive_export": bool(meta.get("allow_sensitive_export", False)),
+        "sensitive_export_approval": _sensitive_export_approval(meta),
+    }
+
+
+@app.post("/sessions/{dataset_id}/sensitive-export/request")
+def request_sensitive_export_approval(
+    dataset_id: str,
+    payload: SensitiveExportApprovalRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    approval = _sensitive_export_approval(meta)
+
+    approval.update(
+        {
+            "status": "pending",
+            "requested_by": actor,
+            "requested_at": _utc_now_iso(),
+            "justification": payload.justification.strip(),
+            "reviewed_by": None,
+            "reviewed_at": None,
+            "review_note": None,
+        }
+    )
+    meta["allow_sensitive_export"] = False
+    meta["sensitive_export_approval"] = approval
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "sensitive_export_requested",
+        actor,
+        {"justification": payload.justification.strip()},
+    )
+    return {
+        "dataset_id": dataset_id,
+        "allow_sensitive_export": False,
+        "sensitive_export_approval": approval,
+    }
+
+
+@app.post("/sessions/{dataset_id}/sensitive-export/decision")
+def decide_sensitive_export_approval(
+    dataset_id: str,
+    payload: SensitiveExportApprovalDecision,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    _require_session_dir(dataset_id)
+    meta = _load_meta(dataset_id)
+    actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
+    approval = _sensitive_export_approval(meta)
+
+    if approval.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="No pending sensitive export request to review.")
+
+    approval["status"] = "approved" if payload.approved else "rejected"
+    approval["reviewed_by"] = actor
+    approval["reviewed_at"] = _utc_now_iso()
+    approval["review_note"] = payload.note.strip() if payload.note else None
+    meta["allow_sensitive_export"] = bool(payload.approved)
+    meta["sensitive_export_approval"] = approval
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "sensitive_export_reviewed",
+        actor,
+        {"approved": payload.approved, "note": approval.get("review_note")},
+    )
+    return {
+        "dataset_id": dataset_id,
+        "allow_sensitive_export": meta["allow_sensitive_export"],
+        "sensitive_export_approval": approval,
+    }
 
 
 @app.post("/sessions/{dataset_id}/upload")
@@ -1927,6 +2079,8 @@ async def upload_file(
         meta["display_name"] = Path(filename).stem
     meta["status"] = "uploaded"
     meta["artifacts"] = {}
+    meta["allow_sensitive_export"] = False
+    meta["sensitive_export_approval"] = _default_sensitive_export_approval()
     meta["file_hash"] = _dataset_signature(meta)
     cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:")
     _save_meta(dataset_id, meta)
@@ -2555,6 +2709,11 @@ def export_dataset(
     meta = _load_meta(dataset_id)
     format = format.lower()
     profile = _load_profile_if_exists(dataset_id)
+    if profile is None and meta.get("file"):
+        profile = _build_profile(_read_uploaded_file(meta))
+        _save_json(_profile_path(dataset_id), profile)
+        meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
+        _save_meta(dataset_id, meta)
     aliases = _pii_aliases(profile or {})
     pii_detected = bool(aliases)
     actor = _actor_from_header(x_api_key, fallback=meta.get("user_id") or meta.get("created_by", "anonymous"))
@@ -2586,9 +2745,10 @@ def export_dataset(
         if not facts_path.exists():
             raise HTTPException(status_code=404, detail="Facts bundle not generated yet.")
         facts_bundle = _load_json(facts_path)
+        masked_export = pii_detected and not _can_export_sensitive(meta)
         if pii_detected and not _can_export_sensitive(meta):
             facts_bundle = _mask_recursive(facts_bundle, aliases)
-        _append_audit(dataset_id, "export_json", actor, {"format": "json"})
+        _append_audit(dataset_id, "export_json", actor, {"format": "json", "masked": masked_export})
         return Response(content=json.dumps(facts_bundle), media_type="application/json")
 
     if format == "csv":
@@ -2599,9 +2759,10 @@ def export_dataset(
             if not meta.get("file"):
                 raise HTTPException(status_code=404, detail="No dataset available.")
             df = _read_uploaded_file(meta).head(limit)
+        masked_export = pii_detected and not _can_export_sensitive(meta)
         if pii_detected and not _can_export_sensitive(meta) and aliases:
             df = df.rename(columns=aliases)
-        _append_audit(dataset_id, "export_csv", actor, {"format": "csv"})
+        _append_audit(dataset_id, "export_csv", actor, {"format": "csv", "masked": masked_export})
         stream = io.StringIO()
         df.to_csv(stream, index=False)
         return Response(content=stream.getvalue(), media_type="text/csv")
