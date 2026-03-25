@@ -6,6 +6,10 @@
   "outputDirectory": "app/dist",
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": "/api/proxy?path=$1"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }

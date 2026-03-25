@@ -145,7 +145,7 @@ export function computeDefaultApiBase(): string {
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
     return 'http://localhost:8000';
   }
-  return '';
+  return '/api';
 }
 
 export const API_BASE = ENV_API_BASE || computeDefaultApiBase();

@@ -1,73 +1,66 @@
-# Vercel Deployment
+# Deployment Guide
 
-This repository is configured for Vercel with the frontend in `app/`.
+## Recommended topology
 
-## Configuration Included
+Use two deploy targets:
 
-- `vercel.json` at repo root:
-  - `installCommand`: `cd app && npm ci --include=dev`
-  - `buildCommand`: `cd app && npm run build`
-  - `outputDirectory`: `app/dist`
-  - SPA rewrite to `index.html`
-- `app/vercel.json` (fallback when Vercel Project Root Directory is set to `app/`):
-  - `installCommand`: `npm ci --include=dev`
-  - `buildCommand`: `npm run build`
-  - `outputDirectory`: `dist`
-  - SPA rewrite to `index.html`
-- `.nvmrc` set to `22.12.0` (compatible with Vite 7)
-- `.vercelignore` excludes non-runtime assets and large local reference files
-- `app/package.json` includes Node engine `>=20.19.0`
+1. Frontend on Vercel from the repo root
+2. FastAPI backend on a Python-capable service such as Render, Railway, Fly.io, or your own container platform
 
-## Deploy From Vercel Dashboard
+This repo now supports a same-origin Vercel proxy:
 
-1. Import this GitHub repository into Vercel.
-2. Use either project root:
-   - Repository root (uses root `vercel.json`)
-   - `app/` root (uses `app/vercel.json`)
-3. In Vercel Project Settings, clear any manual Build/Install command overrides so config files are honored.
-4. Deploy.
+- Browser calls `/api/...`
+- Vercel proxy forwards that request to `BACKEND_API_URL`
+- FastAPI handles `/sessions`, `/jobs`, `/auth/me`, and the rest of the governed API
 
-## Deploy With Vercel CLI
+## Important
+
+Deploy the repository root on Vercel, not the `app/` folder by itself.
+
+The root project includes:
+
+- the Vite frontend build in `app/`
+- the Vercel API proxy in `api/proxy.js`
+- the rewrite rules in `vercel.json`
+
+## Vercel environment variables
+
+Set these in the Vercel project:
 
 ```bash
-npm i -g vercel
-vercel
-vercel --prod
+BACKEND_API_URL=https://your-fastapi-service.example.com
 ```
 
-## Local Docker Compose (API + Worker + Redis + Streamlit)
-
-This stack runs the Python MVP end-to-end with one command.
-
-### 1) Configure environment
+Optional:
 
 ```bash
-cp .env.example .env
+VITE_API_BASE_URL=
 ```
 
-Set your LLM credentials in `.env`:
-- Azure primary: `AI_PROVIDER=azure` plus `AZURE_OPENAI_*`
-- OpenAI fallback: `OPENAI_API_KEY` (and optional `OPENAI_MODEL`)
+Leave `VITE_API_BASE_URL` empty if you want the frontend to use the same-origin `/api` proxy by default.
 
-### 2) Start all services
+## Backend deployment
+
+The backend expects the dependencies in `requirements-mvp.txt` and serves the governed API from:
+
+- `backend/main.py`
+
+Typical start command:
 
 ```bash
-docker compose up --build
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 
-Services:
-- FastAPI: `http://localhost:8000`
-- Streamlit: `http://localhost:8501`
-- Redis: `localhost:6379`
+## What this fixes
 
-### 3) Stop services
+Without `BACKEND_API_URL`, a deployed frontend can fall back to calling its own domain and fail on routes like:
 
-```bash
-docker compose down
+```text
+POST /sessions
 ```
 
-### Notes
+With this setup:
 
-- Persisted artifacts are mounted in `./data_store`.
-- Streamlit sends `X-API-Key` using `APP_API_KEY` for audit attribution.
-- Celery worker concurrency is set to `2` for both facts/report jobs.
+- frontend calls `/api/sessions`
+- Vercel proxy forwards to `${BACKEND_API_URL}/sessions`
+- the governed backend receives the request correctly
