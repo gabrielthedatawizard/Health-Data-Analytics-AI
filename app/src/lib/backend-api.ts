@@ -284,6 +284,34 @@ export interface ModelRegistryResponse {
   entries: ModelRegistryEntry[];
 }
 
+export interface ModelEvaluationRunSummary {
+  run_id: string;
+  name: string;
+  champion_model: string;
+  metric_field: string;
+  mae: number;
+  rmse: number;
+  mape?: number | null;
+  drift_score: number;
+  stale_model: boolean;
+  source: string;
+}
+
+export interface ModelEvaluationPayload {
+  generated_at: string;
+  active_run: ModelEvaluationRunSummary;
+  challenger_run: ModelEvaluationRunSummary;
+  recommendation: string;
+  winner: string;
+  rationale: string[];
+  suggested_actions: string[];
+}
+
+export interface ModelEvaluationResponse {
+  dataset_id: string;
+  evaluation: ModelEvaluationPayload;
+}
+
 export interface AskResponsePayload {
   dataset_id: string;
   answer: string;
@@ -356,6 +384,13 @@ export interface DocumentSummary {
   file_type: string;
   chunk_count: number;
   char_count: number;
+  version_label?: string | null;
+  effective_date?: string | null;
+  supersedes_document_id?: string | null;
+  superseded_by_document_id?: string | null;
+  is_current?: boolean;
+  freshness?: string;
+  freshness_note?: string;
   snippet_preview: string;
 }
 
@@ -366,6 +401,9 @@ export interface DocumentCitation {
   source_name: string;
   snippet: string;
   chunk_index: number;
+  version_label?: string | null;
+  effective_date?: string | null;
+  freshness?: string;
 }
 
 export interface DocumentAskResponse {
@@ -373,6 +411,7 @@ export interface DocumentAskResponse {
   grounded: boolean;
   confidence: string;
   citations: DocumentCitation[];
+  freshness_summary: string;
 }
 
 export type BackendUserRole = 'viewer' | 'analyst' | 'reviewer' | 'admin';
@@ -544,7 +583,11 @@ export function listDocuments(userId: string) {
   return apiRequest<{ documents: DocumentSummary[] }>('/documents', undefined, { userId });
 }
 
-export async function uploadDocument(userId: string, file: File, payload?: { title?: string; source_name?: string }) {
+export async function uploadDocument(
+  userId: string,
+  file: File,
+  payload?: { title?: string; source_name?: string; version_label?: string; effective_date?: string; supersedes_document_id?: string }
+) {
   const form = new FormData();
   form.append('file', file);
   if (payload?.title?.trim()) {
@@ -552,6 +595,15 @@ export async function uploadDocument(userId: string, file: File, payload?: { tit
   }
   if (payload?.source_name?.trim()) {
     form.append('source_name', payload.source_name.trim());
+  }
+  if (payload?.version_label?.trim()) {
+    form.append('version_label', payload.version_label.trim());
+  }
+  if (payload?.effective_date?.trim()) {
+    form.append('effective_date', payload.effective_date.trim());
+  }
+  if (payload?.supersedes_document_id?.trim()) {
+    form.append('supersedes_document_id', payload.supersedes_document_id.trim());
   }
   return apiRequest<DocumentSummary>(
     '/documents',
@@ -769,6 +821,18 @@ export function getForecastDrift(datasetId: string, userId: string, runId?: stri
 
 export function getModelRegistry(datasetId: string, userId: string) {
   return apiRequest<ModelRegistryResponse>(`/sessions/${datasetId}/ml-registry`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function getModelEvaluation(datasetId: string, userId: string, challengerRunId?: string) {
+  const params = new URLSearchParams();
+  if (challengerRunId) {
+    params.set('challenger_run_id', challengerRunId);
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return apiRequest<ModelEvaluationResponse>(`/sessions/${datasetId}/ml-evaluation${suffix}`, undefined, {
     userId,
     timeoutMs: 120000,
   });

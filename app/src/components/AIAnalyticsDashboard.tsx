@@ -31,6 +31,7 @@ import {
   type DocumentAskResponse,
   type DocumentSummary,
   type CohortAnalysisResponse,
+  type ModelEvaluationResponse,
   type ModelRegistryEntry,
   type ForecastDriftResponse,
   type ForecastRunRecord,
@@ -60,6 +61,7 @@ import {
   getFacts,
   getForecastDrift,
   getForecastRuns,
+  getModelEvaluation,
   getModelRegistry,
   getJobStatus,
   getProfile,
@@ -330,6 +332,14 @@ function summarizeFactReference(fact: unknown): string | null {
   return summary ? `${metric}: ${summary}` : metric;
 }
 
+function formatDocumentFreshnessLabel(value: string | null | undefined): string {
+  if (!value) return 'Current';
+  return value
+    .split('_')
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(' ');
+}
+
 function normalizeDashboardCharts(spec: Record<string, unknown> | null): DashboardChartSpec[] {
   const items = Array.isArray(spec?.charts) ? spec.charts : [];
   return items
@@ -510,6 +520,11 @@ export function AIAnalyticsDashboard() {
   const [loadDatasetId, setLoadDatasetId] = useState(() => getStoredDatasetId());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedDocumentFile, setSelectedDocumentFile] = useState<File | null>(null);
+  const [documentTitle, setDocumentTitle] = useState('');
+  const [documentSourceName, setDocumentSourceName] = useState('');
+  const [documentVersionLabel, setDocumentVersionLabel] = useState('');
+  const [documentEffectiveDate, setDocumentEffectiveDate] = useState('');
+  const [documentSupersedesId, setDocumentSupersedesId] = useState('');
   const [authContext, setAuthContext] = useState<AuthContextResponse | null>(null);
   const [usingFallbackAuthContext, setUsingFallbackAuthContext] = useState(false);
   const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null);
@@ -520,6 +535,7 @@ export function AIAnalyticsDashboard() {
   const [cohortAnalysis, setCohortAnalysis] = useState<CohortAnalysisResponse | null>(null);
   const [forecastRuns, setForecastRuns] = useState<ForecastRunRecord[]>([]);
   const [forecastDrift, setForecastDrift] = useState<ForecastDriftResponse | null>(null);
+  const [modelEvaluation, setModelEvaluation] = useState<ModelEvaluationResponse | null>(null);
   const [modelRegistryEntries, setModelRegistryEntries] = useState<ModelRegistryEntry[]>([]);
   const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigationRecord[]>([]);
   const [savedPlaybooks, setSavedPlaybooks] = useState<SavedPlaybookRecord[]>([]);
@@ -632,6 +648,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelEvaluation(null);
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
@@ -652,6 +669,7 @@ export function AIAnalyticsDashboard() {
       try {
         setForecastRuns([]);
         setForecastDrift(null);
+        setModelEvaluation(null);
         setModelRegistryEntries([]);
         setSavedInvestigations([]);
         setSavedPlaybooks([]);
@@ -700,6 +718,12 @@ export function AIAnalyticsDashboard() {
           const registryResponse = await getModelRegistry(datasetId, userId);
           if (!active) return;
           setModelRegistryEntries(registryResponse.entries ?? []);
+        }
+
+        if (meta.artifacts?.ml_evaluation) {
+          const evaluationResponse = await getModelEvaluation(datasetId, userId);
+          if (!active) return;
+          setModelEvaluation(evaluationResponse);
         }
 
         if (meta.artifacts?.investigations) {
@@ -1027,6 +1051,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelEvaluation(null);
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
@@ -1057,9 +1082,20 @@ export function AIAnalyticsDashboard() {
     setError(null);
     setNotice(null);
     try {
-      await uploadDocument(userId, selectedDocumentFile);
+      await uploadDocument(userId, selectedDocumentFile, {
+        title: documentTitle,
+        source_name: documentSourceName,
+        version_label: documentVersionLabel,
+        effective_date: documentEffectiveDate,
+        supersedes_document_id: documentSupersedesId,
+      });
       await refreshDocuments();
       setSelectedDocumentFile(null);
+      setDocumentTitle('');
+      setDocumentSourceName('');
+      setDocumentVersionLabel('');
+      setDocumentEffectiveDate('');
+      setDocumentSupersedesId('');
       setNotice(`${selectedDocumentFile.name} uploaded to the trusted document library.`);
     } catch (documentError) {
       setError(documentError instanceof Error ? documentError.message : 'Document upload failed.');
@@ -1110,6 +1146,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelEvaluation(null);
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
@@ -1154,6 +1191,7 @@ export function AIAnalyticsDashboard() {
       setCohortAnalysis(null);
       setForecastRuns([]);
       setForecastDrift(null);
+      setModelEvaluation(null);
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
@@ -1331,6 +1369,7 @@ export function AIAnalyticsDashboard() {
       setSessionMeta(await getSession(datasetId, userId));
       setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
       setForecastDrift(null);
+      setModelEvaluation(null);
       setForecastName('');
       setNotice(`Forecast run completed with champion model ${run.payload.champion_model}.`);
     } catch (forecastError) {
@@ -1382,10 +1421,41 @@ export function AIAnalyticsDashboard() {
       await refreshModelRegistry(datasetId);
       setSessionMeta(await getSession(datasetId, userId));
       setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setModelEvaluation(null);
       setModelPromotionNote('');
       setNotice(`Promoted model ${promoted.name} to the governed registry.`);
     } catch (promoteError) {
       setError(promoteError instanceof Error ? promoteError.message : 'Model promotion failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleEvaluateModels(challengerRunId?: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+    if (!activeRegistryEntry) {
+      setError('Promote an active governed model before running champion-versus-challenger evaluation.');
+      return;
+    }
+    if (forecastRuns.length < 2) {
+      setError('Train at least two forecast runs before running model evaluation.');
+      return;
+    }
+
+    setBusyAction('model_evaluation');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await getModelEvaluation(datasetId, userId, challengerRunId);
+      setModelEvaluation(response);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(`Model evaluation completed. Recommended winner: ${response.evaluation.winner}.`);
+    } catch (evaluationError) {
+      setError(evaluationError instanceof Error ? evaluationError.message : 'Model evaluation failed.');
     } finally {
       setBusyAction(null);
     }
@@ -2339,11 +2409,36 @@ export function AIAnalyticsDashboard() {
           </div>
         </div>
 
-        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
           <Input
             type="file"
             accept=".txt,.md,.html,.htm,.json,.pdf"
             onChange={(event) => setSelectedDocumentFile(event.target.files?.[0] ?? null)}
+          />
+          <Input
+            value={documentTitle}
+            onChange={(event) => setDocumentTitle(event.target.value)}
+            placeholder="Optional title override"
+          />
+          <Input
+            value={documentSourceName}
+            onChange={(event) => setDocumentSourceName(event.target.value)}
+            placeholder="Optional source or policy group"
+          />
+          <Input
+            value={documentVersionLabel}
+            onChange={(event) => setDocumentVersionLabel(event.target.value)}
+            placeholder="Version label, e.g. v2026.03"
+          />
+          <Input
+            type="date"
+            value={documentEffectiveDate}
+            onChange={(event) => setDocumentEffectiveDate(event.target.value)}
+          />
+          <Input
+            value={documentSupersedesId}
+            onChange={(event) => setDocumentSupersedesId(event.target.value)}
+            placeholder="Optional superseded document ID"
           />
           <Button
             type="button"
@@ -2369,9 +2464,18 @@ export function AIAnalyticsDashboard() {
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge variant="outline">{document.file_type.toUpperCase()}</Badge>
                   <Badge variant="outline">{document.chunk_count} chunks</Badge>
+                  <Badge variant="outline">{formatDocumentFreshnessLabel(document.freshness)}</Badge>
+                  {document.version_label ? <Badge variant="outline">{document.version_label}</Badge> : null}
                 </div>
                 <p className="mt-2 text-sm font-medium text-foreground">{document.title}</p>
                 <p className="mt-1 text-xs text-muted-foreground">{document.source_name}</p>
+                <p className="mt-1 text-xs text-muted-foreground break-all">
+                  ID: {document.document_id}
+                  {document.effective_date ? ` · effective ${document.effective_date}` : ''}
+                </p>
+                {document.freshness_note ? (
+                  <p className="mt-1 text-xs text-amber-400">{document.freshness_note}</p>
+                ) : null}
                 {document.snippet_preview ? (
                   <p className="mt-2 text-xs text-muted-foreground">{document.snippet_preview}</p>
                 ) : null}
@@ -2401,6 +2505,9 @@ export function AIAnalyticsDashboard() {
           <div className="mt-4 space-y-4">
             <div className="rounded-xl border border-border bg-background p-4">
               <p className="text-sm text-foreground">{documentAnswer.answer}</p>
+              {documentAnswer.freshness_summary ? (
+                <p className="mt-2 text-xs text-amber-400">{documentAnswer.freshness_summary}</p>
+              ) : null}
               <div className="mt-3 flex flex-wrap gap-2">
                 <Badge variant="outline">Grounded: {documentAnswer.grounded ? 'yes' : 'no'}</Badge>
                 <Badge variant="outline">Confidence: {documentAnswer.confidence}</Badge>
@@ -2417,7 +2524,12 @@ export function AIAnalyticsDashboard() {
                     <p className="text-sm font-medium text-foreground">{citation.title}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
                       {citation.source_name} · chunk {citation.chunk_index + 1}
+                      {citation.effective_date ? ` · effective ${citation.effective_date}` : ''}
                     </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Badge variant="outline">{formatDocumentFreshnessLabel(citation.freshness)}</Badge>
+                      {citation.version_label ? <Badge variant="outline">{citation.version_label}</Badge> : null}
+                    </div>
                     <p className="mt-2 text-sm text-muted-foreground">{citation.snippet}</p>
                   </div>
                 ))}
@@ -2943,15 +3055,26 @@ export function AIAnalyticsDashboard() {
               </p>
             </div>
           </div>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => void handleScanForecastDrift()}
-            disabled={busyAction === 'forecast_drift' || forecastRuns.length === 0 || !datasetId || !canCompute}
-          >
-            {busyAction === 'forecast_drift' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-            Scan Drift
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void handleEvaluateModels()}
+              disabled={busyAction === 'model_evaluation' || !activeRegistryEntry || forecastRuns.length < 2 || !datasetId || !canCompute}
+            >
+              {busyAction === 'model_evaluation' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
+              Evaluate Models
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void handleScanForecastDrift()}
+              disabled={busyAction === 'forecast_drift' || forecastRuns.length === 0 || !datasetId || !canCompute}
+            >
+              {busyAction === 'forecast_drift' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              Scan Drift
+            </Button>
+          </div>
         </div>
 
         <div className="mt-4 grid gap-3 xl:grid-cols-[1.2fr_1fr_1fr_160px_150px_auto]">
@@ -3084,6 +3207,39 @@ export function AIAnalyticsDashboard() {
                 <p className="mt-3 text-sm text-muted-foreground">Promote a reviewed forecast run to create the active governed model entry.</p>
               )}
             </div>
+
+            {modelEvaluation ? (
+              <div className="rounded-xl border border-border bg-background p-4">
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="outline">Winner: {modelEvaluation.evaluation.winner}</Badge>
+                  <Badge variant="outline">Active MAE: {modelEvaluation.evaluation.active_run.mae.toFixed(2)}</Badge>
+                  <Badge variant="outline">Challenger MAE: {modelEvaluation.evaluation.challenger_run.mae.toFixed(2)}</Badge>
+                </div>
+                <p className="mt-3 text-sm text-foreground">{modelEvaluation.evaluation.recommendation}</p>
+                <div className="mt-4 grid gap-4 xl:grid-cols-2">
+                  <div className="rounded-lg border border-border/70 bg-card p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Rationale</p>
+                    <div className="mt-2 space-y-2">
+                      {modelEvaluation.evaluation.rationale.map((item) => (
+                        <div key={item} className="rounded-md border border-border/60 px-3 py-2 text-xs text-foreground">
+                          {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-border/70 bg-card p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Suggested actions</p>
+                    <div className="mt-2 space-y-2">
+                      {modelEvaluation.evaluation.suggested_actions.map((item) => (
+                        <div key={item} className="rounded-md border border-border/60 px-3 py-2 text-xs text-foreground">
+                          {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
 
             {forecastDrift ? (
               <div className="rounded-xl border border-border bg-background p-4">
@@ -3228,11 +3384,11 @@ export function AIAnalyticsDashboard() {
                           <Badge variant="outline">{run.payload.aggregation}</Badge>
                           <Badge variant="outline">{new Date(run.created_at).toLocaleString()}</Badge>
                           {canPromoteModel ? (
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              onClick={() => void handlePromoteModel(run.run_id)}
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void handlePromoteModel(run.run_id)}
                               disabled={
                                 busyAction === `promote_model:${run.run_id}` ||
                                 (activeRegistryEntry?.run_id === run.run_id) ||
@@ -3241,6 +3397,17 @@ export function AIAnalyticsDashboard() {
                             >
                               {busyAction === `promote_model:${run.run_id}` ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BadgeCheck className="mr-2 h-4 w-4" />}
                               {activeRegistryEntry?.run_id === run.run_id ? 'Active' : 'Promote'}
+                            </Button>
+                          ) : null}
+                          {activeRegistryEntry?.run_id !== run.run_id ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => void handleEvaluateModels(run.run_id)}
+                              disabled={busyAction === 'model_evaluation' || !activeRegistryEntry || !canCompute}
+                            >
+                              Evaluate
                             </Button>
                           ) : null}
                           <Button

@@ -9,10 +9,16 @@ import backend.main as main
 client = TestClient(main.app)
 
 
-def _upload_document(actor: str, filename: str, content: str | bytes, content_type: str = "text/plain") -> dict:
+def _upload_document(
+    actor: str,
+    filename: str,
+    content: str | bytes,
+    content_type: str = "text/plain",
+    data: dict[str, str] | None = None,
+) -> dict:
     payload = content.encode("utf-8") if isinstance(content, str) else content
     files = {"file": (filename, io.BytesIO(payload), content_type)}
-    response = client.post("/documents", files=files, headers={"X-API-Key": actor})
+    response = client.post("/documents", files=files, data=data or {}, headers={"X-API-Key": actor})
     assert response.status_code == 200
     return response.json()
 
@@ -87,6 +93,46 @@ def test_pdf_documents_are_ingested_when_text_is_extractable(monkeypatch) -> Non
     assert payload["citations"]
     assert payload["citations"][0]["document_id"] == uploaded["document_id"]
     assert "denominator exclusions" in payload["answer"].lower()
+
+
+def test_document_qa_prefers_current_versions_and_marks_superseded_sources() -> None:
+    actor = f"doc_version_actor_{uuid4().hex}"
+    original = _upload_document(
+        actor,
+        "measure_v1.md",
+        "# Policy\nDenominator exclusions require supervisor review within ten business days.",
+        data={"title": "Denominator Policy", "version_label": "v1", "effective_date": "2025-01-01"},
+    )
+    replacement = _upload_document(
+        actor,
+        "measure_v2.md",
+        "# Policy\nDenominator exclusions require clinical lead approval within five business days.",
+        data={
+            "title": "Denominator Policy",
+            "version_label": "v2",
+            "effective_date": "2026-01-15",
+            "supersedes_document_id": original["document_id"],
+        },
+    )
+
+    list_response = client.get("/documents", headers={"X-API-Key": actor})
+    assert list_response.status_code == 200
+    document_lookup = {item["document_id"]: item for item in list_response.json()["documents"]}
+    assert document_lookup[original["document_id"]]["freshness"] == "superseded"
+    assert document_lookup[replacement["document_id"]]["freshness"] == "current"
+
+    response = client.post(
+        "/documents/ask",
+        json={"question": "What do the trusted documents say about denominator exclusions?"},
+        headers={"X-API-Key": actor},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["grounded"] is True
+    assert payload["citations"][0]["document_id"] == replacement["document_id"]
+    assert payload["citations"][0]["freshness"] == "current"
+    assert "five business days" in payload["answer"].lower()
 
 
 def test_viewer_cannot_upload_documents() -> None:

@@ -524,6 +524,34 @@ class ModelRegistryResponse(BaseModel):
     entries: list[ModelRegistryEntry] = Field(default_factory=list)
 
 
+class ModelEvaluationRunSummary(BaseModel):
+    run_id: str
+    name: str
+    champion_model: str
+    metric_field: str
+    mae: float
+    rmse: float
+    mape: float | None = None
+    drift_score: float
+    stale_model: bool
+    source: str
+
+
+class ModelEvaluationPayload(BaseModel):
+    generated_at: str
+    active_run: ModelEvaluationRunSummary
+    challenger_run: ModelEvaluationRunSummary
+    recommendation: str
+    winner: str
+    rationale: list[str] = Field(default_factory=list)
+    suggested_actions: list[str] = Field(default_factory=list)
+
+
+class ModelEvaluationResponse(BaseModel):
+    dataset_id: str
+    evaluation: ModelEvaluationPayload
+
+
 class ReportResponse(BaseModel):
     dataset_id: str
     report_html_path: str
@@ -602,6 +630,13 @@ class DocumentSummaryResponse(BaseModel):
     file_type: str
     chunk_count: int
     char_count: int
+    version_label: str | None = None
+    effective_date: str | None = None
+    supersedes_document_id: str | None = None
+    superseded_by_document_id: str | None = None
+    is_current: bool = True
+    freshness: str = "current"
+    freshness_note: str = ""
 
 
 class DocumentMetaResponse(DocumentSummaryResponse):
@@ -622,6 +657,9 @@ class DocumentSearchHit(BaseModel):
     snippet: str
     chunk_index: int
     score: float
+    version_label: str | None = None
+    effective_date: str | None = None
+    freshness: str = "current"
 
 
 class DocumentSearchResponse(BaseModel):
@@ -642,6 +680,9 @@ class DocumentCitation(BaseModel):
     source_name: str
     snippet: str
     chunk_index: int
+    version_label: str | None = None
+    effective_date: str | None = None
+    freshness: str = "current"
 
 
 class DocumentAskResponse(BaseModel):
@@ -649,6 +690,7 @@ class DocumentAskResponse(BaseModel):
     grounded: bool
     confidence: str
     citations: list[DocumentCitation] = Field(default_factory=list)
+    freshness_summary: str = ""
 
 
 def _utc_now_iso() -> str:
@@ -723,6 +765,10 @@ def _ml_drift_path(dataset_id: str) -> Path:
 
 def _ml_registry_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "ml_registry.json"
+
+
+def _ml_evaluation_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "ml_evaluation.json"
 
 
 def _dashboard_spec_path(dataset_id: str) -> Path:
@@ -887,6 +933,10 @@ def _save_ml_registry(dataset_id: str, entries: list[dict[str, Any]]) -> None:
             "entries": entries,
         },
     )
+
+
+def _find_ml_run(runs: list[dict[str, Any]], run_id: str) -> dict[str, Any] | None:
+    return next((item for item in runs if str(item.get("run_id")) == run_id), None)
 
 
 def _safe_directory_size(path: Path) -> int:
@@ -1110,6 +1160,8 @@ def _document_action_allowed(meta: dict[str, Any], actor: str, role: str, action
         return owner or role == "reviewer"
     if action == "create":
         return role in {"analyst", "reviewer"}
+    if action == "write":
+        return owner or role == "reviewer"
     return False
 
 
@@ -1138,6 +1190,54 @@ def _authorized_document_context(
     return meta, actor, role
 
 
+def _normalize_effective_date(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate):
+            parsed = datetime.strptime(candidate, "%Y-%m-%d")
+        else:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        return parsed.date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="effective_date must be a valid ISO date like YYYY-MM-DD.") from exc
+
+
+def _effective_date_sort_key(value: str | None) -> tuple[int, str]:
+    if not value:
+        return (0, "")
+    normalized = _normalize_effective_date(value)
+    return (1, normalized or "")
+
+
+def _document_freshness(meta: dict[str, Any]) -> tuple[str, bool, str]:
+    superseded_by = str(meta.get("superseded_by_document_id") or "").strip()
+    effective_date = _normalize_effective_date(str(meta.get("effective_date") or "").strip() or None)
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    if superseded_by:
+        return ("superseded", False, f"Superseded by document {superseded_by}.")
+    if effective_date and effective_date > today:
+        return ("pending", False, f"Effective on {effective_date}.")
+    status = str(meta.get("status") or "ready").strip().lower()
+    if status not in {"", "ready"}:
+        return (status, False, f"Document status is {status}.")
+    if effective_date:
+        return ("current", True, f"Effective as of {effective_date}.")
+    return ("current", True, "Current trusted version.")
+
+
+def _document_recency_bonus(meta: dict[str, Any]) -> float:
+    freshness, _, _ = _document_freshness(meta)
+    bonus = {"current": 1.25, "pending": 0.4, "superseded": -1.5}.get(freshness, -0.2)
+    _, effective_date = _effective_date_sort_key(str(meta.get("effective_date") or "").strip() or None)
+    if effective_date:
+        age_days = (datetime.now(timezone.utc).date() - datetime.strptime(effective_date, "%Y-%m-%d").date()).days
+        bonus += max(0.0, 0.5 - max(0, age_days) / 3650)
+    return bonus
+
+
 def _document_summary_from_meta(document_id: str, meta: dict[str, Any]) -> DocumentMetaResponse:
     content_path = _document_content_path(document_id)
     snippet_preview = ""
@@ -1147,6 +1247,7 @@ def _document_summary_from_meta(document_id: str, meta: dict[str, Any]) -> Docum
         except OSError:
             snippet_preview = ""
 
+    freshness, is_current, freshness_note = _document_freshness(meta)
     return DocumentMetaResponse(
         document_id=document_id,
         title=str(meta.get("title") or meta.get("file_name") or document_id),
@@ -1159,6 +1260,13 @@ def _document_summary_from_meta(document_id: str, meta: dict[str, Any]) -> Docum
         file_type=str(meta.get("file_type") or ""),
         chunk_count=int(meta.get("chunk_count") or 0),
         char_count=int(meta.get("char_count") or 0),
+        version_label=str(meta.get("version_label") or "") or None,
+        effective_date=_normalize_effective_date(str(meta.get("effective_date") or "").strip() or None),
+        supersedes_document_id=str(meta.get("supersedes_document_id") or "") or None,
+        superseded_by_document_id=str(meta.get("superseded_by_document_id") or "") or None,
+        is_current=is_current,
+        freshness=freshness,
+        freshness_note=freshness_note,
         snippet_preview=snippet_preview,
     )
 
@@ -1333,9 +1441,12 @@ def _search_documents_internal(
             continue
         title = str(meta.get("title") or meta.get("file_name") or document_id)
         source_name = str(meta.get("source_name") or title)
+        version_label = str(meta.get("version_label") or "").strip() or None
+        effective_date = _normalize_effective_date(str(meta.get("effective_date") or "").strip() or None)
+        freshness, _, _ = _document_freshness(meta)
         chunks = _load_document_chunks(document_id)
         for index, chunk in enumerate(chunks):
-            score = _score_document_chunk(query, query_tokens, chunk, title, source_name)
+            score = _score_document_chunk(query, query_tokens, chunk, title, source_name) + _document_recency_bonus(meta)
             if score <= 0:
                 continue
             candidates.append(
@@ -1347,10 +1458,13 @@ def _search_documents_internal(
                     snippet=_document_snippet(chunk),
                     chunk_index=index,
                     score=round(score, 3),
+                    version_label=version_label,
+                    effective_date=effective_date,
+                    freshness=freshness,
                 )
             )
 
-    candidates.sort(key=lambda item: (item.score, item.document_id), reverse=True)
+    candidates.sort(key=lambda item: (item.score, item.effective_date or "", item.document_id), reverse=True)
     return candidates[:limit]
 
 
@@ -1361,19 +1475,37 @@ def _answer_documents(question: str, hits: list[DocumentSearchHit]) -> DocumentA
             grounded=False,
             confidence="Low",
             citations=[],
+            freshness_summary="No trusted document citations matched the question.",
         )
 
     lead = hits[0]
     supporting = hits[1:3]
+    lead_label = lead.title
+    if lead.version_label:
+        lead_label = f"{lead_label} ({lead.version_label})"
+    if lead.freshness != "current":
+        lead_label = f"{lead_label} [{lead.freshness}]"
     answer_parts = [
-        f"The most relevant trusted source is {lead.title}.",
+        f"The most relevant trusted source is {lead_label}.",
         f"It states: \"{lead.snippet}\"",
     ]
     if supporting:
         answer_parts.append(
             "Supporting documents add: "
-            + " ".join(f"{item.title}: \"{item.snippet}\"" for item in supporting)
+            + " ".join(
+                f"{item.title}{f' ({item.version_label})' if item.version_label else ''}: \"{item.snippet}\""
+                for item in supporting
+            )
         )
+
+    freshness_parts: list[str] = []
+    if lead.effective_date:
+        freshness_parts.append(f"Lead source effective date: {lead.effective_date}.")
+    if lead.freshness != "current":
+        freshness_parts.append(f"Lead source freshness: {lead.freshness}.")
+    superseded_hits = [item for item in hits if item.freshness == "superseded"]
+    if superseded_hits:
+        freshness_parts.append("One or more supporting citations are superseded, so review the current policy version before acting.")
 
     citations = [
         DocumentCitation(
@@ -1383,11 +1515,20 @@ def _answer_documents(question: str, hits: list[DocumentSearchHit]) -> DocumentA
             source_name=item.source_name,
             snippet=item.snippet,
             chunk_index=item.chunk_index,
+            version_label=item.version_label,
+            effective_date=item.effective_date,
+            freshness=item.freshness,
         )
         for item in hits
     ]
     confidence = "High" if len(hits) >= 2 and hits[0].score >= 3 else "Medium"
-    return DocumentAskResponse(answer=" ".join(answer_parts), grounded=True, confidence=confidence, citations=citations)
+    return DocumentAskResponse(
+        answer=" ".join(answer_parts),
+        grounded=True,
+        confidence=confidence,
+        citations=citations,
+        freshness_summary=" ".join(freshness_parts).strip(),
+    )
 
 
 def _sha256_text(value: str) -> str:
@@ -2913,6 +3054,117 @@ def _build_forecast_drift(
     }
 
 
+def _champion_candidate_metrics(payload: dict[str, Any]) -> dict[str, Any]:
+    champion_model = str(payload.get("champion_model") or "")
+    candidates = payload.get("candidate_models") if isinstance(payload.get("candidate_models"), list) else []
+    for candidate in candidates:
+        if isinstance(candidate, dict) and str(candidate.get("model_name") or "") == champion_model:
+            return candidate
+    return {}
+
+
+def _build_evaluation_run_summary(run: dict[str, Any], drift: dict[str, Any], *, source: str) -> dict[str, Any]:
+    payload = run.get("payload") if isinstance(run, dict) else {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="The selected model run payload is malformed.")
+    metrics = _champion_candidate_metrics(payload)
+    return {
+        "run_id": str(run.get("run_id") or ""),
+        "name": str(payload.get("name") or run.get("run_id") or "Forecast run"),
+        "champion_model": str(payload.get("champion_model") or "unknown"),
+        "metric_field": str(payload.get("metric_field") or ""),
+        "mae": round(float(metrics.get("mae") or 0.0), 4),
+        "rmse": round(float(metrics.get("rmse") or 0.0), 4),
+        "mape": round(float(metrics.get("mape")), 2) if metrics.get("mape") is not None else None,
+        "drift_score": round(float(drift.get("drift_score") or 0.0), 4),
+        "stale_model": bool(drift.get("stale_model")),
+        "source": source,
+    }
+
+
+def _build_model_evaluation(
+    dataset_id: str,
+    meta: dict[str, Any],
+    df: pd.DataFrame,
+    active_run: dict[str, Any],
+    challenger_run: dict[str, Any],
+) -> dict[str, Any]:
+    active_drift = _build_forecast_drift(dataset_id, meta, df, active_run, window=6)
+    challenger_drift = _build_forecast_drift(dataset_id, meta, df, challenger_run, window=6)
+
+    active_summary = _build_evaluation_run_summary(active_run, active_drift, source="registry")
+    challenger_summary = _build_evaluation_run_summary(challenger_run, challenger_drift, source="candidate")
+
+    rationale: list[str] = []
+    if active_summary["stale_model"]:
+        rationale.append("The active registry model is stale against the current dataset hash.")
+    if challenger_summary["stale_model"]:
+        rationale.append("The challenger run is also stale and should not be promoted without retraining.")
+
+    mae_improvement = 0.0
+    if active_summary["mae"] > 0:
+        mae_improvement = (active_summary["mae"] - challenger_summary["mae"]) / active_summary["mae"]
+
+    if challenger_summary["mae"] < active_summary["mae"]:
+        rationale.append(
+            f"The challenger has lower holdout MAE ({challenger_summary['mae']:.2f}) than the active model ({active_summary['mae']:.2f})."
+        )
+    else:
+        rationale.append(
+            f"The active model keeps the stronger holdout MAE ({active_summary['mae']:.2f}) compared with the challenger ({challenger_summary['mae']:.2f})."
+        )
+
+    if challenger_summary["drift_score"] < active_summary["drift_score"]:
+        rationale.append(
+            f"The challenger shows lower current-data drift ({challenger_summary['drift_score']:.2f}) than the active model ({active_summary['drift_score']:.2f})."
+        )
+    elif challenger_summary["drift_score"] > active_summary["drift_score"]:
+        rationale.append(
+            f"The active model is more stable on current data ({active_summary['drift_score']:.2f}) than the challenger ({challenger_summary['drift_score']:.2f})."
+        )
+    else:
+        rationale.append("Both runs show similar current-data drift against the refreshed dataset.")
+
+    promote_challenger = False
+    if active_summary["stale_model"] and not challenger_summary["stale_model"]:
+        promote_challenger = challenger_summary["mae"] <= active_summary["mae"] * 1.05
+    elif not challenger_summary["stale_model"] and mae_improvement >= 0.05 and challenger_summary["drift_score"] <= active_summary["drift_score"] + 0.05:
+        promote_challenger = True
+
+    if promote_challenger:
+        recommendation = (
+            f"Promote challenger run {challenger_summary['run_id']} after reviewer approval. "
+            "It outperforms or safely replaces the active model under current governed checks."
+        )
+        winner = "challenger"
+        suggested_actions = [
+            "Promote the challenger run to the governed registry.",
+            "Record a reviewer note explaining the promotion rationale.",
+            "Re-run drift monitoring after the next data refresh.",
+        ]
+    else:
+        recommendation = (
+            f"Keep active run {active_summary['run_id']} as the governed model for now. "
+            "The challenger does not yet justify promotion under current holdout and drift checks."
+        )
+        winner = "active"
+        suggested_actions = [
+            "Keep the active model in the registry.",
+            "Retrain a fresh challenger if the active model becomes stale or drift worsens.",
+            "Review anomaly and drift signals before the next promotion decision.",
+        ]
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "active_run": active_summary,
+        "challenger_run": challenger_summary,
+        "recommendation": recommendation,
+        "winner": winner,
+        "rationale": rationale,
+        "suggested_actions": suggested_actions,
+    }
+
+
 def _pii_aliases(profile: dict[str, Any]) -> dict[str, str]:
     pii_columns = profile.get("pii_candidates", []) if profile else []
     return {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
@@ -3912,6 +4164,9 @@ async def upload_document(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     source_name: str | None = Form(default=None),
+    version_label: str | None = Form(default=None),
+    effective_date: str | None = Form(default=None),
+    supersedes_document_id: str | None = Form(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> DocumentMetaResponse:
@@ -3945,6 +4200,17 @@ async def upload_document(
     if not chunks:
         raise HTTPException(status_code=400, detail="Document did not produce retrievable text chunks.")
 
+    normalized_effective_date = _normalize_effective_date(effective_date)
+    supersedes_id = (supersedes_document_id or "").strip()
+    superseded_meta: dict[str, Any] | None = None
+    if supersedes_id:
+        superseded_meta, _, _ = _authorized_document_context(
+            supersedes_id,
+            action="write",
+            x_api_key=x_api_key,
+            x_user_role=x_user_role,
+        )
+
     document_id = str(uuid.uuid4())
     document_dir = _document_path(document_id)
     document_dir.mkdir(parents=True, exist_ok=True)
@@ -3964,8 +4230,16 @@ async def upload_document(
         "file_type": extension.lstrip("."),
         "chunk_count": len(chunks),
         "char_count": len(text),
+        "version_label": (version_label or "").strip() or None,
+        "effective_date": normalized_effective_date,
+        "supersedes_document_id": supersedes_id or None,
+        "superseded_by_document_id": None,
     }
     _save_json(_document_meta_path(document_id), meta)
+    if superseded_meta is not None:
+        superseded_meta["superseded_by_document_id"] = document_id
+        superseded_meta["status"] = "superseded"
+        _save_document_meta(supersedes_id, superseded_meta)
     return _document_summary_from_meta(document_id, meta)
 
 
@@ -4747,6 +5021,63 @@ def promote_ml_run(
         },
     )
     return ModelRegistryEntry(**record)
+
+
+@app.get("/sessions/{dataset_id}/ml-evaluation", response_model=ModelEvaluationResponse)
+def evaluate_ml_models(
+    dataset_id: str,
+    challenger_run_id: str | None = Query(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ModelEvaluationResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    registry_entries = _load_ml_registry(dataset_id)
+    active_entry = next((entry for entry in registry_entries if str(entry.get("status") or "") == "active"), None)
+    if active_entry is None:
+        raise HTTPException(status_code=404, detail="No active governed model is registered for this session.")
+
+    runs = _load_ml_runs(dataset_id)
+    if not runs:
+        raise HTTPException(status_code=404, detail="No saved forecast runs are available for this session.")
+
+    active_run_id = str(active_entry.get("run_id") or "")
+    active_run = _find_ml_run(runs, active_run_id)
+    if active_run is None:
+        raise HTTPException(status_code=404, detail="The active registry run could not be found in saved model runs.")
+
+    challenger_run = None
+    if challenger_run_id:
+        challenger_run = _find_ml_run(runs, challenger_run_id)
+        if challenger_run is None:
+            raise HTTPException(status_code=404, detail="Requested challenger run was not found.")
+    else:
+        challenger_run = next((item for item in runs if str(item.get("run_id") or "") != active_run_id), None)
+    if challenger_run is None:
+        raise HTTPException(status_code=400, detail="No challenger run is available. Train another forecast run first.")
+
+    try:
+        df = _read_uploaded_file(meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed reading dataset: {exc}") from exc
+
+    evaluation = _build_model_evaluation(dataset_id, meta, df, active_run, challenger_run)
+    _save_json(_ml_evaluation_path(dataset_id), evaluation)
+    meta.setdefault("artifacts", {})["ml_evaluation"] = str(_ml_evaluation_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "ml_models_evaluated",
+        actor,
+        {
+            "active_run_id": evaluation.get("active_run", {}).get("run_id"),
+            "challenger_run_id": evaluation.get("challenger_run", {}).get("run_id"),
+            "winner": evaluation.get("winner"),
+        },
+    )
+    return ModelEvaluationResponse(dataset_id=dataset_id, evaluation=ModelEvaluationPayload(**evaluation))
 
 
 @app.get("/sessions/{dataset_id}/workflow-actions", response_model=WorkflowActionsResponse)
