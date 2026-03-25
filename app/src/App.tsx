@@ -14,8 +14,19 @@ import { AnalyticsProvider } from './lib/analytics-context';
 
 export type ViewType = 'dashboard' | 'upload' | 'datasets' | 'insights' | 'ai_analytics' | 'settings';
 
+const VIEW_STORAGE_KEY = 'healthai_current_view';
+const VALID_VIEWS: ViewType[] = ['dashboard', 'upload', 'datasets', 'insights', 'ai_analytics', 'settings'];
+
+function getStoredView(): ViewType {
+  if (typeof window === 'undefined') {
+    return 'dashboard';
+  }
+  const storedView = localStorage.getItem(VIEW_STORAGE_KEY);
+  return storedView && VALID_VIEWS.includes(storedView as ViewType) ? (storedView as ViewType) : 'dashboard';
+}
+
 function AppContent() {
-  const [currentView, setCurrentView] = useState<ViewType>('dashboard');
+  const [currentView, setCurrentView] = useState<ViewType>(() => getStoredView());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -28,6 +39,7 @@ function AppContent() {
 
   const handleLogout = () => {
     localStorage.removeItem('healthai_visited');
+    localStorage.removeItem(VIEW_STORAGE_KEY);
     setShowLanding(true);
   };
 
@@ -53,6 +65,10 @@ function AppContent() {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+  }, [currentView]);
 
   const handleViewChange = (view: ViewType) => {
     setCurrentView(view);

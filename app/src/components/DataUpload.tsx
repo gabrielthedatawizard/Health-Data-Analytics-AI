@@ -25,14 +25,6 @@ interface DataUploadProps {
   onViewChange: (view: ViewType) => void;
 }
 
-interface ActiveUploadState {
-  name: string;
-  progress: number;
-  status: 'uploading' | 'processing';
-  message?: string;
-  error?: string;
-}
-
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
@@ -51,11 +43,10 @@ function datasetTypeIcon(type: DatasetRecord['type']) {
 
 export function DataUpload({ onViewChange }: DataUploadProps) {
   const { t, formatTime } = useI18n();
-  const { datasets, uploadFile, removeDataset, analyzeDataset, addSampleDataset, aiEnvironment } =
+  const { datasets, uploadFile, removeDataset, analyzeDataset, addSampleDataset, aiEnvironment, activeUpload, dismissActiveUpload } =
     useAnalytics();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [uploadingFile, setUploadingFile] = useState<ActiveUploadState | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
@@ -67,45 +58,17 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
     async (files: File[]) => {
       if (files.length === 0) return;
       for (const file of files) {
-        setUploadingFile({
-          name: file.name,
-          progress: 0,
-          status: 'uploading',
-          message: t.uploading,
-        });
         try {
-          await uploadFile(file, (progressEvent) => {
-            setUploadingFile({
-              name: file.name,
-              progress: progressEvent.progress,
-              status: progressEvent.status,
-              message: progressEvent.message,
-            });
-          });
+          await uploadFile(file);
           setActionMessage(`${file.name} uploaded successfully.`);
           await pause(300);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : t.error;
-          setUploadingFile((previous) =>
-            previous
-              ? {
-                  ...previous,
-                  error: message,
-                }
-              : {
-                  name: file.name,
-                  progress: 0,
-                  status: 'uploading',
-                  error: message,
-                }
-          );
+        } catch {
           setActionMessage(`Upload failed for ${file.name}.`);
           await pause(1100);
         }
       }
-      setUploadingFile(null);
     },
-    [t.error, t.uploading, uploadFile]
+    [uploadFile]
   );
 
   const handleFileSelect = useCallback(
@@ -226,18 +189,20 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
         </div>
       </div>
 
-      {uploadingFile && (
+      {activeUpload && (
         <Card
           className={cn(
             'glass-card',
-            uploadingFile.error ? 'border-red-500/30' : 'border-health-mint/30'
+            activeUpload.error ? 'border-red-500/30' : 'border-health-mint/30'
           )}
         >
           <CardContent className="p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="w-10 h-10 rounded-lg bg-health-mint/20 flex items-center justify-center">
-                {uploadingFile.error ? (
+                {activeUpload.error ? (
                   <AlertCircle className="w-5 h-5 text-red-400" />
+                ) : activeUpload.status === 'complete' ? (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
                 ) : (
                   <Loader2 className="w-5 h-5 text-health-mint animate-spin" />
                 )}
@@ -245,16 +210,36 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
               <div className="flex-1">
                 <div className="mb-2 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
                   <div>
-                    <p className="font-medium text-foreground">{uploadingFile.name}</p>
+                    <p className="font-medium text-foreground">{activeUpload.name}</p>
                     <p className="text-xs text-muted-foreground">
-                      {uploadingFile.error ? uploadingFile.error : uploadingFile.message}
+                      {activeUpload.error ? activeUpload.error : activeUpload.message}
                     </p>
                   </div>
-                  {!uploadingFile.error && (
-                    <span className="text-sm text-muted-foreground">{uploadingFile.progress}%</span>
+                  <div className="flex items-center gap-2">
+                    {!activeUpload.error && (
+                      <span className="text-sm text-muted-foreground">{activeUpload.progress}%</span>
+                    )}
+                    {(activeUpload.error || activeUpload.status === 'complete') && (
+                      <Button variant="ghost" size="sm" onClick={dismissActiveUpload}>
+                        {t.dismiss}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                {!activeUpload.error && activeUpload.status !== 'complete' && (
+                  <Progress value={activeUpload.progress} className="h-2" />
+                )}
+                {!activeUpload.error && activeUpload.status === 'complete' && (
+                  <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
+                    Upload finished and remained active while you navigated away.
+                  </div>
+                )}
+                {activeUpload.error && (
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                    The upload did not finish successfully.
+                  </div>
                   )}
                 </div>
-                {!uploadingFile.error && <Progress value={uploadingFile.progress} className="h-2" />}
               </div>
             </div>
           </CardContent>

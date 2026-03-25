@@ -37,6 +37,7 @@ import {
   type InsightKpiSnapshot,
   type InsightRecord,
   type SampleDatasetKind,
+  type UploadProgressEvent,
   type UploadProgressHandler,
 } from '@/lib/ai-engine';
 
@@ -54,10 +55,19 @@ export interface AnalyticsExportSnapshot {
   aiEnvironment: AIEnvironmentState;
 }
 
+export interface WorkspaceUploadState {
+  name: string;
+  progress: number;
+  status: UploadProgressEvent['status'] | 'complete';
+  message?: string;
+  error?: string;
+}
+
 interface AnalyticsContextValue {
   datasets: DatasetRecord[];
   insights: InsightRecord[];
   aiEnvironment: AIEnvironmentState;
+  activeUpload: WorkspaceUploadState | null;
   uploadFile: (file: File, onProgress?: UploadProgressHandler) => Promise<DatasetRecord>;
   addSampleDataset: (kind?: SampleDatasetKind) => Promise<DatasetRecord>;
   removeDataset: (datasetId: string) => Promise<void>;
@@ -70,6 +80,7 @@ interface AnalyticsContextValue {
   flagInsight: (insightId: string) => void;
   exportSnapshot: () => AnalyticsExportSnapshot;
   clearAllData: () => Promise<void>;
+  dismissActiveUpload: () => void;
 }
 
 interface InitialWorkspaceState {
@@ -805,6 +816,7 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
   const [datasets, setDatasets] = useState<DatasetRecord[]>(initialState.datasets);
   const [insights, setInsights] = useState<InsightRecord[]>(initialState.insights);
   const [aiEnvironment, setAiEnvironment] = useState<AIEnvironmentState>(initialState.aiEnvironment);
+  const [activeUpload, setActiveUpload] = useState<WorkspaceUploadState | null>(null);
   const [backendUserId] = useState(() => getOrCreateBackendUserId());
 
   useEffect(() => {
@@ -883,9 +895,18 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
       markEnvironmentBusy();
       let datasetId: string | null = null;
       let uploadCommitted = false;
+      const updateActiveUpload = (event: UploadProgressEvent) => {
+        setActiveUpload({
+          name: file.name,
+          progress: event.progress,
+          status: event.status,
+          message: event.message,
+        });
+        options?.onProgress?.(event);
+      };
 
       try {
-        options?.onProgress?.({
+        updateActiveUpload({
           progress: 10,
           status: 'uploading',
           message: 'Creating governed session',
@@ -896,7 +917,7 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
         });
         datasetId = created.dataset_id;
 
-        options?.onProgress?.({
+        updateActiveUpload({
           progress: 40,
           status: 'uploading',
           message: 'Uploading dataset to backend',
@@ -904,7 +925,7 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
         await uploadBackendDataset(datasetId, file, backendUserId);
         uploadCommitted = true;
 
-        options?.onProgress?.({
+        updateActiveUpload({
           progress: 75,
           status: 'processing',
           message: 'Profiling dataset',
@@ -945,9 +966,10 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
         setInsights((previous) => [buildUploadInsight(hydratedDataset), ...previous]);
         void refreshDatasets();
 
-        options?.onProgress?.({
+        setActiveUpload({
+          name: file.name,
           progress: 100,
-          status: 'processing',
+          status: 'complete',
           message: 'Dataset ready',
         });
         markEnvironmentReady();
@@ -964,6 +986,13 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
           void refreshDatasets();
         }
         const message = error instanceof Error ? error.message : 'Upload failed unexpectedly.';
+        setActiveUpload((previous) => ({
+          name: file.name,
+          progress: previous?.name === file.name ? previous.progress : 0,
+          status: previous?.status === 'complete' ? 'processing' : previous?.status ?? 'uploading',
+          message: previous?.message ?? 'Upload failed.',
+          error: message,
+        }));
         markEnvironmentError(message);
         throw error instanceof Error ? error : new Error(message);
       }
@@ -1202,11 +1231,16 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
     }
   }, [backendUserId, datasets, markEnvironmentBusy, markEnvironmentError, refreshDatasets]);
 
+  const dismissActiveUpload = useCallback(() => {
+    setActiveUpload(null);
+  }, []);
+
   const value = useMemo<AnalyticsContextValue>(
     () => ({
       datasets,
       insights,
       aiEnvironment,
+      activeUpload,
       uploadFile,
       addSampleDataset,
       removeDataset,
@@ -1219,13 +1253,16 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
       flagInsight,
       exportSnapshot,
       clearAllData,
+      dismissActiveUpload,
     }),
     [
+      activeUpload,
       addSampleDataset,
       aiEnvironment,
       analyzeDataset,
       askAi,
       clearAllData,
+      dismissActiveUpload,
       datasets,
       exportSnapshot,
       flagInsight,
