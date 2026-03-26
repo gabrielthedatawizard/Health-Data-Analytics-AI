@@ -3926,10 +3926,12 @@ export function AIAnalyticsDashboard() {
                           type="button"
                           size="sm"
                           variant="outline"
-                          onClick={() => void handleRunPlaybook(item.playbook_id, item.question_template, item.name)}
-                          disabled={busyAction === `run_playbook:${item.playbook_id}` || !canCompute}
+                          onClick={() =>
+                            void handleInvestigateQuestion(item.question, `Re-ran saved investigation: ${item.title}.`)
+                          }
+                          disabled={busyAction === 'investigate' || !canCompute}
                         >
-                          {busyAction === `run_playbook:${item.playbook_id}` ? (
+                          {busyAction === 'investigate' ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                           ) : (
                             <Bot className="mr-2 h-4 w-4" />
@@ -3971,6 +3973,20 @@ export function AIAnalyticsDashboard() {
                       {item.description ? <p className="mt-2 text-xs text-muted-foreground">{item.description}</p> : null}
                       <div className="mt-3 flex flex-wrap gap-2">
                         <Badge variant="outline">{item.context_type}</Badge>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleRunPlaybook(item.playbook_id, item.question_template, item.name)}
+                          disabled={busyAction === `run_playbook:${item.playbook_id}` || !canCompute}
+                        >
+                          {busyAction === `run_playbook:${item.playbook_id}` ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Bot className="mr-2 h-4 w-4" />
+                          )}
+                          Run
+                        </Button>
                         <Button
                           type="button"
                           size="sm"
