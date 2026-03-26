@@ -157,6 +157,8 @@ WORKFLOW_STATUS_PENDING = "pending_approval"
 WORKFLOW_STATUS_APPROVED = "approved"
 WORKFLOW_STATUS_REJECTED = "rejected"
 WORKFLOW_STATUS_EXECUTED = "executed"
+FEEDBACK_SURFACES = {"ask_data", "document_qa", "dashboard_summary", "chart_explanation"}
+FEEDBACK_RATINGS = {"positive", "negative"}
 COHORT_OPERATOR_LABELS = {
     "eq": "equals",
     "neq": "does not equal",
@@ -598,6 +600,32 @@ class AskResponse(BaseModel):
     governance: dict[str, Any] = Field(default_factory=dict)
 
 
+class FeedbackRequest(BaseModel):
+    surface: str = Field(min_length=3, max_length=64)
+    target_id: str = Field(min_length=1, max_length=200)
+    rating: str = Field(min_length=3, max_length=16)
+    question: str | None = Field(default=None, max_length=1000)
+    title: str | None = Field(default=None, max_length=240)
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+class FeedbackRecord(BaseModel):
+    feedback_id: str
+    surface: str
+    target_id: str
+    rating: str
+    question: str | None = None
+    title: str | None = None
+    comment: str | None = None
+    created_at: str
+    created_by: str
+
+
+class FeedbackListResponse(BaseModel):
+    dataset_id: str
+    feedback: list[FeedbackRecord] = Field(default_factory=list)
+
+
 class SemanticLayerResponse(BaseModel):
     dataset_id: str
     semantic_layer: dict[str, Any]
@@ -771,6 +799,11 @@ def _anomaly_path(dataset_id: str) -> Path:
 def _cohort_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "cohort_analysis.json"
 
+
+def _feedback_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "feedback.json"
+
+
 def _workflow_actions_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "workflow_actions.json"
 
@@ -907,6 +940,22 @@ def _count_recent_audit_events(dataset_id: str, since: datetime) -> int:
     return count
 
 
+def _normalize_feedback_request(payload: FeedbackRequest) -> FeedbackRequest:
+    payload.surface = payload.surface.strip().lower()
+    payload.rating = payload.rating.strip().lower()
+    payload.target_id = payload.target_id.strip()
+    payload.question = payload.question.strip() if payload.question else None
+    payload.title = payload.title.strip() if payload.title else None
+    payload.comment = payload.comment.strip() if payload.comment else None
+    if payload.surface not in FEEDBACK_SURFACES:
+        raise HTTPException(status_code=400, detail=f"Unsupported feedback surface '{payload.surface}'.")
+    if payload.rating not in FEEDBACK_RATINGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported feedback rating '{payload.rating}'.")
+    if not payload.target_id:
+        raise HTTPException(status_code=400, detail="target_id is required.")
+    return payload
+
+
 def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
     path = _workflow_actions_path(dataset_id)
     if not path.exists():
@@ -914,6 +963,26 @@ def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
     payload = _load_json(path)
     actions = payload.get("actions") if isinstance(payload, dict) else []
     return [item for item in actions if isinstance(item, dict)]
+
+
+def _load_feedback(dataset_id: str) -> list[dict[str, Any]]:
+    path = _feedback_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("feedback") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_feedback(dataset_id: str, items: list[dict[str, Any]]) -> None:
+    _save_json(
+        _feedback_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "feedback": items,
+        },
+    )
 
 
 def _save_workflow_actions(dataset_id: str, actions: list[dict[str, Any]]) -> None:
@@ -6150,3 +6219,49 @@ def get_audit_log(
             except json.JSONDecodeError:
                 continue
     return {"dataset_id": dataset_id, "events": events}
+
+
+@app.get("/sessions/{dataset_id}/feedback", response_model=FeedbackListResponse)
+def get_feedback(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> FeedbackListResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return FeedbackListResponse(
+        dataset_id=dataset_id,
+        feedback=[FeedbackRecord(**item) for item in _load_feedback(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/feedback", response_model=FeedbackRecord)
+def submit_feedback(
+    dataset_id: str,
+    payload: FeedbackRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> FeedbackRecord:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
+    normalized = _normalize_feedback_request(payload)
+    record = {
+        "feedback_id": str(uuid.uuid4()),
+        "surface": normalized.surface,
+        "target_id": normalized.target_id,
+        "rating": normalized.rating,
+        "question": normalized.question,
+        "title": normalized.title,
+        "comment": normalized.comment,
+        "created_at": _utc_now_iso(),
+        "created_by": actor,
+    }
+    items = [record, *_load_feedback(dataset_id)]
+    _save_feedback(dataset_id, items)
+    meta.setdefault("artifacts", {})["feedback"] = str(_feedback_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "feedback_recorded",
+        actor,
+        {"surface": normalized.surface, "target_id": normalized.target_id, "rating": normalized.rating},
+    )
+    return FeedbackRecord(**record)

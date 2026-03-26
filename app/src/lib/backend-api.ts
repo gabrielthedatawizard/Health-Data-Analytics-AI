@@ -359,6 +359,23 @@ export interface AuditResponse {
   events: AuditEvent[];
 }
 
+export interface FeedbackRecord {
+  feedback_id: string;
+  surface: string;
+  target_id: string;
+  rating: 'positive' | 'negative';
+  question?: string | null;
+  title?: string | null;
+  comment?: string | null;
+  created_at: string;
+  created_by: string;
+}
+
+export interface FeedbackListResponse {
+  dataset_id: string;
+  feedback: FeedbackRecord[];
+}
+
 export interface PreviewResponse {
   dataset_id: string;
   rows: Array<Record<string, unknown>>;
@@ -1041,6 +1058,33 @@ export function getJobStatus(jobId: string, userId: string) {
 
 export function getAudit(datasetId: string, userId: string) {
   return apiRequest<AuditResponse>(`/sessions/${datasetId}/audit`, undefined, { userId });
+}
+
+export function listFeedback(datasetId: string, userId: string) {
+  return apiRequest<FeedbackListResponse>(`/sessions/${datasetId}/feedback`, undefined, { userId });
+}
+
+export function submitFeedback(
+  datasetId: string,
+  userId: string,
+  payload: {
+    surface: 'ask_data' | 'document_qa' | 'dashboard_summary' | 'chart_explanation';
+    target_id: string;
+    rating: 'positive' | 'negative';
+    question?: string;
+    title?: string;
+    comment?: string;
+  }
+) {
+  return apiRequest<FeedbackRecord>(
+    `/sessions/${datasetId}/feedback`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { userId }
+  );
 }
 
 export function getSensitiveExportStatus(datasetId: string, userId: string) {

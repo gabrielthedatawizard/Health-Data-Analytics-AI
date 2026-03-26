@@ -13,6 +13,8 @@ import {
   RefreshCw,
   Shield,
   Sparkles,
+  ThumbsDown,
+  ThumbsUp,
   Upload,
   X,
 } from 'lucide-react';
@@ -41,6 +43,7 @@ import {
   type AuthContextResponse,
   type BackendUserRole,
   type AuditEvent,
+  type FeedbackRecord,
   type JobStatus,
   type SessionMeta,
   askDocuments,
@@ -58,6 +61,7 @@ import {
   getAuthContext,
   getCohortAnalysis,
   getDashboardSpec,
+  listFeedback,
   getFacts,
   getForecastDrift,
   getForecastRuns,
@@ -80,6 +84,7 @@ import {
   promoteModelRun,
   reviewSensitiveExportApproval,
   setSensitiveExportEnabled,
+  submitFeedback,
   trainForecastRun,
   uploadDocument,
   uploadDataset,
@@ -340,6 +345,10 @@ function formatDocumentFreshnessLabel(value: string | null | undefined): string 
     .join(' ');
 }
 
+function feedbackKey(surface: string, targetId: string): string {
+  return `${surface}:${targetId}`;
+}
+
 function normalizeDashboardCharts(spec: Record<string, unknown> | null): DashboardChartSpec[] {
   const items = Array.isArray(spec?.charts) ? spec.charts : [];
   return items
@@ -563,6 +572,7 @@ export function AIAnalyticsDashboard() {
   const [askResult, setAskResult] = useState<AskResponsePayload | null>(null);
   const [documentQuestion, setDocumentQuestion] = useState('What do our trusted policy documents say about denominator exclusions?');
   const [documentAnswer, setDocumentAnswer] = useState<DocumentAskResponse | null>(null);
+  const [feedbackRecords, setFeedbackRecords] = useState<FeedbackRecord[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [factsJob, setFactsJob] = useState<JobStatus | null>(null);
   const [reportJob, setReportJob] = useState<JobStatus | null>(null);
@@ -653,6 +663,7 @@ export function AIAnalyticsDashboard() {
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
+      setFeedbackRecords([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -674,6 +685,7 @@ export function AIAnalyticsDashboard() {
         setSavedInvestigations([]);
         setSavedPlaybooks([]);
         setWorkflowActions([]);
+        setFeedbackRecords([]);
         const meta = await getSession(datasetId, userId);
         if (!active) return;
         setSessionMeta(meta);
@@ -753,6 +765,12 @@ export function AIAnalyticsDashboard() {
         const auditResponse = await getAudit(datasetId, userId);
         if (!active) return;
         setAuditEvents(auditResponse.events ?? []);
+
+        if (meta.artifacts?.feedback) {
+          const feedbackResponse = await listFeedback(datasetId, userId);
+          if (!active) return;
+          setFeedbackRecords(feedbackResponse.feedback ?? []);
+        }
       } catch (sessionError) {
         if (!active) return;
         setError(sessionError instanceof Error ? sessionError.message : 'Failed to load session.');
@@ -919,6 +937,15 @@ export function AIAnalyticsDashboard() {
   }, [factsBundle]);
 
   const activeChartExplanation = selectedChartKey ? chartExplanations[selectedChartKey] ?? null : null;
+  const feedbackLookup = useMemo(() => {
+    return feedbackRecords.reduce<Record<string, FeedbackRecord>>((accumulator, record) => {
+      const key = feedbackKey(record.surface, record.target_id);
+      if (!accumulator[key]) {
+        accumulator[key] = record;
+      }
+      return accumulator;
+    }, {});
+  }, [feedbackRecords]);
   const piiCandidates = useMemo(() => {
     const raw = profile?.pii_candidates;
     return Array.isArray(raw) ? raw.map((value) => String(value)).slice(0, 6) : [];
@@ -1038,6 +1065,11 @@ export function AIAnalyticsDashboard() {
     setWorkflowActions(response.actions ?? []);
   }
 
+  async function refreshFeedback(targetDatasetId: string) {
+    const response = await listFeedback(targetDatasetId, userId);
+    setFeedbackRecords(response.feedback ?? []);
+  }
+
   async function handleCreateSession() {
     setBusyAction('create_session');
     setError(null);
@@ -1056,6 +1088,7 @@ export function AIAnalyticsDashboard() {
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
+      setFeedbackRecords([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -1124,6 +1157,82 @@ export function AIAnalyticsDashboard() {
     }
   }
 
+  async function handleSubmitFeedback(
+    surface: 'ask_data' | 'document_qa' | 'dashboard_summary' | 'chart_explanation',
+    targetId: string,
+    rating: 'positive' | 'negative',
+    extra?: { question?: string; title?: string }
+  ) {
+    if (!datasetId) {
+      setError('Create or load a governed session before recording feedback.');
+      return;
+    }
+
+    setBusyAction(`feedback:${surface}:${targetId}:${rating}`);
+    setError(null);
+    setNotice(null);
+    try {
+      await submitFeedback(datasetId, userId, {
+        surface,
+        target_id: targetId,
+        rating,
+        question: extra?.question,
+        title: extra?.title,
+      });
+      await refreshFeedback(datasetId);
+      const meta = await getSession(datasetId, userId);
+      setSessionMeta(meta);
+      const auditResponse = await getAudit(datasetId, userId);
+      setAuditEvents(auditResponse.events ?? []);
+      setNotice(`Recorded ${rating} feedback for ${surface.replace('_', ' ')}.`);
+    } catch (feedbackError) {
+      setError(feedbackError instanceof Error ? feedbackError.message : 'Feedback submission failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  function renderFeedbackActions(
+    surface: 'ask_data' | 'document_qa' | 'dashboard_summary' | 'chart_explanation',
+    targetId: string,
+    extra?: { question?: string; title?: string }
+  ) {
+    const selectedRating = feedbackLookup[feedbackKey(surface, targetId)]?.rating;
+    return (
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-muted-foreground">Was this helpful?</span>
+        <Button
+          type="button"
+          size="sm"
+          variant={selectedRating === 'positive' ? 'default' : 'outline'}
+          onClick={() => void handleSubmitFeedback(surface, targetId, 'positive', extra)}
+          disabled={busyAction === `feedback:${surface}:${targetId}:positive` || !canWriteSession}
+        >
+          {busyAction === `feedback:${surface}:${targetId}:positive` ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <ThumbsUp className="mr-2 h-4 w-4" />
+          )}
+          Helpful
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant={selectedRating === 'negative' ? 'default' : 'outline'}
+          onClick={() => void handleSubmitFeedback(surface, targetId, 'negative', extra)}
+          disabled={busyAction === `feedback:${surface}:${targetId}:negative` || !canWriteSession}
+        >
+          {busyAction === `feedback:${surface}:${targetId}:negative` ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <ThumbsDown className="mr-2 h-4 w-4" />
+          )}
+          Needs Work
+        </Button>
+      </div>
+    );
+  }
+
   async function handleLoadSession() {
     const targetDatasetId = loadDatasetId.trim();
     if (!targetDatasetId) {
@@ -1151,6 +1260,7 @@ export function AIAnalyticsDashboard() {
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
       setWorkflowActions([]);
+      setFeedbackRecords([]);
       setDashboardSpec(null);
       setAskResult(null);
       setDashboardExplanation(null);
@@ -2513,6 +2623,12 @@ export function AIAnalyticsDashboard() {
                 <Badge variant="outline">Confidence: {documentAnswer.confidence}</Badge>
                 <Badge variant="outline">Citations: {documentAnswer.citations.length}</Badge>
               </div>
+              <div className="mt-4">
+                {renderFeedbackActions('document_qa', 'document_qa', {
+                  question: documentQuestion,
+                  title: 'Trusted document answer',
+                })}
+              </div>
             </div>
             {documentAnswer.citations.length > 0 ? (
               <div className="grid gap-3 lg:grid-cols-2">
@@ -2887,6 +3003,12 @@ export function AIAnalyticsDashboard() {
                       title="Dashboard result rows"
                       emptyRowsMessage="No tabular rows were returned for the dashboard summary."
                     />
+                    <div className="mt-4">
+                      {renderFeedbackActions('dashboard_summary', 'dashboard_summary', {
+                        question: dashboardExplanation.question,
+                        title: 'Dashboard narrative',
+                      })}
+                    </div>
                   </div>
                 ) : null}
 
@@ -2901,6 +3023,12 @@ export function AIAnalyticsDashboard() {
                       title="Chart result rows"
                       emptyRowsMessage="No tabular rows were returned for this chart explanation."
                     />
+                    <div className="mt-4">
+                      {renderFeedbackActions('chart_explanation', selectedChartKey, {
+                        question: activeChartExplanation.question,
+                        title: 'Chart explanation',
+                      })}
+                    </div>
                   </div>
                 ) : null}
 
@@ -3465,6 +3593,10 @@ export function AIAnalyticsDashboard() {
               title="Result Rows"
               emptyRowsMessage="No tabular rows were returned for this question."
             />
+            {renderFeedbackActions('ask_data', 'current_ask', {
+              question: askQuestion,
+              title: 'Ask Your Data response',
+            })}
 
             <div className="grid gap-4 xl:grid-cols-2">
               <div className="rounded-xl border border-border bg-background p-4">
