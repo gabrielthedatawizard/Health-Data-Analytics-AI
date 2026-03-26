@@ -199,6 +199,9 @@ export interface ReportScheduleRecord {
   last_run_at?: string | null;
   last_job_id?: string | null;
   last_run_status?: string | null;
+  next_due_at?: string | null;
+  due_now?: boolean;
+  days_until_due?: number | null;
 }
 
 export interface ReportSchedulesResponse {
@@ -211,6 +214,19 @@ export interface ReportScheduleRunResponse {
   schedule_id: string;
   job_id: string;
   status: string;
+}
+
+export interface ReportScheduleBatchRunItem {
+  schedule_id: string;
+  title: string;
+  job_id: string;
+  status: string;
+}
+
+export interface ReportScheduleBatchRunResponse {
+  dataset_id: string;
+  triggered_count: number;
+  runs: ReportScheduleBatchRunItem[];
 }
 
 export interface ForecastSeriesPoint {
@@ -1040,6 +1056,16 @@ export function runReportSchedule(datasetId: string, scheduleId: string, userId:
   );
 }
 
+export function runDueReportSchedules(datasetId: string, userId: string) {
+  return apiRequest<ReportScheduleBatchRunResponse>(
+    `/sessions/${datasetId}/report-schedules/run-due`,
+    {
+      method: 'POST',
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
 export function draftWorkflowAction(
   datasetId: string,
   userId: string,
@@ -1150,6 +1176,16 @@ export function getJobStatus(jobId: string, userId: string) {
 export function listJobs(userId: string, userRole?: BackendUserRole, datasetId?: string) {
   const suffix = datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : '';
   return apiRequest<{ jobs: JobStatus[] }>(`/jobs${suffix}`, undefined, { userId, userRole });
+}
+
+export function retryJob(jobId: string, userId: string, userRole?: BackendUserRole) {
+  return apiRequest<JobStatus>(
+    `/jobs/${jobId}/retry`,
+    {
+      method: 'POST',
+    },
+    { userId, userRole, timeoutMs: 120000 }
+  );
 }
 
 export function getAudit(datasetId: string, userId: string) {

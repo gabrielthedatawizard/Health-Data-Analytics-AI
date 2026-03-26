@@ -87,6 +87,7 @@ import {
   promoteModelRun,
   reviewSensitiveExportApproval,
   runPlaybook,
+  runDueReportSchedules,
   runReportSchedule,
   setSensitiveExportEnabled,
   submitFeedback,
@@ -348,6 +349,20 @@ function formatDocumentFreshnessLabel(value: string | null | undefined): string 
     .split('_')
     .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
     .join(' ');
+}
+
+function formatScheduleDueLabel(schedule: ReportScheduleRecord): string {
+  if (schedule.due_now) {
+    return schedule.last_run_at ? 'Due now' : 'Initial run due';
+  }
+  if (!schedule.next_due_at) {
+    return 'Cadence pending';
+  }
+  const dueDate = new Date(schedule.next_due_at);
+  if (Number.isNaN(dueDate.getTime())) {
+    return 'Scheduled';
+  }
+  return `Due ${dueDate.toLocaleString()}`;
 }
 
 function feedbackKey(surface: string, targetId: string): string {
@@ -960,6 +975,10 @@ export function AIAnalyticsDashboard() {
       return accumulator;
     }, {});
   }, [feedbackRecords]);
+  const dueReportSchedules = useMemo(
+    () => reportSchedules.filter((schedule) => schedule.due_now && schedule.status === 'active'),
+    [reportSchedules],
+  );
   const piiCandidates = useMemo(() => {
     const raw = profile?.pii_candidates;
     return Array.isArray(raw) ? raw.map((value) => String(value)).slice(0, 6) : [];
@@ -1858,6 +1877,41 @@ export function AIAnalyticsDashboard() {
       });
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : 'Running the report schedule failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRunDueReportSchedules() {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction('run_due_report_schedules');
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await runDueReportSchedules(datasetId, userId);
+      await refreshReportSchedules(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      if (response.runs[0]) {
+        setReportJob({
+          job_id: response.runs[0].job_id,
+          type: 'report',
+          dataset_id: datasetId,
+          status: response.runs[0].status,
+          progress: 0,
+        });
+      }
+      setNotice(
+        response.triggered_count > 0
+          ? `Queued ${response.triggered_count} due report schedule${response.triggered_count === 1 ? '' : 's'}.`
+          : 'No report schedules are due right now.',
+      );
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : 'Running due report schedules failed.');
     } finally {
       setBusyAction(null);
     }
@@ -2927,10 +2981,27 @@ export function AIAnalyticsDashboard() {
             <div>
               <p className="text-sm font-medium text-foreground">Governed Report Schedules</p>
               <p className="mt-1 text-xs text-muted-foreground">
-                Approved `schedule_report` workflows create durable schedule artifacts that can be manually triggered.
+                Approved `schedule_report` workflows create durable schedule artifacts with due tracking and manual run controls.
               </p>
             </div>
-            <Badge variant="outline">{reportSchedules.length}</Badge>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline">{reportSchedules.length}</Badge>
+              <Badge variant="outline">{dueReportSchedules.length} due</Badge>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => void handleRunDueReportSchedules()}
+                disabled={busyAction === 'run_due_report_schedules' || dueReportSchedules.length === 0 || !canCompute}
+              >
+                {busyAction === 'run_due_report_schedules' ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                )}
+                Run Due
+              </Button>
+            </div>
           </div>
 
           {reportSchedules.length === 0 ? (
@@ -2951,6 +3022,7 @@ export function AIAnalyticsDashboard() {
                     <div className="flex flex-wrap gap-2">
                       <Badge variant="outline">{schedule.status}</Badge>
                       <Badge variant="outline">{schedule.report_template}</Badge>
+                      <Badge variant="outline">{formatScheduleDueLabel(schedule)}</Badge>
                     </div>
                   </div>
 
@@ -2972,6 +3044,7 @@ export function AIAnalyticsDashboard() {
                   <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
                     <span>Created {new Date(schedule.created_at).toLocaleString()}</span>
                     {schedule.last_run_at ? <span>Last run {new Date(schedule.last_run_at).toLocaleString()}</span> : null}
+                    {schedule.next_due_at ? <span>Next due {new Date(schedule.next_due_at).toLocaleString()}</span> : null}
                     {schedule.last_run_status ? <span>Last job {schedule.last_run_status}</span> : null}
                   </div>
 

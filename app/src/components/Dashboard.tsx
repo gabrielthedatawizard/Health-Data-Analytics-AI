@@ -9,6 +9,7 @@ import {
   FileUp,
   Flag,
   Loader2,
+  RefreshCw,
   Shield,
   Sparkles,
 } from 'lucide-react';
@@ -38,6 +39,7 @@ import {
   getReviewQueue,
   getSystemStatus,
   listJobs,
+  retryJob,
   type BackendUserRole,
   type JobStatus,
   type ReviewQueueItem,
@@ -168,6 +170,7 @@ export function Dashboard({ onViewChange }: DashboardProps) {
   const [reviewQueueError, setReviewQueueError] = useState<string | null>(null);
   const [recentJobs, setRecentJobs] = useState<JobStatus[]>([]);
   const [recentJobsError, setRecentJobsError] = useState<string | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
 
   const sortedDatasets = useMemo(
     () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
@@ -183,6 +186,7 @@ export function Dashboard({ onViewChange }: DashboardProps) {
     (latestDataset
       ? sortedInsights.find((insight) => insight.datasetId === latestDataset.id)
       : null) ?? sortedInsights[0] ?? null;
+  const canRetryJobs = resolveBackendRole() !== 'viewer';
 
   const stats = useMemo(() => {
     const activeDatasets = datasets.filter((dataset) => dataset.status === 'active');
@@ -250,53 +254,57 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       .slice(0, 5);
   }, [sortedDatasets]);
 
+  async function refreshOperatorPanels() {
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    const role = resolveBackendRole();
+    const [statusResult, queueResult, jobsResult] = await Promise.allSettled([
+      getSystemStatus(actor, role),
+      getReviewQueue(actor, role),
+      listJobs(actor, role),
+    ]);
+
+    if (statusResult.status === 'fulfilled') {
+      setSystemStatus(statusResult.value);
+      setSystemStatusError(null);
+    } else {
+      setSystemStatus(null);
+      setSystemStatusError(
+        statusResult.reason instanceof Error ? statusResult.reason.message : 'Could not load governed backend status.',
+      );
+    }
+
+    if (queueResult.status === 'fulfilled') {
+      setReviewQueue(queueResult.value.items ?? []);
+      setReviewQueueError(null);
+    } else {
+      setReviewQueue([]);
+      setReviewQueueError(
+        queueResult.reason instanceof Error ? queueResult.reason.message : 'Could not load the governance queue.',
+      );
+    }
+
+    if (jobsResult.status === 'fulfilled') {
+      const jobs = [...(jobsResult.value.jobs ?? [])];
+      jobs.sort((left, right) => {
+        const leftTime = new Date(left.updated_at ?? left.created_at ?? 0).getTime();
+        const rightTime = new Date(right.updated_at ?? right.created_at ?? 0).getTime();
+        return rightTime - leftTime;
+      });
+      setRecentJobs(jobs.slice(0, 6));
+      setRecentJobsError(null);
+    } else {
+      setRecentJobs([]);
+      setRecentJobsError(jobsResult.reason instanceof Error ? jobsResult.reason.message : 'Could not load recent backend jobs.');
+    }
+  }
+
   useEffect(() => {
     let active = true;
 
     async function hydrateSystemStatus() {
-      const actor =
-        (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
-      const role = resolveBackendRole();
-      const [statusResult, queueResult, jobsResult] = await Promise.allSettled([
-        getSystemStatus(actor, role),
-        getReviewQueue(actor, role),
-        listJobs(actor, role),
-      ]);
+      await refreshOperatorPanels();
       if (!active) return;
-
-      if (statusResult.status === 'fulfilled') {
-        setSystemStatus(statusResult.value);
-        setSystemStatusError(null);
-      } else {
-        setSystemStatus(null);
-        setSystemStatusError(
-          statusResult.reason instanceof Error ? statusResult.reason.message : 'Could not load governed backend status.',
-        );
-      }
-
-      if (queueResult.status === 'fulfilled') {
-        setReviewQueue(queueResult.value.items ?? []);
-        setReviewQueueError(null);
-      } else {
-        setReviewQueue([]);
-        setReviewQueueError(
-          queueResult.reason instanceof Error ? queueResult.reason.message : 'Could not load the governance queue.',
-        );
-      }
-
-      if (jobsResult.status === 'fulfilled') {
-        const jobs = [...(jobsResult.value.jobs ?? [])];
-        jobs.sort((left, right) => {
-          const leftTime = new Date(left.updated_at ?? left.created_at ?? 0).getTime();
-          const rightTime = new Date(right.updated_at ?? right.created_at ?? 0).getTime();
-          return rightTime - leftTime;
-        });
-        setRecentJobs(jobs.slice(0, 6));
-        setRecentJobsError(null);
-      } else {
-        setRecentJobs([]);
-        setRecentJobsError(jobsResult.reason instanceof Error ? jobsResult.reason.message : 'Could not load recent backend jobs.');
-      }
     }
 
     void hydrateSystemStatus();
@@ -331,6 +339,19 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       window.localStorage.setItem(BACKEND_DATASET_STORAGE_KEY, datasetId);
     }
     onViewChange('ai_analytics');
+  }
+
+  async function handleRetryJob(job: JobStatus) {
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    const role = resolveBackendRole();
+    setRetryingJobId(job.job_id);
+    try {
+      await retryJob(job.job_id, actor, role);
+      await refreshOperatorPanels();
+    } finally {
+      setRetryingJobId(null);
+    }
   }
 
   if (datasets.length === 0) {
@@ -670,6 +691,20 @@ export function Dashboard({ onViewChange }: DashboardProps) {
                     Updated {formatTimestamp(job.updated_at ?? job.created_at ?? new Date().toISOString())}
                   </p>
                   {job.error?.message ? <p className="mt-2 text-xs text-muted-foreground">{job.error.message}</p> : null}
+                  {job.status === 'failed' ? (
+                    <div className="mt-3">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleRetryJob(job)}
+                        disabled={!canRetryJobs || retryingJobId === job.job_id}
+                      >
+                        {retryingJobId === job.job_id ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                        Retry Job
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
               ))
             ) : (

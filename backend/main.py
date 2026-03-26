@@ -429,6 +429,9 @@ class ReportScheduleRecord(BaseModel):
     last_run_at: str | None = None
     last_job_id: str | None = None
     last_run_status: str | None = None
+    next_due_at: str | None = None
+    due_now: bool = False
+    days_until_due: int | None = None
 
 
 class ReportSchedulesResponse(BaseModel):
@@ -441,6 +444,19 @@ class ReportScheduleRunResponse(BaseModel):
     schedule_id: str
     job_id: str
     status: str
+
+
+class ReportScheduleBatchRunItem(BaseModel):
+    schedule_id: str
+    title: str
+    job_id: str
+    status: str
+
+
+class ReportScheduleBatchRunResponse(BaseModel):
+    dataset_id: str
+    triggered_count: int = 0
+    runs: list[ReportScheduleBatchRunItem] = Field(default_factory=list)
 
 
 class ForecastTrainRequest(BaseModel):
@@ -1027,6 +1043,64 @@ def _report_schedule_record(dataset_id: str, schedule_id: str) -> tuple[int, dic
         if str(item.get("schedule_id") or "") == schedule_id:
             return index, item, schedules
     raise HTTPException(status_code=404, detail="Report schedule not found.")
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _report_schedule_interval_days(frequency: str | None) -> int:
+    text = str(frequency or "").strip().lower()
+    if "day" in text:
+        return 1
+    if "week" in text:
+        return 7
+    if "quarter" in text:
+        return 90
+    if "year" in text or "annual" in text:
+        return 365
+    return 30
+
+
+def _report_schedule_due_state(schedule: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    baseline = _parse_iso_datetime(str(schedule.get("last_run_at") or "")) or _parse_iso_datetime(
+        str(schedule.get("created_at") or schedule.get("updated_at") or "")
+    )
+    current_time = now or datetime.now(timezone.utc)
+    if baseline is None:
+        return {
+            "next_due_at": None,
+            "due_now": bool(not schedule.get("last_run_at")),
+            "days_until_due": None,
+        }
+
+    if not schedule.get("last_run_at"):
+        next_due = baseline
+    else:
+        next_due = baseline + timedelta(days=_report_schedule_interval_days(str(schedule.get("frequency") or "")))
+
+    remaining_days = int((next_due - current_time).total_seconds() // 86400)
+    return {
+        "next_due_at": next_due.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "due_now": current_time >= next_due,
+        "days_until_due": remaining_days,
+    }
+
+
+def _schedule_record_with_due_state(schedule: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    enriched = dict(schedule)
+    enriched.update(_report_schedule_due_state(schedule, now=now))
+    return enriched
 
 
 def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
@@ -2738,6 +2812,37 @@ def _queue_report_job(dataset_id: str, actor: str, template: str | None, section
         except Exception as inner_exc:
             update_job(job["job_id"], status="failed", error=str(inner_exc))
             raise HTTPException(status_code=503, detail=f"Failed to run report job: {exc}; {inner_exc}") from inner_exc
+    return {"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}
+
+
+def _queue_facts_job(
+    dataset_id: str,
+    actor: str,
+    mode: str,
+    seed: int,
+    *,
+    file_hash: str,
+    schema_hash: str,
+    force: bool,
+    audit_action: str,
+) -> dict[str, Any]:
+    cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:facts:")
+    job = create_job(
+        "facts",
+        dataset_id,
+        {"mode": mode, "seed": seed, "file_hash": file_hash, "schema_hash": schema_hash, "force": force},
+    )
+    try:
+        from backend.tasks import generate_facts_task
+
+        generate_facts_task.delay(job["job_id"], dataset_id, mode, seed)
+        _append_audit(dataset_id, audit_action, actor, {"job_id": job["job_id"], "mode": mode})
+    except Exception as exc:
+        try:
+            generate_facts_task(job["job_id"], dataset_id, mode, seed)
+        except Exception as inner_exc:
+            update_job(job["job_id"], status="failed", error=str(inner_exc))
+            raise HTTPException(status_code=503, detail=f"Failed to run facts job: {exc}; {inner_exc}") from inner_exc
     return {"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}
 
 
@@ -4520,6 +4625,7 @@ def get_review_queue(
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> ReviewQueueResponse:
     actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    now = datetime.now(timezone.utc)
     visible_sessions = _iter_accessible_sessions(actor, permissions)
     visible_dataset_ids = {dataset_id for dataset_id, _ in visible_sessions}
     session_meta_by_id = {dataset_id: meta for dataset_id, meta in visible_sessions}
@@ -4600,18 +4706,24 @@ def get_review_queue(
         for schedule in _load_report_schedules(dataset_id):
             if str(schedule.get("status") or "") != "active":
                 continue
-            if schedule.get("last_run_at"):
+            due_state = _report_schedule_due_state(schedule, now=now)
+            if not bool(due_state.get("due_now")):
                 continue
             frequency = str(schedule.get("frequency") or "scheduled")
+            has_run = bool(schedule.get("last_run_at"))
             _queue_item(
                 item_id=f"schedule:{dataset_id}:{schedule.get('schedule_id')}",
                 dataset_id=dataset_id,
                 dataset_label=dataset_label,
                 category="report_schedule",
-                severity="info",
+                severity="warning" if has_run else "info",
                 status="ready_to_run",
                 title=str(schedule.get("title") or "Governed report schedule"),
-                summary=f"Active {frequency} schedule has not been run yet for this session.",
+                summary=(
+                    f"Active {frequency} schedule is due again and should queue its next governed report."
+                    if has_run
+                    else f"Active {frequency} schedule has not been run yet for this session."
+                ),
                 created_at=str(schedule.get("created_at") or ""),
                 updated_at=str(schedule.get("updated_at") or schedule.get("created_at") or ""),
                 action_hint="Open AI Analytics to run the scheduled report now.",
@@ -5405,9 +5517,10 @@ def list_report_schedules(
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> ReportSchedulesResponse:
     _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    now = datetime.now(timezone.utc)
     return ReportSchedulesResponse(
         dataset_id=dataset_id,
-        schedules=[ReportScheduleRecord(**item) for item in _load_report_schedules(dataset_id)],
+        schedules=[ReportScheduleRecord(**_schedule_record_with_due_state(item, now=now)) for item in _load_report_schedules(dataset_id)],
     )
 
 
@@ -5452,6 +5565,70 @@ def run_report_schedule(
         job_id=queued["job_id"],
         status=queued["status"],
     )
+
+
+@app.post("/sessions/{dataset_id}/report-schedules/run-due", response_model=ReportScheduleBatchRunResponse)
+def run_due_report_schedules(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ReportScheduleBatchRunResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    schedules = _load_report_schedules(dataset_id)
+    now = datetime.now(timezone.utc)
+    runs: list[ReportScheduleBatchRunItem] = []
+    changed = False
+    for index, schedule in enumerate(schedules):
+        if str(schedule.get("status") or "active") != "active":
+            continue
+        due_state = _report_schedule_due_state(schedule, now=now)
+        if not bool(due_state.get("due_now")):
+            continue
+
+        queued = _queue_report_job(
+            dataset_id,
+            actor,
+            str(schedule.get("report_template") or "health_report"),
+            [str(item) for item in (schedule.get("sections") or [])],
+        )
+        run_time = _utc_now_iso()
+        updated = dict(schedule)
+        updated["last_run_at"] = run_time
+        updated["last_job_id"] = queued["job_id"]
+        updated["last_run_status"] = queued["status"]
+        updated["updated_at"] = run_time
+        schedules[index] = updated
+        changed = True
+        runs.append(
+            ReportScheduleBatchRunItem(
+                schedule_id=str(updated.get("schedule_id") or ""),
+                title=str(updated.get("title") or "Governed report schedule"),
+                job_id=str(queued["job_id"]),
+                status=str(queued["status"]),
+            )
+        )
+        _append_audit(
+            dataset_id,
+            "report_schedule_run",
+            actor,
+            {"schedule_id": updated.get("schedule_id"), "job_id": queued["job_id"], "title": updated.get("title"), "mode": "run_due"},
+        )
+
+    if changed:
+        _save_report_schedules(dataset_id, schedules)
+        meta.setdefault("artifacts", {})["report_schedules"] = str(_report_schedules_path(dataset_id))
+        _save_meta(dataset_id, meta)
+
+    _append_audit(
+        dataset_id,
+        "report_schedule_due_scan",
+        actor,
+        {"triggered_count": len(runs)},
+    )
+    return ReportScheduleBatchRunResponse(dataset_id=dataset_id, triggered_count=len(runs), runs=runs)
 
 
 @app.get("/sessions/{dataset_id}/ml-runs", response_model=ForecastRunsResponse)
@@ -6090,24 +6267,16 @@ def regenerate_facts(
         _save_meta(dataset_id, meta)
     resolved_seed = seed if seed is not None else _seed_from_dataset_hash(file_hash)
     schema_hash = meta.get("schema_hash", "")
-    cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:facts:")
-    job = create_job(
-        "facts",
+    job = _queue_facts_job(
         dataset_id,
-        {"mode": mode, "seed": resolved_seed, "file_hash": file_hash, "schema_hash": schema_hash, "force": True},
+        actor,
+        mode,
+        resolved_seed,
+        file_hash=file_hash,
+        schema_hash=schema_hash,
+        force=True,
+        audit_action="facts_job_forced",
     )
-    try:
-        from backend.tasks import generate_facts_task
-
-        generate_facts_task.delay(job["job_id"], dataset_id, mode, resolved_seed)
-        _append_audit(dataset_id, "facts_job_forced", actor, {"job_id": job["job_id"], "mode": mode})
-    except Exception as exc:
-        try:
-            generate_facts_task(job["job_id"], dataset_id, mode, resolved_seed)
-        except Exception as inner_exc:
-            update_job(job["job_id"], status="failed", error=str(inner_exc))
-            raise HTTPException(status_code=503, detail=f"Failed to run facts job: {exc}; {inner_exc}") from inner_exc
-
     return Response(
         content=json.dumps({"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}),
         media_type="application/json",
@@ -6548,6 +6717,70 @@ def get_job_status(
     if dataset_id:
         _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
     return _normalize_job_payload(job)
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(
+    job_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    dataset_id = str(job.get("dataset_id") or "")
+    if not dataset_id:
+        raise HTTPException(status_code=400, detail="Only dataset-scoped jobs can be retried.")
+
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if str(job.get("status") or "") != "failed":
+        raise HTTPException(status_code=409, detail="Only failed jobs can be retried.")
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    job_type = str(job.get("type") or "")
+    if job_type == "report":
+        queued = _queue_report_job(
+            dataset_id,
+            actor,
+            str(payload.get("template") or "health_report"),
+            [str(item) for item in (payload.get("sections") or [])],
+        )
+    elif job_type == "facts":
+        file_hash = str(payload.get("file_hash") or meta.get("file_hash") or _dataset_signature(meta))
+        if file_hash and meta.get("file_hash") != file_hash:
+            meta["file_hash"] = file_hash
+            _save_meta(dataset_id, meta)
+        seed_value = payload.get("seed")
+        try:
+            seed = int(seed_value) if seed_value is not None else _seed_from_dataset_hash(file_hash)
+        except (TypeError, ValueError):
+            seed = _seed_from_dataset_hash(file_hash)
+        queued = _queue_facts_job(
+            dataset_id,
+            actor,
+            str(payload.get("mode") or "full"),
+            seed,
+            file_hash=file_hash,
+            schema_hash=str(payload.get("schema_hash") or meta.get("schema_hash") or ""),
+            force=bool(payload.get("force", True)),
+            audit_action="facts_job_retried",
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Retry is not supported for job type '{job_type}'.")
+
+    _append_audit(
+        dataset_id,
+        "job_retried",
+        actor,
+        {"original_job_id": job_id, "retried_job_id": queued["job_id"], "job_type": job_type},
+    )
+    retried = get_job(str(queued["job_id"]))
+    if not retried:
+        raise HTTPException(status_code=500, detail="Retried job could not be loaded.")
+    return _normalize_job_payload(retried)
 
 
 @app.get("/sessions/{dataset_id}/export/{format}")
