@@ -4,6 +4,7 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 import backend.main as main
+from backend.tasks import generate_facts_task
 
 
 client = TestClient(main.app)
@@ -86,6 +87,47 @@ def test_saved_investigations_and_playbooks_persist_for_session() -> None:
     actions = [event["action"] for event in audit.json()["events"]]
     assert "investigation_saved" in actions
     assert "playbook_saved" in actions
+
+
+def test_saved_playbook_can_run_through_governed_ask_pipeline() -> None:
+    dataset_id = _create_session()
+    _upload_dataset(dataset_id)
+
+    facts_response = client.post(
+        f"/sessions/{dataset_id}/facts",
+        json={"mode": "full"},
+        headers={"X-API-Key": ACTOR},
+    )
+    assert facts_response.status_code in (200, 202)
+    if facts_response.status_code == 202:
+        generate_facts_task(facts_response.json()["job_id"], dataset_id, "full", 42)
+
+    saved_playbook = client.post(
+        f"/sessions/{dataset_id}/playbooks",
+        json={
+            "name": "Facility trend review",
+            "question_template": "Compare visit trends by facility over the last 6 months.",
+            "context_type": "ask",
+        },
+        headers={"X-API-Key": ACTOR},
+    )
+    assert saved_playbook.status_code == 200
+    playbook_payload = saved_playbook.json()
+
+    run_response = client.post(
+        f"/sessions/{dataset_id}/playbooks/{playbook_payload['playbook_id']}/run",
+        headers={"X-API-Key": ACTOR},
+    )
+    assert run_response.status_code == 200
+    ask_payload = run_response.json()
+    assert ask_payload["dataset_id"] == dataset_id
+    assert "answer" in ask_payload
+    assert ask_payload["query_plan"] is not None
+
+    audit = client.get(f"/sessions/{dataset_id}/audit", headers={"X-API-Key": ACTOR})
+    assert audit.status_code == 200
+    events = audit.json()["events"]
+    assert any(event["action"] == "playbook_run" for event in events)
 
 
 def test_viewer_cannot_save_investigations_or_playbooks() -> None:

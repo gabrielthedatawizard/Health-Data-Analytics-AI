@@ -956,6 +956,13 @@ def _normalize_feedback_request(payload: FeedbackRequest) -> FeedbackRequest:
     return payload
 
 
+def _playbook_record(dataset_id: str, playbook_id: str) -> dict[str, Any]:
+    for item in _load_saved_playbooks(dataset_id):
+        if str(item.get("playbook_id") or "") == playbook_id:
+            return item
+    raise HTTPException(status_code=404, detail="Playbook not found.")
+
+
 def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
     path = _workflow_actions_path(dataset_id)
     if not path.exists():
@@ -5826,14 +5833,15 @@ def get_dashboard(
     return {"dataset_id": dataset_id, "dashboard_html": _render_dashboard_html(spec), "spec_version": spec.get("version")}
 
 
-@app.post("/sessions/{dataset_id}/ask", response_model=AskResponse)
-def ask_dataset(
+def _execute_governed_ask(
     dataset_id: str,
-    payload: AskRequest,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    question: str,
+    meta: dict[str, Any],
+    actor: str,
+    *,
+    audit_action: str = "ask_data",
+    audit_details: dict[str, Any] | None = None,
 ) -> AskResponse:
-    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
     facts_path = _facts_path(dataset_id)
     if facts_path.exists():
         facts_bundle = _load_json(facts_path)
@@ -5875,19 +5883,22 @@ def ask_dataset(
     semantic_layer = build_semantic_layer(profile)
 
     try:
-        query_plan = _generate_query_plan_llm(payload.question, facts_bundle, profile, semantic_layer)
+        query_plan = _generate_query_plan_llm(question, facts_bundle, profile, semantic_layer)
     except Exception:
-        query_plan = _fallback_query_plan(payload.question, profile, semantic_layer)
+        query_plan = _fallback_query_plan(question, profile, semantic_layer)
 
     try:
         validate_schema(query_plan, QUERY_PLAN_SCHEMA)
         query_plan = validate_and_resolve_query_plan(query_plan, profile, semantic_layer)
     except (QueryPlanValidationError, SchemaValidationError) as exc:
+        details = {"question": question, "status": "invalid_plan", "error": str(exc)}
+        if audit_details:
+            details.update(audit_details)
         _append_audit(
             dataset_id,
-            "ask_data",
+            audit_action,
             actor,
-            {"question": payload.question, "status": "invalid_plan", "error": str(exc)},
+            details,
         )
         raise HTTPException(status_code=422, detail=f"Invalid query plan: {exc}") from exc
 
@@ -5895,17 +5906,20 @@ def ask_dataset(
     candidate_fact_ids = _default_fact_ids(facts_bundle)
 
     try:
-        answer, facts_used = _summarize_query_result_llm(payload.question, result_df, facts_bundle, candidate_fact_ids)
+        answer, facts_used = _summarize_query_result_llm(question, result_df, facts_bundle, candidate_fact_ids)
     except Exception:
-        fallback_answer, fallback_facts, _, _, _ = _safe_answer_from_facts(payload.question, facts_bundle)
+        fallback_answer, fallback_facts, _, _, _ = _safe_answer_from_facts(question, facts_bundle)
         answer = f"{fallback_answer} ({execution_note})"
         facts_used = fallback_facts or candidate_fact_ids
 
+    details = {"question": question, "facts_used": facts_used, "status": "ok"}
+    if audit_details:
+        details.update(audit_details)
     _append_audit(
         dataset_id,
-        "ask_data",
+        audit_action,
         actor,
-        {"question": payload.question, "facts_used": facts_used, "status": "ok"},
+        details,
     )
 
     data_coverage = (facts_bundle.get("data_coverage") or {}).get("mode", "sample")
@@ -5947,6 +5961,39 @@ def ask_dataset(
             "semantic_metric_ids": used_metric_ids,
             "blocked_fields": semantic_layer.get("pii_blocked_fields", []),
         },
+    )
+
+
+@app.post("/sessions/{dataset_id}/ask", response_model=AskResponse)
+def ask_dataset(
+    dataset_id: str,
+    payload: AskRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> AskResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    return _execute_governed_ask(dataset_id, payload.question, meta, actor)
+
+
+@app.post("/sessions/{dataset_id}/playbooks/{playbook_id}/run", response_model=AskResponse)
+def run_playbook(
+    dataset_id: str,
+    playbook_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> AskResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    playbook = _playbook_record(dataset_id, playbook_id)
+    question = str(playbook.get("question_template") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Playbook does not have a runnable question template.")
+    return _execute_governed_ask(
+        dataset_id,
+        question,
+        meta,
+        actor,
+        audit_action="playbook_run",
+        audit_details={"playbook_id": playbook_id, "name": str(playbook.get("name") or "Unnamed playbook")},
     )
 
 

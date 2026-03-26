@@ -949,6 +949,16 @@ export function savePlaybook(
   );
 }
 
+export function runPlaybook(datasetId: string, playbookId: string, userId: string) {
+  return apiRequest<AskResponsePayload>(
+    `/sessions/${datasetId}/playbooks/${playbookId}/run`,
+    {
+      method: 'POST',
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
 export function draftWorkflowAction(
   datasetId: string,
   userId: string,

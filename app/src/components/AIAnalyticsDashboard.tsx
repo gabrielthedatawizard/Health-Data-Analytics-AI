@@ -83,6 +83,7 @@ import {
   reviewWorkflowAction,
   promoteModelRun,
   reviewSensitiveExportApproval,
+  runPlaybook,
   setSensitiveExportEnabled,
   submitFeedback,
   trainForecastRun,
@@ -1765,6 +1766,32 @@ export function AIAnalyticsDashboard() {
       setNotice(`Saved playbook: ${saved.name}.`);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Saving the playbook failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRunPlaybook(playbookId: string, questionTemplate: string, name: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(`run_playbook:${playbookId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await runPlaybook(datasetId, playbookId, userId);
+      setAskQuestion(questionTemplate);
+      setAskResult(response);
+      setDashboardExplanation(null);
+      setChartExplanations({});
+      setSelectedChartKey(null);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(`Ran playbook: ${name}.`);
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : 'Running the playbook failed.');
     } finally {
       setBusyAction(null);
     }
@@ -3678,6 +3705,20 @@ export function AIAnalyticsDashboard() {
                       {item.note ? <p className="mt-2 text-xs text-muted-foreground">{item.note}</p> : null}
                       <div className="mt-3 flex flex-wrap gap-2">
                         <Badge variant="outline">{item.context_type}</Badge>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleRunPlaybook(item.playbook_id, item.question_template, item.name)}
+                          disabled={busyAction === `run_playbook:${item.playbook_id}` || !canCompute}
+                        >
+                          {busyAction === `run_playbook:${item.playbook_id}` ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Bot className="mr-2 h-4 w-4" />
+                          )}
+                          Run
+                        </Button>
                         <Button
                           type="button"
                           size="sm"
