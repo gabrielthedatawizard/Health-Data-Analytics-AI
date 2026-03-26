@@ -1,4 +1,4 @@
-import { useMemo, useState, type ElementType } from 'react';
+import { useEffect, useMemo, useState, type ElementType } from 'react';
 import {
   Activity,
   AlertCircle,
@@ -31,6 +31,13 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useAnalytics } from '@/lib/analytics-context';
+import {
+  BACKEND_ROLE_STORAGE_KEY,
+  BACKEND_USER_STORAGE_KEY,
+  getSystemStatus,
+  type BackendUserRole,
+  type SystemStatusResponse,
+} from '@/lib/backend-api';
 import type { DatasetRecord, InsightRecord } from '@/lib/ai-engine';
 import { cn } from '@/lib/utils';
 
@@ -91,6 +98,21 @@ function datasetStatusTone(dataset: DatasetRecord): string {
   return 'border-emerald-500/30 text-emerald-400';
 }
 
+function resolveBackendRole(): BackendUserRole {
+  if (typeof window === 'undefined') return 'analyst';
+  const storedRole = window.localStorage.getItem(BACKEND_ROLE_STORAGE_KEY);
+  if (storedRole === 'viewer' || storedRole === 'analyst' || storedRole === 'reviewer' || storedRole === 'admin') {
+    return storedRole;
+  }
+  return 'analyst';
+}
+
+function statusAlertTone(level: string): string {
+  if (level === 'error') return 'border-red-500/20 bg-red-500/5 text-red-300';
+  if (level === 'warning') return 'border-amber-500/20 bg-amber-500/5 text-amber-200';
+  return 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200';
+}
+
 function StatCard({ label, value, icon: Icon, tone, hint }: StatCardProps) {
   return (
     <Card className="glass-card overflow-hidden">
@@ -112,6 +134,8 @@ export function Dashboard({ onViewChange }: DashboardProps) {
   const { datasets, insights, aiEnvironment, addSampleDataset, analyzeDataset } = useAnalytics();
   const [isSeedingDemo, setIsSeedingDemo] = useState(false);
   const [analyzingDatasetId, setAnalyzingDatasetId] = useState<string | null>(null);
+  const [systemStatus, setSystemStatus] = useState<SystemStatusResponse | null>(null);
+  const [systemStatusError, setSystemStatusError] = useState<string | null>(null);
 
   const sortedDatasets = useMemo(
     () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
@@ -193,6 +217,30 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       )
       .slice(0, 5);
   }, [sortedDatasets]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function hydrateSystemStatus() {
+      const actor =
+        (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+      try {
+        const response = await getSystemStatus(actor, resolveBackendRole());
+        if (!active) return;
+        setSystemStatus(response);
+        setSystemStatusError(null);
+      } catch (error) {
+        if (!active) return;
+        setSystemStatus(null);
+        setSystemStatusError(error instanceof Error ? error.message : 'Could not load governed backend status.');
+      }
+    }
+
+    void hydrateSystemStatus();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   async function handleSeedDemo() {
     setIsSeedingDemo(true);
@@ -400,6 +448,95 @@ export function Dashboard({ onViewChange }: DashboardProps) {
           tone="bg-amber-500/20 text-amber-400"
           hint={`${stats.flaggedInsights} flagged, ${stats.attentionCount} datasets needing attention.`}
         />
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <Card className="glass-card">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Governed Backend Status</CardTitle>
+            <p className="text-xs text-muted-foreground">
+              Role-aware health, queue, audit, and governance signals from the live FastAPI control plane.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {systemStatus ? (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline" className="border-health-mint/30 text-health-mint">
+                    {systemStatus.status}
+                  </Badge>
+                  <Badge variant="outline">{systemStatus.role}</Badge>
+                  <Badge variant="outline">Actor {systemStatus.actor}</Badge>
+                  <Badge variant="outline">Updated {formatTimestamp(systemStatus.timestamp)}</Badge>
+                </div>
+                <div className="space-y-2">
+                  {systemStatus.alerts.map((alert, index) => (
+                    <div key={`${alert.level}-${index}`} className={cn('rounded-2xl border px-4 py-3 text-sm', statusAlertTone(alert.level))}>
+                      {alert.message}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="rounded-2xl border border-border bg-background p-4 text-sm text-muted-foreground">
+                {systemStatusError ?? 'Loading governed backend status...'}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="glass-card">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Control Plane Counters</CardTitle>
+            <p className="text-xs text-muted-foreground">Live counts visible to the current backend role scope.</p>
+          </CardHeader>
+          <CardContent>
+            {systemStatus ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Visible Sessions</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">{systemStatus.counts.visible_sessions}</p>
+                </div>
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Trusted Docs</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">{systemStatus.counts.visible_documents}</p>
+                </div>
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Jobs</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">
+                    {systemStatus.counts.active_jobs + systemStatus.counts.queued_jobs}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {systemStatus.counts.active_jobs} active · {systemStatus.counts.queued_jobs} queued
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Review Queue</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">
+                    {systemStatus.counts.pending_sensitive_exports + systemStatus.counts.pending_workflow_reviews}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {systemStatus.counts.pending_sensitive_exports} export · {systemStatus.counts.pending_workflow_reviews} workflow
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Models</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">{systemStatus.counts.active_models}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{systemStatus.counts.stale_models} stale</p>
+                </div>
+                <div className="rounded-2xl border border-border bg-background p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Recent Audit Events</p>
+                  <p className="mt-2 text-2xl font-bold text-foreground">{systemStatus.counts.recent_audit_events_24h}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Last 24 hours</p>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-border bg-background p-4 text-sm text-muted-foreground">
+                Waiting for live backend counters...
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </section>
 
       <section className="grid gap-4 xl:grid-cols-[1.7fr_1fr]">

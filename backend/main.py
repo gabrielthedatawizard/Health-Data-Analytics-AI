@@ -7,7 +7,7 @@ import io
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -618,6 +618,34 @@ class AuthContextResponse(BaseModel):
     permissions: list[str] = Field(default_factory=list)
 
 
+class SystemStatusCounts(BaseModel):
+    visible_sessions: int = 0
+    visible_documents: int = 0
+    active_jobs: int = 0
+    queued_jobs: int = 0
+    failed_jobs: int = 0
+    active_models: int = 0
+    stale_models: int = 0
+    pending_sensitive_exports: int = 0
+    pending_workflow_reviews: int = 0
+    superseded_documents: int = 0
+    recent_audit_events_24h: int = 0
+
+
+class SystemStatusAlert(BaseModel):
+    level: str
+    message: str
+
+
+class SystemStatusResponse(BaseModel):
+    status: str
+    timestamp: str
+    actor: str
+    role: str
+    counts: SystemStatusCounts
+    alerts: list[SystemStatusAlert] = Field(default_factory=list)
+
+
 class DocumentSummaryResponse(BaseModel):
     document_id: str
     title: str
@@ -816,6 +844,26 @@ def _save_meta(dataset_id: str, meta: dict[str, Any]) -> None:
     _save_json(_meta_path(dataset_id), meta)
 
 
+def _iter_accessible_sessions(actor: str, permissions: list[str]) -> list[tuple[str, dict[str, Any]]]:
+    items: list[tuple[str, dict[str, Any]]] = []
+    for child in sorted(DATA_DIR.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        meta_path = child / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = _load_json(meta_path)
+            created_by = str(meta.get("user_id") or meta.get("created_by") or "anonymous")
+            if "sessions:read_all" not in permissions and "admin:all" not in permissions and created_by != actor:
+                continue
+            dataset_id = str(meta.get("dataset_id") or child.name)
+            items.append((dataset_id, meta))
+        except Exception:
+            continue
+    return items
+
+
 def _load_document_meta(document_id: str) -> dict[str, Any]:
     path = _document_meta_path(document_id)
     if not path.exists():
@@ -826,6 +874,37 @@ def _load_document_meta(document_id: str) -> dict[str, Any]:
 def _save_document_meta(document_id: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = _utc_now_iso()
     _save_json(_document_meta_path(document_id), meta)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    try:
+        return datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _count_recent_audit_events(dataset_id: str, since: datetime) -> int:
+    path = _audit_log_path(dataset_id)
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            happened_at = _parse_iso_datetime(payload.get("timestamp"))
+            if happened_at and happened_at >= since:
+                count += 1
+    return count
 
 
 def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
@@ -4136,6 +4215,88 @@ def health_check() -> dict[str, str]:
     return {"status": "ok", "timestamp": _utc_now_iso()}
 
 
+@app.get("/system/status", response_model=SystemStatusResponse)
+def get_system_status(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> SystemStatusResponse:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    visible_sessions = _iter_accessible_sessions(actor, permissions)
+    visible_dataset_ids = {dataset_id for dataset_id, _ in visible_sessions}
+    visible_documents = _iter_accessible_documents(actor, role)
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now.replace(microsecond=0) - timedelta(hours=24)
+
+    job_counts = {"active": 0, "queued": 0, "failed": 0}
+    for job in list_jobs(dataset_id=None):
+        dataset_id = str(job.get("dataset_id") or "")
+        if dataset_id and dataset_id not in visible_dataset_ids:
+            continue
+        status = _normalize_job_payload(job).get("status")
+        if status in {"running", "processing"}:
+            job_counts["active"] += 1
+        elif status == "queued":
+            job_counts["queued"] += 1
+        elif status == "failed":
+            job_counts["failed"] += 1
+
+    active_models = 0
+    stale_models = 0
+    pending_sensitive_exports = 0
+    pending_workflow_reviews = 0
+    recent_audit_events = 0
+    for dataset_id, meta in visible_sessions:
+        registry_entries = _load_ml_registry(dataset_id) if _ml_registry_path(dataset_id).exists() else []
+        if any(str(entry.get("status") or "") == "active" for entry in registry_entries):
+            active_models += 1
+
+        drift_payload = _load_ml_drift(dataset_id)
+        if drift_payload and bool(drift_payload.get("stale_model")):
+            stale_models += 1
+
+        approval = _sensitive_export_approval(meta)
+        if str(approval.get("status") or "") == "pending":
+            pending_sensitive_exports += 1
+
+        workflow_actions = _load_workflow_actions(dataset_id)
+        pending_workflow_reviews += sum(1 for action in workflow_actions if str(action.get("status") or "") == WORKFLOW_STATUS_PENDING)
+        recent_audit_events += _count_recent_audit_events(dataset_id, recent_cutoff)
+
+    superseded_documents = sum(1 for _, meta in visible_documents if _document_freshness(meta)[0] == "superseded")
+    alerts: list[SystemStatusAlert] = []
+    if stale_models:
+        alerts.append(SystemStatusAlert(level="warning", message=f"{stale_models} governed model run(s) are stale against refreshed data."))
+    if pending_sensitive_exports:
+        alerts.append(SystemStatusAlert(level="warning", message=f"{pending_sensitive_exports} sensitive export approval request(s) are waiting for review."))
+    if pending_workflow_reviews:
+        alerts.append(SystemStatusAlert(level="warning", message=f"{pending_workflow_reviews} workflow draft(s) are waiting for reviewer approval."))
+    if job_counts["failed"]:
+        alerts.append(SystemStatusAlert(level="error", message=f"{job_counts['failed']} backend job(s) are in failed state."))
+    if not alerts:
+        alerts.append(SystemStatusAlert(level="info", message="Governed backend checks are healthy for the current role scope."))
+
+    return SystemStatusResponse(
+        status="ok",
+        timestamp=_utc_now_iso(),
+        actor=actor,
+        role=role,
+        counts=SystemStatusCounts(
+            visible_sessions=len(visible_sessions),
+            visible_documents=len(visible_documents),
+            active_jobs=job_counts["active"],
+            queued_jobs=job_counts["queued"],
+            failed_jobs=job_counts["failed"],
+            active_models=active_models,
+            stale_models=stale_models,
+            pending_sensitive_exports=pending_sensitive_exports,
+            pending_workflow_reviews=pending_workflow_reviews,
+            superseded_documents=superseded_documents,
+            recent_audit_events_24h=recent_audit_events,
+        ),
+        alerts=alerts,
+    )
+
+
 @app.get("/auth/me", response_model=AuthContextResponse)
 def get_auth_context(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -4319,23 +4480,10 @@ def list_sessions(
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, Any]:
     actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
-    items: list[SessionSummaryResponse] = []
-
-    for child in sorted(DATA_DIR.iterdir(), reverse=True):
-        if not child.is_dir():
-            continue
-        meta_path = child / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = _load_json(meta_path)
-            created_by = str(meta.get("user_id") or meta.get("created_by") or "anonymous")
-            if "sessions:read_all" not in permissions and created_by != actor:
-                continue
-            dataset_id = str(meta.get("dataset_id") or child.name)
-            items.append(_session_summary_from_meta(dataset_id, meta))
-        except Exception:
-            continue
+    items = [
+        _session_summary_from_meta(dataset_id, meta)
+        for dataset_id, meta in _iter_accessible_sessions(actor, permissions)
+    ]
 
     items.sort(key=lambda item: item.updated_at, reverse=True)
     return {"sessions": [item.model_dump() for item in items]}

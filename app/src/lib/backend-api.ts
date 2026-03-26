@@ -422,6 +422,34 @@ export interface AuthContextResponse {
   permissions: string[];
 }
 
+export interface SystemStatusCounts {
+  visible_sessions: number;
+  visible_documents: number;
+  active_jobs: number;
+  queued_jobs: number;
+  failed_jobs: number;
+  active_models: number;
+  stale_models: number;
+  pending_sensitive_exports: number;
+  pending_workflow_reviews: number;
+  superseded_documents: number;
+  recent_audit_events_24h: number;
+}
+
+export interface SystemStatusAlert {
+  level: string;
+  message: string;
+}
+
+export interface SystemStatusResponse {
+  status: string;
+  timestamp: string;
+  actor: string;
+  role: BackendUserRole;
+  counts: SystemStatusCounts;
+  alerts: SystemStatusAlert[];
+}
+
 export const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
 
 export function computeDefaultApiBase(): string {
@@ -577,6 +605,10 @@ export async function apiRequest<T>(
 
 export function getAuthContext(userId: string, userRole?: BackendUserRole) {
   return apiRequest<AuthContextResponse>('/auth/me', undefined, { userId, userRole });
+}
+
+export function getSystemStatus(userId: string, userRole?: BackendUserRole) {
+  return apiRequest<SystemStatusResponse>('/system/status', undefined, { userId, userRole });
 }
 
 export function listDocuments(userId: string) {
