@@ -33,9 +33,14 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useAnalytics } from '@/lib/analytics-context';
 import {
   BACKEND_ROLE_STORAGE_KEY,
+  BACKEND_DATASET_STORAGE_KEY,
   BACKEND_USER_STORAGE_KEY,
+  getReviewQueue,
   getSystemStatus,
+  listJobs,
   type BackendUserRole,
+  type JobStatus,
+  type ReviewQueueItem,
   type SystemStatusResponse,
 } from '@/lib/backend-api';
 import type { DatasetRecord, InsightRecord } from '@/lib/ai-engine';
@@ -113,6 +118,29 @@ function statusAlertTone(level: string): string {
   return 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200';
 }
 
+function reviewItemTone(severity: string): string {
+  if (severity === 'error') return 'border-red-500/20 bg-red-500/5 text-red-200';
+  if (severity === 'warning') return 'border-amber-500/20 bg-amber-500/5 text-amber-200';
+  return 'border-blue-500/20 bg-blue-500/5 text-blue-100';
+}
+
+function reviewCategoryLabel(category: string): string {
+  if (category === 'sensitive_export') return 'Sensitive Export';
+  if (category === 'workflow_review') return 'Workflow Review';
+  if (category === 'report_schedule') return 'Report Schedule';
+  if (category === 'model_attention') return 'Model Attention';
+  if (category === 'document_freshness') return 'Document Freshness';
+  if (category === 'failed_job') return 'Failed Job';
+  return category.replace(/_/g, ' ');
+}
+
+function jobStatusTone(status: string): string {
+  if (status === 'failed') return 'border-red-500/20 bg-red-500/5 text-red-200';
+  if (status === 'running' || status === 'processing') return 'border-amber-500/20 bg-amber-500/5 text-amber-200';
+  if (status === 'queued') return 'border-blue-500/20 bg-blue-500/5 text-blue-100';
+  return 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200';
+}
+
 function StatCard({ label, value, icon: Icon, tone, hint }: StatCardProps) {
   return (
     <Card className="glass-card overflow-hidden">
@@ -136,6 +164,10 @@ export function Dashboard({ onViewChange }: DashboardProps) {
   const [analyzingDatasetId, setAnalyzingDatasetId] = useState<string | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatusResponse | null>(null);
   const [systemStatusError, setSystemStatusError] = useState<string | null>(null);
+  const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
+  const [reviewQueueError, setReviewQueueError] = useState<string | null>(null);
+  const [recentJobs, setRecentJobs] = useState<JobStatus[]>([]);
+  const [recentJobsError, setRecentJobsError] = useState<string | null>(null);
 
   const sortedDatasets = useMemo(
     () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
@@ -224,15 +256,46 @@ export function Dashboard({ onViewChange }: DashboardProps) {
     async function hydrateSystemStatus() {
       const actor =
         (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
-      try {
-        const response = await getSystemStatus(actor, resolveBackendRole());
-        if (!active) return;
-        setSystemStatus(response);
+      const role = resolveBackendRole();
+      const [statusResult, queueResult, jobsResult] = await Promise.allSettled([
+        getSystemStatus(actor, role),
+        getReviewQueue(actor, role),
+        listJobs(actor, role),
+      ]);
+      if (!active) return;
+
+      if (statusResult.status === 'fulfilled') {
+        setSystemStatus(statusResult.value);
         setSystemStatusError(null);
-      } catch (error) {
-        if (!active) return;
+      } else {
         setSystemStatus(null);
-        setSystemStatusError(error instanceof Error ? error.message : 'Could not load governed backend status.');
+        setSystemStatusError(
+          statusResult.reason instanceof Error ? statusResult.reason.message : 'Could not load governed backend status.',
+        );
+      }
+
+      if (queueResult.status === 'fulfilled') {
+        setReviewQueue(queueResult.value.items ?? []);
+        setReviewQueueError(null);
+      } else {
+        setReviewQueue([]);
+        setReviewQueueError(
+          queueResult.reason instanceof Error ? queueResult.reason.message : 'Could not load the governance queue.',
+        );
+      }
+
+      if (jobsResult.status === 'fulfilled') {
+        const jobs = [...(jobsResult.value.jobs ?? [])];
+        jobs.sort((left, right) => {
+          const leftTime = new Date(left.updated_at ?? left.created_at ?? 0).getTime();
+          const rightTime = new Date(right.updated_at ?? right.created_at ?? 0).getTime();
+          return rightTime - leftTime;
+        });
+        setRecentJobs(jobs.slice(0, 6));
+        setRecentJobsError(null);
+      } else {
+        setRecentJobs([]);
+        setRecentJobsError(jobsResult.reason instanceof Error ? jobsResult.reason.message : 'Could not load recent backend jobs.');
       }
     }
 
@@ -261,6 +324,13 @@ export function Dashboard({ onViewChange }: DashboardProps) {
     } finally {
       setAnalyzingDatasetId(null);
     }
+  }
+
+  function handleOpenGovernedSession(datasetId: string) {
+    if (typeof window !== 'undefined' && datasetId && datasetId !== 'documents' && datasetId !== 'system') {
+      window.localStorage.setItem(BACKEND_DATASET_STORAGE_KEY, datasetId);
+    }
+    onViewChange('ai_analytics');
   }
 
   if (datasets.length === 0) {
@@ -533,6 +603,78 @@ export function Dashboard({ onViewChange }: DashboardProps) {
             ) : (
               <div className="rounded-2xl border border-border bg-background p-4 text-sm text-muted-foreground">
                 Waiting for live backend counters...
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+        <Card className="glass-card">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-lg font-semibold">Governance Queue</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                Actionable approvals, stale assets, failed jobs, and schedules surfaced from the governed backend.
+              </p>
+            </div>
+            <Badge variant="outline">{reviewQueue.length} visible</Badge>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {reviewQueue.length > 0 ? (
+              reviewQueue.slice(0, 6).map((item) => (
+                <div key={item.item_id} className={cn('rounded-2xl border p-4', reviewItemTone(item.severity))}>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline">{reviewCategoryLabel(item.category)}</Badge>
+                        <Badge variant="outline">{item.status.replace(/_/g, ' ')}</Badge>
+                        <Badge variant="outline">{item.dataset_label}</Badge>
+                      </div>
+                      <p className="mt-3 text-sm font-semibold text-foreground">{item.title}</p>
+                      <p className="mt-2 text-sm text-muted-foreground">{item.summary}</p>
+                      {item.action_hint ? <p className="mt-2 text-xs text-muted-foreground">{item.action_hint}</p> : null}
+                      <p className="mt-3 text-xs text-muted-foreground">Updated {formatTimestamp(item.updated_at)}</p>
+                    </div>
+                    <Button variant="outline" size="sm" className="gap-2" onClick={() => handleOpenGovernedSession(item.dataset_id)}>
+                      Open AI Analyst
+                      <ArrowUpRight className="h-3 w-3" />
+                    </Button>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-2xl border border-border bg-background p-4 text-sm text-muted-foreground">
+                {reviewQueueError ?? 'No governed review items are currently waiting in your visible scope.'}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="glass-card">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Recent Backend Jobs</CardTitle>
+            <p className="text-xs text-muted-foreground">Latest governed jobs visible to the current backend role scope.</p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {recentJobs.length > 0 ? (
+              recentJobs.map((job) => (
+                <div key={job.job_id} className={cn('rounded-2xl border p-4', jobStatusTone(job.status))}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">{job.type.replace(/_/g, ' ')}</Badge>
+                    <Badge variant="outline">{job.status}</Badge>
+                    <Badge variant="outline">{job.progress}%</Badge>
+                  </div>
+                  <p className="mt-3 break-all text-sm font-medium text-foreground">{job.dataset_id}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Updated {formatTimestamp(job.updated_at ?? job.created_at ?? new Date().toISOString())}
+                  </p>
+                  {job.error?.message ? <p className="mt-2 text-xs text-muted-foreground">{job.error.message}</p> : null}
+                </div>
+              ))
+            ) : (
+              <div className="rounded-2xl border border-border bg-background p-4 text-sm text-muted-foreground">
+                {recentJobsError ?? 'No recent governed jobs are visible yet.'}
               </div>
             )}
           </CardContent>

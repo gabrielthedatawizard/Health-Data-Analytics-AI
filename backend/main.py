@@ -412,6 +412,37 @@ class SavedPlaybooksResponse(BaseModel):
     playbooks: list[SavedPlaybookRecord] = Field(default_factory=list)
 
 
+class ReportScheduleRecord(BaseModel):
+    schedule_id: str
+    title: str
+    frequency: str
+    report_template: str
+    sections: list[str] = Field(default_factory=list)
+    audience: str | None = None
+    objective: str | None = None
+    delivery_note: str | None = None
+    status: str = "active"
+    source_action_id: str | None = None
+    created_at: str
+    updated_at: str
+    created_by: str
+    last_run_at: str | None = None
+    last_job_id: str | None = None
+    last_run_status: str | None = None
+
+
+class ReportSchedulesResponse(BaseModel):
+    dataset_id: str
+    schedules: list[ReportScheduleRecord] = Field(default_factory=list)
+
+
+class ReportScheduleRunResponse(BaseModel):
+    dataset_id: str
+    schedule_id: str
+    job_id: str
+    status: str
+
+
 class ForecastTrainRequest(BaseModel):
     name: str | None = Field(default=None, max_length=160)
     time_field: str | None = Field(default=None, max_length=200)
@@ -674,6 +705,29 @@ class SystemStatusResponse(BaseModel):
     alerts: list[SystemStatusAlert] = Field(default_factory=list)
 
 
+class ReviewQueueItem(BaseModel):
+    item_id: str
+    dataset_id: str
+    dataset_label: str
+    category: str
+    severity: str
+    status: str
+    title: str
+    summary: str
+    created_at: str
+    updated_at: str
+    action_hint: str | None = None
+
+
+class ReviewQueueResponse(BaseModel):
+    status: str
+    timestamp: str
+    actor: str
+    role: str
+    total_items: int = 0
+    items: list[ReviewQueueItem] = Field(default_factory=list)
+
+
 class DocumentSummaryResponse(BaseModel):
     document_id: str
     title: str
@@ -802,6 +856,10 @@ def _cohort_path(dataset_id: str) -> Path:
 
 def _feedback_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "feedback.json"
+
+
+def _report_schedules_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "report_schedules.json"
 
 
 def _workflow_actions_path(dataset_id: str) -> Path:
@@ -963,6 +1021,14 @@ def _playbook_record(dataset_id: str, playbook_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail="Playbook not found.")
 
 
+def _report_schedule_record(dataset_id: str, schedule_id: str) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+    schedules = _load_report_schedules(dataset_id)
+    for index, item in enumerate(schedules):
+        if str(item.get("schedule_id") or "") == schedule_id:
+            return index, item, schedules
+    raise HTTPException(status_code=404, detail="Report schedule not found.")
+
+
 def _load_workflow_actions(dataset_id: str) -> list[dict[str, Any]]:
     path = _workflow_actions_path(dataset_id)
     if not path.exists():
@@ -979,6 +1045,26 @@ def _load_feedback(dataset_id: str) -> list[dict[str, Any]]:
     payload = _load_json(path)
     items = payload.get("feedback") if isinstance(payload, dict) else []
     return [item for item in items if isinstance(item, dict)]
+
+
+def _load_report_schedules(dataset_id: str) -> list[dict[str, Any]]:
+    path = _report_schedules_path(dataset_id)
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    items = payload.get("schedules") if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _save_report_schedules(dataset_id: str, schedules: list[dict[str, Any]]) -> None:
+    _save_json(
+        _report_schedules_path(dataset_id),
+        {
+            "dataset_id": dataset_id,
+            "generated_at": _utc_now_iso(),
+            "schedules": schedules,
+        },
+    )
 
 
 def _save_feedback(dataset_id: str, items: list[dict[str, Any]]) -> None:
@@ -2583,6 +2669,7 @@ def _workflow_action_content(
     payload = {
         "schedule": "monthly",
         "report_template": "health_report",
+        "sections": ["quality", "kpis", "trends", "limitations"],
         "audience": audience,
         "objective": objective or "Deliver a recurring governed summary with approved evidence.",
         "delivery_note": "Scheduler integration is not connected yet; execution is recorded as a manual governed task.",
@@ -2599,6 +2686,59 @@ def _workflow_action_execution_result(action_type: str) -> str:
     if action_type == "action_plan":
         return "Action plan marked executed and ready for operational handoff."
     return "Report scheduling request marked executed as a governed manual task."
+
+
+def _create_report_schedule_from_action(
+    dataset_id: str,
+    action: dict[str, Any],
+    actor: str,
+) -> dict[str, Any]:
+    payload = dict(action.get("payload") or {})
+    sections = payload.get("sections")
+    if not isinstance(sections, list) or not sections:
+        sections = ["quality", "kpis", "trends", "limitations"]
+    schedule = {
+        "schedule_id": str(uuid.uuid4()),
+        "title": str(action.get("title") or "Scheduled report"),
+        "frequency": str(payload.get("schedule") or "monthly"),
+        "report_template": str(payload.get("report_template") or "health_report"),
+        "sections": [str(item) for item in sections if str(item).strip()],
+        "audience": str(payload.get("audience") or action.get("target") or "").strip() or None,
+        "objective": str(payload.get("objective") or action.get("objective") or "").strip() or None,
+        "delivery_note": str(payload.get("delivery_note") or "").strip() or None,
+        "status": "active",
+        "source_action_id": str(action.get("action_id") or "") or None,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "created_by": actor,
+        "last_run_at": None,
+        "last_job_id": None,
+        "last_run_status": None,
+    }
+    schedules = [schedule, *_load_report_schedules(dataset_id)]
+    _save_report_schedules(dataset_id, schedules)
+    return schedule
+
+
+def _queue_report_job(dataset_id: str, actor: str, template: str | None, sections: list[str] | None) -> dict[str, Any]:
+    payload = ReportRequest(template=template or "health_report", sections=sections or ["quality", "kpis", "trends", "limitations"])
+    job = create_job(
+        job_type="report",
+        dataset_id=dataset_id,
+        payload={"template": payload.template, "sections": payload.sections},
+    )
+    try:
+        from backend.tasks import generate_report_task
+
+        generate_report_task.delay(job["job_id"], dataset_id, payload.template, payload.sections)
+        _append_audit(dataset_id, "report_job_queued", actor, {"job_id": job["job_id"], "template": payload.template})
+    except Exception as exc:
+        try:
+            generate_report_task(job["job_id"], dataset_id, payload.template, payload.sections)
+        except Exception as inner_exc:
+            update_job(job["job_id"], status="failed", error=str(inner_exc))
+            raise HTTPException(status_code=503, detail=f"Failed to run report job: {exc}; {inner_exc}") from inner_exc
+    return {"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}
 
 
 def _workflow_action_index(actions: list[dict[str, Any]], action_id: str) -> int:
@@ -4373,6 +4513,194 @@ def get_system_status(
     )
 
 
+@app.get("/system/review-queue", response_model=ReviewQueueResponse)
+def get_review_queue(
+    limit: int = Query(default=12, ge=1, le=40),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ReviewQueueResponse:
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    visible_sessions = _iter_accessible_sessions(actor, permissions)
+    visible_dataset_ids = {dataset_id for dataset_id, _ in visible_sessions}
+    session_meta_by_id = {dataset_id: meta for dataset_id, meta in visible_sessions}
+    items: list[dict[str, Any]] = []
+
+    def _dataset_label(dataset_id: str, meta: dict[str, Any]) -> str:
+        file_meta = meta.get("file") if isinstance(meta.get("file"), dict) else {}
+        return str(meta.get("display_name") or file_meta.get("name") or dataset_id[:8])
+
+    def _queue_item(
+        *,
+        item_id: str,
+        dataset_id: str,
+        dataset_label: str,
+        category: str,
+        severity: str,
+        status: str,
+        title: str,
+        summary: str,
+        created_at: str | None,
+        updated_at: str | None,
+        action_hint: str | None,
+    ) -> None:
+        fallback_timestamp = _utc_now_iso()
+        items.append(
+            {
+                "item_id": item_id,
+                "dataset_id": dataset_id,
+                "dataset_label": dataset_label,
+                "category": category,
+                "severity": severity,
+                "status": status,
+                "title": title,
+                "summary": summary,
+                "created_at": created_at or updated_at or fallback_timestamp,
+                "updated_at": updated_at or created_at or fallback_timestamp,
+                "action_hint": action_hint,
+            }
+        )
+
+    for dataset_id, meta in visible_sessions:
+        dataset_label = _dataset_label(dataset_id, meta)
+        approval = _sensitive_export_approval(meta)
+        if str(approval.get("status") or "") == "pending":
+            justification = str(approval.get("justification") or "").strip()
+            summary = justification or "Sensitive export access is waiting for reviewer approval before unmasked export can be enabled."
+            _queue_item(
+                item_id=f"export:{dataset_id}",
+                dataset_id=dataset_id,
+                dataset_label=dataset_label,
+                category="sensitive_export",
+                severity="warning",
+                status="pending_review",
+                title="Sensitive export approval pending",
+                summary=summary,
+                created_at=str(approval.get("requested_at") or meta.get("updated_at") or ""),
+                updated_at=str(approval.get("requested_at") or meta.get("updated_at") or ""),
+                action_hint="Open AI Analytics to review export approval.",
+            )
+
+        for action in _load_workflow_actions(dataset_id):
+            if str(action.get("status") or "") != WORKFLOW_STATUS_PENDING:
+                continue
+            _queue_item(
+                item_id=f"workflow:{dataset_id}:{action.get('action_id')}",
+                dataset_id=dataset_id,
+                dataset_label=dataset_label,
+                category="workflow_review",
+                severity="warning",
+                status="pending_review",
+                title=str(action.get("title") or "Workflow draft awaiting review"),
+                summary=str(action.get("summary") or "A governed workflow draft needs reviewer approval."),
+                created_at=str(action.get("generated_at") or ""),
+                updated_at=str(action.get("updated_at") or action.get("generated_at") or ""),
+                action_hint="Open AI Analytics to approve or reject the workflow draft.",
+            )
+
+        for schedule in _load_report_schedules(dataset_id):
+            if str(schedule.get("status") or "") != "active":
+                continue
+            if schedule.get("last_run_at"):
+                continue
+            frequency = str(schedule.get("frequency") or "scheduled")
+            _queue_item(
+                item_id=f"schedule:{dataset_id}:{schedule.get('schedule_id')}",
+                dataset_id=dataset_id,
+                dataset_label=dataset_label,
+                category="report_schedule",
+                severity="info",
+                status="ready_to_run",
+                title=str(schedule.get("title") or "Governed report schedule"),
+                summary=f"Active {frequency} schedule has not been run yet for this session.",
+                created_at=str(schedule.get("created_at") or ""),
+                updated_at=str(schedule.get("updated_at") or schedule.get("created_at") or ""),
+                action_hint="Open AI Analytics to run the scheduled report now.",
+            )
+
+        drift_payload = _load_ml_drift(dataset_id)
+        if drift_payload:
+            drift_score = float(drift_payload.get("drift_score") or 0.0)
+            stale_model = bool(drift_payload.get("stale_model"))
+            if stale_model or drift_score >= 0.2:
+                severity = "warning" if stale_model or drift_score >= 0.35 else "info"
+                summary = str(drift_payload.get("summary") or "Recent data has moved away from the forecast training baseline.")
+                _queue_item(
+                    item_id=f"model:{dataset_id}:{drift_payload.get('run_id') or 'current'}",
+                    dataset_id=dataset_id,
+                    dataset_label=dataset_label,
+                    category="model_attention",
+                    severity=severity,
+                    status="attention",
+                    title="Forecast model requires review",
+                    summary=summary,
+                    created_at=str(drift_payload.get("generated_at") or meta.get("updated_at") or ""),
+                    updated_at=str(drift_payload.get("generated_at") or meta.get("updated_at") or ""),
+                    action_hint="Open AI Analytics to inspect drift and evaluate a challenger run.",
+                )
+
+    for document_id, document_meta in _iter_accessible_documents(actor, role):
+        freshness, freshness_note, _ = _document_freshness(document_meta)
+        if freshness != "superseded":
+            continue
+        _queue_item(
+            item_id=f"document:{document_id}",
+            dataset_id="documents",
+            dataset_label="Trusted document library",
+            category="document_freshness",
+            severity="info",
+            status="superseded",
+            title=str(document_meta.get("title") or document_meta.get("file_name") or document_id),
+            summary=freshness_note or "A newer trusted document version exists for this source.",
+            created_at=str(document_meta.get("created_at") or ""),
+            updated_at=str(document_meta.get("updated_at") or document_meta.get("created_at") or ""),
+            action_hint="Open AI Analytics to inspect current document versions and citations.",
+        )
+
+    for job in list_jobs(dataset_id=None):
+        dataset_id = str(job.get("dataset_id") or "")
+        if dataset_id and dataset_id not in visible_dataset_ids:
+            continue
+        payload = _normalize_job_payload(job)
+        if str(payload.get("status") or "") != "failed":
+            continue
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        dataset_label = _dataset_label(dataset_id, session_meta_by_id.get(dataset_id, {})) if dataset_id else "Global"
+        _queue_item(
+            item_id=f"job:{payload.get('job_id')}",
+            dataset_id=dataset_id or "system",
+            dataset_label=dataset_label,
+            category="failed_job",
+            severity="error",
+            status="failed",
+            title=f"{str(payload.get('type') or 'backend').replace('_', ' ').title()} job failed",
+            summary=str(error.get("message") or "A backend job failed and needs operator follow-up."),
+            created_at=str(payload.get("created_at") or ""),
+            updated_at=str(payload.get("updated_at") or payload.get("created_at") or ""),
+            action_hint="Open AI Analytics or the job trace to retry after reviewing the failure.",
+        )
+
+    severity_rank = {"error": 0, "warning": 1, "info": 2}
+    sorted_items = sorted(
+        items,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity") or "info"), 3),
+            str(item.get("updated_at") or ""),
+            str(item.get("item_id") or ""),
+        ),
+    )
+    sorted_items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    sorted_items.sort(key=lambda item: severity_rank.get(str(item.get("severity") or "info"), 3))
+
+    return ReviewQueueResponse(
+        status="ok",
+        timestamp=_utc_now_iso(),
+        actor=actor,
+        role=role,
+        total_items=len(sorted_items),
+        items=[ReviewQueueItem(**item) for item in sorted_items[:limit]],
+    )
+
+
 @app.get("/auth/me", response_model=AuthContextResponse)
 def get_auth_context(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -4841,6 +5169,16 @@ async def upload_file(
     file_meta["uploaded_by"] = actor
 
     preserved_artifacts: dict[str, str] = {}
+    if _saved_investigations_path(dataset_id).exists():
+        preserved_artifacts["investigations"] = str(_saved_investigations_path(dataset_id))
+    if _saved_playbooks_path(dataset_id).exists():
+        preserved_artifacts["playbooks"] = str(_saved_playbooks_path(dataset_id))
+    if _workflow_actions_path(dataset_id).exists():
+        preserved_artifacts["workflow_actions"] = str(_workflow_actions_path(dataset_id))
+    if _feedback_path(dataset_id).exists():
+        preserved_artifacts["feedback"] = str(_feedback_path(dataset_id))
+    if _report_schedules_path(dataset_id).exists():
+        preserved_artifacts["report_schedules"] = str(_report_schedules_path(dataset_id))
     if _ml_runs_path(dataset_id).exists():
         preserved_artifacts["ml_runs"] = str(_ml_runs_path(dataset_id))
     if _ml_registry_path(dataset_id).exists():
@@ -5058,6 +5396,62 @@ def save_playbook(
         {"playbook_id": record["playbook_id"], "name": record["name"], "context_type": record["context_type"]},
     )
     return SavedPlaybookRecord(**record)
+
+
+@app.get("/sessions/{dataset_id}/report-schedules", response_model=ReportSchedulesResponse)
+def list_report_schedules(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ReportSchedulesResponse:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return ReportSchedulesResponse(
+        dataset_id=dataset_id,
+        schedules=[ReportScheduleRecord(**item) for item in _load_report_schedules(dataset_id)],
+    )
+
+
+@app.post("/sessions/{dataset_id}/report-schedules/{schedule_id}/run", response_model=ReportScheduleRunResponse)
+def run_report_schedule(
+    dataset_id: str,
+    schedule_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> ReportScheduleRunResponse:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+
+    index, schedule, schedules = _report_schedule_record(dataset_id, schedule_id)
+    if str(schedule.get("status") or "active") != "active":
+        raise HTTPException(status_code=409, detail="Only active report schedules can be run.")
+
+    queued = _queue_report_job(
+        dataset_id,
+        actor,
+        str(schedule.get("report_template") or "health_report"),
+        [str(item) for item in (schedule.get("sections") or [])],
+    )
+    schedule["last_run_at"] = _utc_now_iso()
+    schedule["last_job_id"] = queued["job_id"]
+    schedule["last_run_status"] = queued["status"]
+    schedule["updated_at"] = schedule["last_run_at"]
+    schedules[index] = schedule
+    _save_report_schedules(dataset_id, schedules)
+    meta.setdefault("artifacts", {})["report_schedules"] = str(_report_schedules_path(dataset_id))
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id,
+        "report_schedule_run",
+        actor,
+        {"schedule_id": schedule_id, "job_id": queued["job_id"], "title": schedule.get("title")},
+    )
+    return ReportScheduleRunResponse(
+        dataset_id=dataset_id,
+        schedule_id=schedule_id,
+        job_id=queued["job_id"],
+        status=queued["status"],
+    )
 
 
 @app.get("/sessions/{dataset_id}/ml-runs", response_model=ForecastRunsResponse)
@@ -5443,6 +5837,17 @@ def execute_workflow_action(
     current["execution_note"] = request.note if request else None
     current["updated_at"] = executed_at
     payload = dict(current.get("payload") or {})
+    if str(current.get("action_type") or "") == "schedule_report":
+        schedule = _create_report_schedule_from_action(dataset_id, current, actor)
+        payload["schedule_id"] = schedule["schedule_id"]
+        payload["schedule_status"] = schedule["status"]
+        meta.setdefault("artifacts", {})["report_schedules"] = str(_report_schedules_path(dataset_id))
+        _append_audit(
+            dataset_id,
+            "report_schedule_created",
+            actor,
+            {"schedule_id": schedule["schedule_id"], "title": schedule["title"], "frequency": schedule["frequency"]},
+        )
     payload["execution_mode"] = "governed_manual"
     payload["execution_result"] = _workflow_action_execution_result(str(current.get("action_type") or ""))
     current["payload"] = payload
@@ -6029,26 +6434,10 @@ def generate_report(
         raise HTTPException(status_code=400, detail="No file uploaded for this session.")
 
     payload = payload or ReportRequest()
-    job = create_job(
-        job_type="report",
-        dataset_id=dataset_id,
-        payload={"template": payload.template, "sections": payload.sections},
-    )
-
-    try:
-        from backend.tasks import generate_report_task
-
-        generate_report_task.delay(job["job_id"], dataset_id, payload.template, payload.sections)
-        _append_audit(dataset_id, "report_job_queued", actor, {"job_id": job["job_id"]})
-    except Exception as exc:
-        try:
-            generate_report_task(job["job_id"], dataset_id, payload.template, payload.sections)
-        except Exception as inner_exc:
-            update_job(job["job_id"], status="failed", error=str(inner_exc))
-            raise HTTPException(status_code=503, detail=f"Failed to run report job: {exc}; {inner_exc}") from inner_exc
+    job = _queue_report_job(dataset_id, actor, payload.template, payload.sections)
 
     return Response(
-        content=json.dumps({"dataset_id": dataset_id, "job_id": job["job_id"], "status": job["status"]}),
+        content=json.dumps(job),
         media_type="application/json",
         status_code=202,
     )

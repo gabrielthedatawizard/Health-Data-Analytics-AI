@@ -26,6 +26,7 @@ import { Progress } from '@/components/ui/progress';
 import { Textarea } from '@/components/ui/textarea';
 import {
   API_TARGET_LABEL,
+  BACKEND_DATASET_STORAGE_KEY,
   type AnomalyAnalysisResponse,
   BACKEND_ROLE_STORAGE_KEY,
   BACKEND_USER_STORAGE_KEY,
@@ -40,6 +41,7 @@ import {
   type SavedInvestigationRecord,
   type SavedPlaybookRecord,
   type WorkflowActionRecord,
+  type ReportScheduleRecord,
   type AuthContextResponse,
   type BackendUserRole,
   type AuditEvent,
@@ -71,6 +73,7 @@ import {
   getProfile,
   getSavedInvestigations,
   getSavedPlaybooks,
+  getReportSchedules,
   getSession,
   getWorkflowActions,
   inferBackendUserRole,
@@ -84,6 +87,7 @@ import {
   promoteModelRun,
   reviewSensitiveExportApproval,
   runPlaybook,
+  runReportSchedule,
   setSensitiveExportEnabled,
   submitFeedback,
   trainForecastRun,
@@ -91,7 +95,7 @@ import {
   uploadDataset,
 } from '@/lib/backend-api';
 
-const DATASET_STORAGE_KEY = 'healthai_backend_dataset_id';
+const DATASET_STORAGE_KEY = BACKEND_DATASET_STORAGE_KEY;
 const USER_STORAGE_KEY = BACKEND_USER_STORAGE_KEY;
 const ROLE_STORAGE_KEY = BACKEND_ROLE_STORAGE_KEY;
 const DATASET_ID_PATTERN = /^[a-f0-9-]{36}$/i;
@@ -549,6 +553,7 @@ export function AIAnalyticsDashboard() {
   const [modelRegistryEntries, setModelRegistryEntries] = useState<ModelRegistryEntry[]>([]);
   const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigationRecord[]>([]);
   const [savedPlaybooks, setSavedPlaybooks] = useState<SavedPlaybookRecord[]>([]);
+  const [reportSchedules, setReportSchedules] = useState<ReportScheduleRecord[]>([]);
   const [workflowActions, setWorkflowActions] = useState<WorkflowActionRecord[]>([]);
   const [dashboardSpec, setDashboardSpec] = useState<Record<string, unknown> | null>(null);
   const [askQuestion, setAskQuestion] = useState('Show the main metric trend over time');
@@ -663,6 +668,7 @@ export function AIAnalyticsDashboard() {
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
+      setReportSchedules([]);
       setWorkflowActions([]);
       setFeedbackRecords([]);
       setDashboardSpec(null);
@@ -685,6 +691,7 @@ export function AIAnalyticsDashboard() {
         setModelRegistryEntries([]);
         setSavedInvestigations([]);
         setSavedPlaybooks([]);
+        setReportSchedules([]);
         setWorkflowActions([]);
         setFeedbackRecords([]);
         const meta = await getSession(datasetId, userId);
@@ -749,6 +756,12 @@ export function AIAnalyticsDashboard() {
           const playbooksResponse = await getSavedPlaybooks(datasetId, userId);
           if (!active) return;
           setSavedPlaybooks(playbooksResponse.playbooks ?? []);
+        }
+
+        if (meta.artifacts?.report_schedules) {
+          const schedulesResponse = await getReportSchedules(datasetId, userId);
+          if (!active) return;
+          setReportSchedules(schedulesResponse.schedules ?? []);
         }
 
         if (meta.artifacts?.workflow_actions) {
@@ -1051,6 +1064,11 @@ export function AIAnalyticsDashboard() {
     setSavedPlaybooks(response.playbooks ?? []);
   }
 
+  async function refreshReportSchedules(targetDatasetId: string) {
+    const response = await getReportSchedules(targetDatasetId, userId);
+    setReportSchedules(response.schedules ?? []);
+  }
+
   async function refreshForecastRuns(targetDatasetId: string) {
     const response = await getForecastRuns(targetDatasetId, userId);
     setForecastRuns(response.runs ?? []);
@@ -1088,6 +1106,7 @@ export function AIAnalyticsDashboard() {
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
+      setReportSchedules([]);
       setWorkflowActions([]);
       setFeedbackRecords([]);
       setDashboardSpec(null);
@@ -1260,6 +1279,7 @@ export function AIAnalyticsDashboard() {
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
+      setReportSchedules([]);
       setWorkflowActions([]);
       setFeedbackRecords([]);
       setDashboardSpec(null);
@@ -1306,6 +1326,7 @@ export function AIAnalyticsDashboard() {
       setModelRegistryEntries([]);
       setSavedInvestigations([]);
       setSavedPlaybooks([]);
+      setReportSchedules([]);
       setWorkflowActions([]);
       setDashboardSpec(null);
       setAskResult(null);
@@ -1316,7 +1337,23 @@ export function AIAnalyticsDashboard() {
       setFactsJob(null);
       setReportJob(null);
       setSelectedFile(null);
-      setSessionMeta(await getSession(targetDatasetId, userId));
+      const refreshedMeta = await getSession(targetDatasetId, userId);
+      setSessionMeta(refreshedMeta);
+      if (refreshedMeta.artifacts?.investigations) {
+        await refreshSavedInvestigations(targetDatasetId);
+      }
+      if (refreshedMeta.artifacts?.playbooks) {
+        await refreshSavedPlaybooks(targetDatasetId);
+      }
+      if (refreshedMeta.artifacts?.report_schedules) {
+        await refreshReportSchedules(targetDatasetId);
+      }
+      if (refreshedMeta.artifacts?.workflow_actions) {
+        await refreshWorkflowActions(targetDatasetId);
+      }
+      if (refreshedMeta.artifacts?.feedback) {
+        await refreshFeedback(targetDatasetId);
+      }
       await refreshForecastRuns(targetDatasetId);
       await refreshModelRegistry(targetDatasetId);
       setAuditEvents((await getAudit(targetDatasetId, userId)).events ?? []);
@@ -1797,6 +1834,35 @@ export function AIAnalyticsDashboard() {
     }
   }
 
+  async function handleRunReportSchedule(scheduleId: string, title: string) {
+    if (!datasetId) {
+      setError('Create or load a session first.');
+      return;
+    }
+
+    setBusyAction(`run_report_schedule:${scheduleId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      const queued = await runReportSchedule(datasetId, scheduleId, userId);
+      await refreshReportSchedules(datasetId);
+      setSessionMeta(await getSession(datasetId, userId));
+      setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
+      setNotice(`Queued scheduled report: ${title}.`);
+      setReportJob({
+        job_id: queued.job_id,
+        type: 'report',
+        dataset_id: datasetId,
+        status: queued.status,
+        progress: 0,
+      });
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : 'Running the report schedule failed.');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleDraftWorkflow() {
     if (!datasetId) {
       setError('Create or load a session first.');
@@ -1871,6 +1937,9 @@ export function AIAnalyticsDashboard() {
         note: workflowDecisionNote.trim() || undefined,
       });
       await refreshWorkflowActions(datasetId);
+      if (action.action_type === 'schedule_report') {
+        await refreshReportSchedules(datasetId);
+      }
       setSessionMeta(await getSession(datasetId, userId));
       setAuditEvents((await getAudit(datasetId, userId)).events ?? []);
       setWorkflowDecisionNote('');
@@ -2852,6 +2921,81 @@ export function AIAnalyticsDashboard() {
             })}
           </div>
         )}
+
+        <div className="mt-6 rounded-xl border border-border bg-background p-4">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <p className="text-sm font-medium text-foreground">Governed Report Schedules</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Approved `schedule_report` workflows create durable schedule artifacts that can be manually triggered.
+              </p>
+            </div>
+            <Badge variant="outline">{reportSchedules.length}</Badge>
+          </div>
+
+          {reportSchedules.length === 0 ? (
+            <p className="mt-3 text-sm text-muted-foreground">
+              No governed report schedules yet. Execute an approved `Schedule Report` workflow action to create one.
+            </p>
+          ) : (
+            <div className="mt-4 grid gap-3 xl:grid-cols-2">
+              {reportSchedules.map((schedule) => (
+                <div key={schedule.schedule_id} className="rounded-lg border border-border/70 bg-card p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{schedule.title}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {schedule.audience ?? 'Governed audience'} · {schedule.frequency}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="outline">{schedule.status}</Badge>
+                      <Badge variant="outline">{schedule.report_template}</Badge>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {schedule.sections.map((section) => (
+                      <Badge key={`${schedule.schedule_id}-${section}`} variant="outline">
+                        {section}
+                      </Badge>
+                    ))}
+                  </div>
+
+                  {schedule.objective ? (
+                    <p className="mt-3 text-xs text-muted-foreground">{schedule.objective}</p>
+                  ) : null}
+                  {schedule.delivery_note ? (
+                    <p className="mt-2 text-xs text-muted-foreground">{schedule.delivery_note}</p>
+                  ) : null}
+
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                    <span>Created {new Date(schedule.created_at).toLocaleString()}</span>
+                    {schedule.last_run_at ? <span>Last run {new Date(schedule.last_run_at).toLocaleString()}</span> : null}
+                    {schedule.last_run_status ? <span>Last job {schedule.last_run_status}</span> : null}
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleRunReportSchedule(schedule.schedule_id, schedule.title)}
+                      disabled={busyAction === `run_report_schedule:${schedule.schedule_id}` || !canCompute}
+                    >
+                      {busyAction === `run_report_schedule:${schedule.schedule_id}` ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <FileText className="mr-2 h-4 w-4" />
+                      )}
+                      Run Now
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="grid gap-4 xl:grid-cols-2">

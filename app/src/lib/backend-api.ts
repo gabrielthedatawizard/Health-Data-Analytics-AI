@@ -182,6 +182,37 @@ export interface SavedPlaybooksResponse {
   playbooks: SavedPlaybookRecord[];
 }
 
+export interface ReportScheduleRecord {
+  schedule_id: string;
+  title: string;
+  frequency: string;
+  report_template: string;
+  sections: string[];
+  audience?: string | null;
+  objective?: string | null;
+  delivery_note?: string | null;
+  status: string;
+  source_action_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  last_run_at?: string | null;
+  last_job_id?: string | null;
+  last_run_status?: string | null;
+}
+
+export interface ReportSchedulesResponse {
+  dataset_id: string;
+  schedules: ReportScheduleRecord[];
+}
+
+export interface ReportScheduleRunResponse {
+  dataset_id: string;
+  schedule_id: string;
+  job_id: string;
+  status: string;
+}
+
 export interface ForecastSeriesPoint {
   period: string;
   value: number;
@@ -337,6 +368,8 @@ export interface JobStatus {
   dataset_id: string;
   status: string;
   progress: number;
+  created_at?: string;
+  updated_at?: string;
   result?: Record<string, unknown> | null;
   artifacts?: Record<string, string | null> | null;
   error?: {
@@ -467,6 +500,29 @@ export interface SystemStatusResponse {
   alerts: SystemStatusAlert[];
 }
 
+export interface ReviewQueueItem {
+  item_id: string;
+  dataset_id: string;
+  dataset_label: string;
+  category: string;
+  severity: string;
+  status: string;
+  title: string;
+  summary: string;
+  created_at: string;
+  updated_at: string;
+  action_hint?: string | null;
+}
+
+export interface ReviewQueueResponse {
+  status: string;
+  timestamp: string;
+  actor: string;
+  role: BackendUserRole;
+  total_items: number;
+  items: ReviewQueueItem[];
+}
+
 export const ENV_API_BASE = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
 
 export function computeDefaultApiBase(): string {
@@ -484,6 +540,7 @@ export const API_BASE = ENV_API_BASE || computeDefaultApiBase();
 export const API_TARGET_LABEL = API_BASE || 'same-origin';
 export const BACKEND_USER_STORAGE_KEY = 'healthai_backend_user_id';
 export const BACKEND_ROLE_STORAGE_KEY = 'healthai_backend_user_role';
+export const BACKEND_DATASET_STORAGE_KEY = 'healthai_backend_dataset_id';
 
 const VALID_BACKEND_ROLES = new Set<BackendUserRole>(['viewer', 'analyst', 'reviewer', 'admin']);
 
@@ -626,6 +683,13 @@ export function getAuthContext(userId: string, userRole?: BackendUserRole) {
 
 export function getSystemStatus(userId: string, userRole?: BackendUserRole) {
   return apiRequest<SystemStatusResponse>('/system/status', undefined, { userId, userRole });
+}
+
+export function getReviewQueue(userId: string, userRole?: BackendUserRole, limit = 12) {
+  return apiRequest<ReviewQueueResponse>(`/system/review-queue?limit=${encodeURIComponent(String(limit))}`, undefined, {
+    userId,
+    userRole,
+  });
 }
 
 export function listDocuments(userId: string) {
@@ -959,6 +1023,23 @@ export function runPlaybook(datasetId: string, playbookId: string, userId: strin
   );
 }
 
+export function getReportSchedules(datasetId: string, userId: string) {
+  return apiRequest<ReportSchedulesResponse>(`/sessions/${datasetId}/report-schedules`, undefined, {
+    userId,
+    timeoutMs: 120000,
+  });
+}
+
+export function runReportSchedule(datasetId: string, scheduleId: string, userId: string) {
+  return apiRequest<ReportScheduleRunResponse>(
+    `/sessions/${datasetId}/report-schedules/${scheduleId}/run`,
+    {
+      method: 'POST',
+    },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
 export function draftWorkflowAction(
   datasetId: string,
   userId: string,
@@ -1064,6 +1145,11 @@ export function generateReport(datasetId: string, userId: string) {
 
 export function getJobStatus(jobId: string, userId: string) {
   return apiRequest<JobStatus>(`/jobs/${jobId}`, undefined, { userId });
+}
+
+export function listJobs(userId: string, userRole?: BackendUserRole, datasetId?: string) {
+  const suffix = datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : '';
+  return apiRequest<{ jobs: JobStatus[] }>(`/jobs${suffix}`, undefined, { userId, userRole });
 }
 
 export function getAudit(datasetId: string, userId: string) {
