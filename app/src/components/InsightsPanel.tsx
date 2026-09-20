@@ -20,6 +20,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
+import { toast } from 'sonner';
 import { useAnalytics } from '@/lib/analytics-context';
 import { downloadJsonFile } from '@/lib/download';
 import { useI18n } from '@/lib/i18n';
@@ -193,9 +194,10 @@ export function InsightsPanel() {
     try {
       await navigator.clipboard.writeText(payload);
       setCopiedInsightId(insight.id);
+      toast.success('Insight copied');
       window.setTimeout(() => setCopiedInsightId(null), 1200);
     } catch {
-      window.alert('Could not copy to clipboard in this browser.');
+      toast.error('Could not copy to clipboard in this browser.');
     }
   };
 

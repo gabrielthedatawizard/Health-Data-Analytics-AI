@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,19 +16,40 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+_JOBS_LOCK = threading.Lock()
+
+
 def _load_jobs(path: Path = JOBS_PATH) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    # Retry on torn writes from concurrent API/worker processes.
+    for attempt in range(5):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            if attempt == 4:
+                return {}
+            time.sleep(0.02 * (attempt + 1))
+    return {}
 
 
 def _save_jobs(jobs: dict[str, Any], path: Path = JOBS_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(jobs, handle, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+    with _JOBS_LOCK:
+        tmp_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex[:8]}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(jobs, handle, ensure_ascii=False, indent=2)
+        try:
+            tmp_path.replace(path)
+        except OSError:
+            # Cross-process race: reload, merge, retry once.
+            existing = _load_jobs(path)
+            existing.update(jobs)
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(existing, handle, ensure_ascii=False, indent=2)
+            tmp_path.replace(path)
 
 
 def create_job(job_type: str, dataset_id: str, payload: dict[str, Any], path: Path = JOBS_PATH) -> dict[str, Any]:

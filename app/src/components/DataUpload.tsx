@@ -16,10 +16,13 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
+import { toast } from 'sonner';
 import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { useAnalytics } from '@/lib/analytics-context';
 import type { DatasetRecord, SampleDatasetKind } from '@/lib/ai-engine';
+
+const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 
 interface DataUploadProps {
   onViewChange: (view: ViewType) => void;
@@ -49,6 +52,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [sheetName, setSheetName] = useState('');
 
   const sortedDatasets = useMemo(() => {
     return [...datasets].sort((left, right) => right.uploadedAt.localeCompare(left.uploadedAt));
@@ -58,17 +62,32 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
     async (files: File[]) => {
       if (files.length === 0) return;
       for (const file of files) {
+        if (file.size > MAX_UPLOAD_BYTES) {
+          const msg = `${file.name} exceeds 30MB backend limit.`;
+          setActionMessage(msg);
+          toast.error(msg);
+          continue;
+        }
         try {
-          await uploadFile(file);
-          setActionMessage(`${file.name} uploaded successfully.`);
+          // uploadFile auto-triggers backend auto-run (profile->facts->dashboard).
+          await uploadFile(file, undefined, {
+            sheetName: sheetName.trim() || undefined,
+            autoAnalyze: true,
+          });
+          const msg = `${file.name} uploaded — auto-analysis started.`;
+          setActionMessage(msg);
+          toast.success(msg);
           await pause(300);
-        } catch {
-          setActionMessage(`Upload failed for ${file.name}.`);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'Upload failed';
+          const msg = `Upload failed for ${file.name}: ${detail}`;
+          setActionMessage(msg);
+          toast.error(msg);
           await pause(1100);
         }
       }
     },
-    [uploadFile]
+    [uploadFile, sheetName]
   );
 
   const handleFileSelect = useCallback(
@@ -108,11 +127,15 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
     async (kind: SampleDatasetKind, label: string) => {
       try {
         await addSampleDataset(kind);
-        setActionMessage(`${label} imported successfully.`);
+        const msg = `${label} imported — auto-analysis started.`;
+        setActionMessage(msg);
+        toast.success(msg);
         onViewChange('datasets');
       } catch (error) {
         const message = error instanceof Error ? error.message : t.error;
-        setActionMessage(`Import failed for ${label}: ${message}`);
+        const msg = `Import failed for ${label}: ${message}`;
+        setActionMessage(msg);
+        toast.error(msg);
       }
     },
     [addSampleDataset, onViewChange, t.error]
@@ -186,6 +209,15 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
             <Upload className="w-4 h-4" />
             {t.upload}
           </Button>
+          <div className="mx-auto mt-4 flex max-w-md items-center gap-2">
+            <input
+              value={sheetName}
+              onChange={(e) => setSheetName(e.target.value)}
+              placeholder="Excel sheet name (optional, defaults to first)"
+              className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 text-sm"
+            />
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">Max 30MB • CSV/XLSX • PII masked by default • Auto-analysis runs on upload</p>
         </div>
       </div>
 
@@ -412,7 +444,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                               void removeDataset(dataset.id).catch((error) => {
                                 const message =
                                   error instanceof Error ? error.message : 'Could not remove dataset.';
-                                window.alert(message);
+                                toast.error(message);
                               });
                             }}
                           >
@@ -429,7 +461,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
                             type="button"
                             className="text-xs text-health-mint hover:underline"
                             onClick={() => {
-                              window.alert(dataset.issues.join('\n'));
+                              toast.info(dataset.issues.join('\n'));
                             }}
                           >
                             {t.review}

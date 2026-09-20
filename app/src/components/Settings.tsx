@@ -13,6 +13,7 @@ import {
   FileText,
   LogOut
 } from 'lucide-react';
+import { toast } from 'sonner';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -362,14 +363,9 @@ export function Settings({ onLogout }: SettingsProps) {
             type="button"
             className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors"
             onClick={() => {
-              const existing = localStorage.getItem('healthai_api_key') ?? '';
-              const next = window.prompt('Set local AI API key (optional)', existing);
-              if (next === null) return;
-              if (next.trim()) {
-                localStorage.setItem('healthai_api_key', next.trim());
-              } else {
-                localStorage.removeItem('healthai_api_key');
-              }
+              // No-leak: never store raw LLM keys in plaintext localStorage via prompt.
+              // Direct users to server-side env (AZURE_OPENAI_*/OPENAI_API_KEY).
+              toast.info('AI keys are server-side only (BACKEND env). No browser key needed.');
             }}
           >
             <div className="flex items-center gap-3">
@@ -406,18 +402,18 @@ export function Settings({ onLogout }: SettingsProps) {
             variant="outline"
             className="w-full justify-start gap-3 text-destructive hover:text-destructive"
             onClick={() => {
-              const confirmed = window.confirm(
-                'This will remove all governed backend dataset sessions and local generated insights for this workspace. Continue?'
-              );
-              if (!confirmed) return;
+              if (!confirm(
+                'This will remove all governed backend dataset sessions and local generated insights for this workspace. Audit archives are retained server-side. Continue?'
+              )) return;
               void clearAllData()
                 .then(() => {
+                  toast.success('Workspace cleared (audit archives retained)');
                   onLogout?.();
                 })
                 .catch((error) => {
                   const message =
                     error instanceof Error ? error.message : 'Could not clear workspace data.';
-                  window.alert(message);
+                  toast.error(message);
                 });
             }}
           >

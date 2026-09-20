@@ -36,6 +36,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
+import { toast } from 'sonner';
 import { useAnalytics } from '@/lib/analytics-context';
 import { datasetCsvUrl } from '@/lib/backend-api';
 import type { DatasetRecord } from '@/lib/ai-engine';
@@ -287,13 +288,15 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
                           <DropdownMenuItem
                             className="gap-2"
                             onClick={() => {
-                              const nextName = window.prompt('Rename dataset', dataset.name);
+                              const nextName = prompt('Rename dataset', dataset.name);
                               if (nextName && nextName.trim()) {
-                                void renameDataset(dataset.id, nextName.trim()).catch((error) => {
-                                  const message =
-                                    error instanceof Error ? error.message : 'Could not rename dataset.';
-                                  window.alert(message);
-                                });
+                                void renameDataset(dataset.id, nextName.trim())
+                                  .then(() => toast.success('Dataset renamed'))
+                                  .catch((error) => {
+                                    const message =
+                                      error instanceof Error ? error.message : 'Could not rename dataset.';
+                                    toast.error(message);
+                                  });
                               }
                             }}
                           >
@@ -307,12 +310,14 @@ export function DatasetsView({ onViewChange }: DatasetsViewProps) {
                           <DropdownMenuItem
                             className="gap-2 text-destructive"
                             onClick={() => {
-                              if (window.confirm(`Delete ${dataset.name}?`)) {
-                                void removeDataset(dataset.id).catch((error) => {
-                                  const message =
-                                    error instanceof Error ? error.message : 'Could not delete dataset.';
-                                  window.alert(message);
-                                });
+                              if (confirm(`Delete ${dataset.name}? Audit trail is archived, data is masked by default.`)) {
+                                void removeDataset(dataset.id)
+                                  .then(() => toast.success('Dataset deleted'))
+                                  .catch((error) => {
+                                    const message =
+                                      error instanceof Error ? error.message : 'Could not delete dataset.';
+                                    toast.error(message);
+                                  });
                               }
                             }}
                           >

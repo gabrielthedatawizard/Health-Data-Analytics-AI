@@ -11,6 +11,7 @@ import { AIAnalyticsDashboard } from './components/AIAnalyticsDashboard';
 import { LandingPage } from './landing/LandingPage';
 import { I18nProvider } from './lib/i18n';
 import { AnalyticsProvider } from './lib/analytics-context';
+import { Toaster } from './components/ui/sonner';
 
 export type ViewType = 'dashboard' | 'upload' | 'datasets' | 'insights' | 'ai_analytics' | 'settings';
 
@@ -161,6 +162,7 @@ function App() {
     <I18nProvider>
       <AnalyticsProvider>
         <AppContent />
+        <Toaster richColors position="top-right" />
       </AnalyticsProvider>
     </I18nProvider>
   );

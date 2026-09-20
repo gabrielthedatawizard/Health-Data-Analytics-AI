@@ -9,6 +9,7 @@ import {
 } from 'react';
 import {
   askDataset as askBackendDataset,
+  autoRunPipeline,
   BACKEND_USER_STORAGE_KEY,
   createSession as createBackendSession,
   deleteSession as deleteBackendSession,
@@ -68,7 +69,11 @@ interface AnalyticsContextValue {
   insights: InsightRecord[];
   aiEnvironment: AIEnvironmentState;
   activeUpload: WorkspaceUploadState | null;
-  uploadFile: (file: File, onProgress?: UploadProgressHandler) => Promise<DatasetRecord>;
+  uploadFile: (
+    file: File,
+    onProgress?: UploadProgressHandler,
+    opts?: { sheetName?: string; autoAnalyze?: boolean }
+  ) => Promise<DatasetRecord>;
   addSampleDataset: (kind?: SampleDatasetKind) => Promise<DatasetRecord>;
   removeDataset: (datasetId: string) => Promise<void>;
   renameDataset: (datasetId: string, nextName: string) => Promise<void>;
@@ -889,6 +894,8 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
         description?: string;
         sourceOverride?: DatasetRecord['source'];
         initialTags?: string[];
+        sheetName?: string;
+        autoAnalyze?: boolean;
         onProgress?: UploadProgressHandler;
       }
     ): Promise<DatasetRecord> => {
@@ -922,14 +929,26 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
           status: 'uploading',
           message: 'Uploading dataset to backend',
         });
-        await uploadBackendDataset(datasetId, file, backendUserId);
+        // Automatic engine: backend warms profile + small-file analysis inline.
+        await uploadBackendDataset(datasetId, file, backendUserId, {
+          sheetName: options?.sheetName,
+          autoRun: options?.autoAnalyze !== false,
+        });
         uploadCommitted = true;
 
         updateActiveUpload({
           progress: 75,
           status: 'processing',
-          message: 'Profiling dataset',
+          message: 'Auto-analyzing dataset',
         });
+
+        // Trigger full automatic pipeline (profile->facts->dashboard->anomalies).
+        // Best-effort: upload already warmed the profile, this completes the rest.
+        try {
+          await autoRunPipeline(datasetId, backendUserId);
+        } catch {
+          // Fall back to manual profile/preview below if auto-run queues async work.
+        }
 
         const [profileResponse, previewResponse] = await Promise.all([
           getProfile(datasetId, backendUserId),
@@ -964,6 +983,17 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
 
         setDatasets((previous) => upsertDataset(previous, hydratedDataset));
         setInsights((previous) => [buildUploadInsight(hydratedDataset), ...previous]);
+        // Zero-friction: automatically build governed analysis insights in background.
+        // Never blocks upload success; failures are swallowed (user can retry via Analyze).
+        void (async () => {
+          try {
+            const factsBundle = await resolveFactsBundle(datasetId, backendUserId);
+            const generated = buildAnalysisInsights(hydratedDataset, factsBundle);
+            setInsights((previous) => [...generated, ...previous]);
+          } catch {
+            // Async facts (large files) will be picked up on next Analyze click.
+          }
+        })();
         void refreshDatasets();
 
         setActiveUpload({
@@ -1001,8 +1031,16 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
   );
 
   const uploadFile = useCallback(
-    async (file: File, onProgress?: UploadProgressHandler): Promise<DatasetRecord> => {
-      return uploadDatasetToBackend(file, { onProgress });
+    async (
+      file: File,
+      onProgress?: UploadProgressHandler,
+      opts?: { sheetName?: string; autoAnalyze?: boolean }
+    ): Promise<DatasetRecord> => {
+      return uploadDatasetToBackend(file, {
+        onProgress,
+        sheetName: opts?.sheetName?.trim() || undefined,
+        autoAnalyze: opts?.autoAnalyze,
+      });
     },
     [uploadDatasetToBackend]
   );

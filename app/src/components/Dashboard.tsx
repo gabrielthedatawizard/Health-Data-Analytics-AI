@@ -32,10 +32,14 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useAnalytics } from '@/lib/analytics-context';
+import { toast } from 'sonner';
 import {
   BACKEND_ROLE_STORAGE_KEY,
   BACKEND_DATASET_STORAGE_KEY,
   BACKEND_USER_STORAGE_KEY,
+  autoRunPipeline,
+  createShareLink,
+  getDashboardSpec,
   getReviewQueue,
   getSystemStatus,
   listJobs,
@@ -171,6 +175,9 @@ export function Dashboard({ onViewChange }: DashboardProps) {
   const [recentJobs, setRecentJobs] = useState<JobStatus[]>([]);
   const [recentJobsError, setRecentJobsError] = useState<string | null>(null);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [governedSpec, setGovernedSpec] = useState<Record<string, any> | null>(null);
+  const [governedSpecError, setGovernedSpecError] = useState<string | null>(null);
+  const [autoRunning, setAutoRunning] = useState(false);
 
   const sortedDatasets = useMemo(
     () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
@@ -312,6 +319,72 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       active = false;
     };
   }, []);
+
+  // Governed backend spec: zero-friction — always show latest auto-generated spec.
+  useEffect(() => {
+    let active = true;
+    async function loadGovernedSpec() {
+      if (!latestDataset) {
+        if (active) {
+          setGovernedSpec(null);
+          setGovernedSpecError(null);
+        }
+        return;
+      }
+      try {
+        const actor =
+          (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+        const specResp = await getDashboardSpec(latestDataset.id, actor);
+        if (!active) return;
+        setGovernedSpec(specResp.dashboard_spec as Record<string, any>);
+        setGovernedSpecError(null);
+      } catch (error) {
+        if (!active) return;
+        setGovernedSpec(null);
+        setGovernedSpecError(error instanceof Error ? error.message : 'No governed spec yet');
+      }
+    }
+    void loadGovernedSpec();
+    return () => {
+      active = false;
+    };
+  }, [latestDataset?.id]);
+
+  async function handleAutoRunLatest() {
+    if (!latestDataset) return;
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    setAutoRunning(true);
+    try {
+      const result = await autoRunPipeline(latestDataset.id, actor);
+      toast.success(`Auto-analysis ${result.status}: ${result.anomaly_count} anomalies, PII masked`);
+      try {
+        const specResp = await getDashboardSpec(latestDataset.id, actor);
+        setGovernedSpec(specResp.dashboard_spec as Record<string, any>);
+      } catch {
+        // spec may still be queued for large files
+      }
+      await refreshOperatorPanels();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Auto-run failed');
+    } finally {
+      setAutoRunning(false);
+    }
+  }
+
+  async function handleShareLatest() {
+    if (!latestDataset) return;
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    try {
+      const shared = await createShareLink(latestDataset.id, actor);
+      const url = `${window.location.origin}${window.location.pathname}#/shared/${latestDataset.id}?token=${shared.share_token}`;
+      await navigator.clipboard.writeText(url).catch(() => undefined);
+      toast.success(`Masked share link copied (token ${shared.share_token.slice(0, 6)}…)`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Share failed');
+    }
+  }
 
   async function handleSeedDemo() {
     setIsSeedingDemo(true);
@@ -508,6 +581,50 @@ export function Dashboard({ onViewChange }: DashboardProps) {
             </Card>
           </div>
         </div>
+      </section>
+
+      <section className="rounded-3xl border border-health-mint/20 bg-card p-5 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">Automatic analysis engine</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {governedSpec
+                ? `${(governedSpec.title as string) ?? 'Governed dashboard'} • v${String(governedSpec.version ?? 'current')} • ${(governedSpec.charts as any[])?.length ?? 0} charts • ${(governedSpec.kpis as any[])?.length ?? 0} KPIs • PII masked by default`
+                : governedSpecError
+                  ? `No governed spec yet for ${latestDataset?.name ?? 'latest dataset'} — run auto-analysis.`
+                  : 'Loading governed spec…'}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" className="gap-2" onClick={() => void handleAutoRunLatest()} disabled={!latestDataset || autoRunning}>
+              {autoRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+              {autoRunning ? 'Auto-running…' : 'Auto-run latest'}
+            </Button>
+            <Button variant="outline" className="gap-2" onClick={() => void handleShareLatest()} disabled={!latestDataset || !governedSpec}>
+              <Shield className="h-4 w-4" />
+              Copy masked share link
+            </Button>
+            <Button variant="outline" className="gap-2" onClick={() => latestDataset && handleOpenGovernedSession(latestDataset.id)}>
+              <BarChart3 className="h-4 w-4" />
+              Open governed details
+            </Button>
+          </div>
+        </div>
+        {governedSpec && (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {((governedSpec.kpis as any[]) ?? []).slice(0, 4).map((kpi: any, idx: number) => (
+              <Card key={String(kpi.name ?? idx)} className="border-border bg-background/80">
+                <CardContent className="p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">{String(kpi.name ?? 'KPI')}</p>
+                  <p className="mt-1 truncate text-lg font-bold text-foreground" title={JSON.stringify(kpi.value ?? '')}>
+                    {typeof kpi.value === 'number' ? kpi.value.toLocaleString() : String(kpi.value ?? '—')}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">Grounded • {String((kpi.facts_refs as string[])?.[0] ?? 'fact')}</p>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

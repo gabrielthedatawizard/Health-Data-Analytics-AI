@@ -55,6 +55,21 @@ PII_KEYWORDS = (
     "passport",
 )
 ID_KEYWORDS = ("id", "mrn", "patient_id", "record_id", "encounter_id")
+# Short keywords (<=3 chars) must match whole tokens, otherwise "id" flags
+# "valid"/"provider"/"incident". Longer keywords may match substrings.
+_SHORT_KEYWORD_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _column_name_tokens(column: str) -> set[str]:
+    return set(_SHORT_KEYWORD_TOKEN_RE.findall(column.lower()))
+
+
+def _keyword_matches_column(keyword: str, column_lower: str, tokens: set[str] | None = None) -> bool:
+    if len(keyword) <= 3:
+        if tokens is None:
+            tokens = _column_name_tokens(column_lower)
+        return keyword.lower() in tokens
+    return keyword.lower() in column_lower
 HMIS_TEMPLATE_FIELDS = ("facility", "district", "month", "diagnosis", "age_group", "sex")
 TIME_KEYWORDS = ("date", "visit_date", "month", "week", "year", "period")
 GEO_KEYWORDS = ("region", "district", "facility", "county", "subcounty", "province")
@@ -910,6 +925,50 @@ def _dashboard_spec_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "dashboard_spec.json"
 
 
+def _dashboard_versions_dir(dataset_id: str) -> Path:
+    path = _dataset_path(dataset_id) / "dashboard_versions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _save_dashboard_version(dataset_id: str, spec: dict[str, Any]) -> str:
+    versions_dir = _dashboard_versions_dir(dataset_id)
+    version_id = f"v{len(list(versions_dir.glob('*.json'))) + 1}_{_utc_now_iso().replace(':','-')}"
+    versioned = dict(spec)
+    versioned["version"] = version_id
+    versioned["saved_at"] = _utc_now_iso()
+    _save_json(versions_dir / f"{version_id}.json", versioned)
+    # Keep last 10 versions to bound disk use.
+    versions = sorted(versions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in versions[10:]:
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError:
+            continue
+    return version_id
+
+
+def _list_dashboard_versions(dataset_id: str) -> list[dict[str, Any]]:
+    versions_dir = _dataset_path(dataset_id) / "dashboard_versions"
+    if not versions_dir.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(versions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            spec = _load_json(path)
+            items.append(
+                {
+                    "version": spec.get("version", path.stem),
+                    "saved_at": spec.get("saved_at", ""),
+                    "title": spec.get("title", ""),
+                    "chart_count": len(spec.get("charts", [])),
+                }
+            )
+        except Exception:
+            continue
+    return items
+
+
 def _report_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "report.html"
 
@@ -1319,7 +1378,7 @@ def _session_summary_from_meta(dataset_id: str, meta: dict[str, Any]) -> Session
         created_at=str(meta.get("created_at", "")),
         updated_at=str(meta.get("updated_at", "")),
         created_by=str(meta.get("created_by", "anonymous")),
-        pii_masking_enabled=bool(meta.get("pii_masking_enabled", False)),
+        pii_masking_enabled=bool(meta.get("pii_masking_enabled", True)),
         allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
         file_name=file_name,
         file_type=file_type,
@@ -1333,15 +1392,38 @@ def _session_summary_from_meta(dataset_id: str, meta: dict[str, Any]) -> Session
     )
 
 
+def _audit_prev_hash(dataset_id: str) -> str:
+    path = _audit_log_path(dataset_id)
+    if not path.exists():
+        return "GENESIS"
+    try:
+        last_line = ""
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    last_line = line
+        if not last_line:
+            return "GENESIS"
+        last_record = json.loads(last_line)
+        return str(last_record.get("event_hash", "GENESIS"))
+    except Exception:
+        return "GENESIS"
+
+
 def _append_audit(dataset_id: str, action: str, actor: str, details: dict[str, Any] | None = None) -> None:
+    prev_hash = _audit_prev_hash(dataset_id)
     record = {
         "timestamp": _utc_now_iso(),
         "dataset_id": dataset_id,
         "action": action,
         "actor": actor or "anonymous",
         "details": details or {},
+        "prev_hash": prev_hash,
     }
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    record["event_hash"] = hashlib.sha256(f"{prev_hash}|{payload}".encode("utf-8")).hexdigest()[:32]
     path = _audit_log_path(dataset_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1361,11 +1443,10 @@ def _normalize_role(role: str | None) -> str | None:
     return None
 
 
-def _role_from_identity(actor: str, explicit_role: str | None = None) -> str:
-    normalized = _normalize_role(explicit_role)
-    if normalized:
-        return normalized
+_ROLE_RANK = {"viewer": 0, "analyst": 1, "reviewer": 2, "admin": 3}
 
+
+def _identity_inferred_role(actor: str) -> str:
     identity = (actor or "").strip().lower()
     if not identity or identity == "anonymous":
         return "viewer"
@@ -1376,6 +1457,19 @@ def _role_from_identity(actor: str, explicit_role: str | None = None) -> str:
     if any(token in identity for token in ("viewer", "read_only", "readonly")):
         return "viewer"
     return "analyst"
+
+
+def _role_from_identity(actor: str, explicit_role: str | None = None) -> str:
+    inferred = _identity_inferred_role(actor)
+    normalized = _normalize_role(explicit_role)
+    if not normalized:
+        return inferred
+    # No-leak: explicit header may only downgrade, never escalate beyond
+    # what the identity implies. Prevents X-User-Role: admin spoofing.
+    # Admin identities retain full rights; others are capped at inferred rank.
+    if _ROLE_RANK.get(normalized, 0) > _ROLE_RANK.get(inferred, 0):
+        return inferred
+    return normalized
 
 
 def _permissions_for_role(role: str) -> list[str]:
@@ -2041,11 +2135,22 @@ def _outlier_count(series: pd.Series) -> int:
 def _detect_pii_reasons(column: str, series: pd.Series) -> list[str]:
     reasons: list[str] = []
     lower_name = column.lower()
-    if any(keyword in lower_name for keyword in PII_KEYWORDS):
+    tokens = _column_name_tokens(column)
+    if any(_keyword_matches_column(keyword, lower_name, tokens) for keyword in PII_KEYWORDS):
         reasons.append("name_keyword")
 
     sampled = series.dropna().astype(str).head(300)
     if sampled.empty:
+        return reasons
+
+    # No-leak without false positives: datetime-like columns (visit_date,
+    # month, etc.) look like phone numbers (2025-01-01). Skip value-pattern
+    # checks when values parse as dates.
+    try:
+        date_ratio = float(pd.to_datetime(sampled, errors="coerce").notna().mean())
+    except Exception:
+        date_ratio = 0.0
+    if date_ratio >= 0.8:
         return reasons
 
     email_ratio = sampled.str.match(EMAIL_PATTERN).mean()
@@ -2064,7 +2169,8 @@ def _detect_pii_reasons(column: str, series: pd.Series) -> list[str]:
 
 def _is_id_like_column(column: str, series: pd.Series, inferred_type: str) -> bool:
     lower_name = column.lower()
-    if any(keyword in lower_name for keyword in ID_KEYWORDS):
+    tokens = _column_name_tokens(column)
+    if any(_keyword_matches_column(keyword, lower_name, tokens) for keyword in ID_KEYWORDS):
         return True
 
     if inferred_type not in {"string", "number"}:
@@ -4493,7 +4599,7 @@ def _render_html_report(
 
   <h2>6) Governance Metadata</h2>
   <p class="muted">Created by: {html.escape(meta.get("created_by", "anonymous"))}</p>
-  <p class="muted">PII masking enabled: {str(meta.get("pii_masking_enabled", False)).lower()}</p>
+  <p class="muted">PII masking enabled: {str(meta.get("pii_masking_enabled", True)).lower()}</p>
 </body>
 </html>
 """
@@ -4979,7 +5085,9 @@ def create_session(
         "user_id": created_by,
         "display_name": (payload.display_name.strip() if payload and payload.display_name else "") or None,
         "description": (payload.description.strip() if payload and payload.description else "") or "",
-        "pii_masking_enabled": False,
+        # No-leak by default: mask PII in all derived artifacts until a
+        # reviewer explicitly approves sensitive export.
+        "pii_masking_enabled": True,
         "allow_sensitive_export": False,
         "sensitive_export_approval": _default_sensitive_export_approval(),
         "file": None,
@@ -5019,7 +5127,7 @@ def get_session(
         updated_at=meta.get("updated_at", ""),
         created_by=meta.get("created_by", "anonymous"),
         user_id=meta.get("user_id"),
-        pii_masking_enabled=bool(meta.get("pii_masking_enabled", False)),
+        pii_masking_enabled=bool(meta.get("pii_masking_enabled", True)),
         allow_sensitive_export=bool(meta.get("allow_sensitive_export", False)),
         sensitive_export_approval=_sensitive_export_approval(meta),
         file=meta.get("file"),
@@ -5062,6 +5170,16 @@ def delete_session(
     session_dir = _require_session_dir(dataset_id)
     meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
     _append_audit(dataset_id, "session_deleted", actor, {})
+    # No-leak / tamper-evidence: archive audit trail before removing session dir.
+    try:
+        archive_dir = DATA_DIR / "deleted_audit"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        src_audit = _audit_log_path(dataset_id)
+        if src_audit.exists():
+            dst = archive_dir / f"{dataset_id}_{_utc_now_iso().replace(':','-')}.jsonl"
+            dst.write_bytes(src_audit.read_bytes())
+    except Exception:
+        pass
     cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:")
 
     for child in sorted(session_dir.rglob("*"), reverse=True):
@@ -5231,6 +5349,7 @@ async def upload_file(
     dataset_id: str,
     file: UploadFile = File(...),
     sheet_name: str | None = Query(default=None, description="Excel sheet to load. Defaults to first sheet."),
+    auto_run: bool = Query(default=False, description="If true, run automatic profile->facts->dashboard pipeline inline for small files."),
     uploaded_by: str = Form(default="anonymous"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
@@ -5314,13 +5433,52 @@ async def upload_file(
         {"filename": filename, "extension": extension, "size_bytes": len(content)},
     )
 
-    return {
+    result: dict[str, Any] = {
         "dataset_id": dataset_id,
         "filename": filename,
         "stored_as": stored_name,
         "sheet_name": file_meta.get("sheet_name"),
+        "sheets": file_meta.get("sheets"),
         "encoding": file_meta.get("encoding"),
     }
+
+    # Automatic engine: optionally warm profile + small-file auto analysis inline
+    # so the frontend needs zero manual clicks after upload.
+    if auto_run:
+        try:
+            fresh_df = _read_uploaded_file(meta)
+            fresh_profile = _build_profile(fresh_df)
+            _save_json(_profile_path(dataset_id), fresh_profile)
+            meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
+            meta["status"] = "profiled"
+            _save_meta(dataset_id, meta)
+            result["auto_profiled"] = True
+            result["pii_candidates"] = fresh_profile.get("pii_candidates", [])
+            rows, cols = fresh_df.shape
+            if rows <= SMALL_ROW_MAX and cols <= MID_COL_MAX:
+                fresh_profile["data_coverage"] = {
+                    "mode": "full", "rows_total": rows, "rows_used": rows,
+                    "sampling_method": "uniform", "seed": None, "bias_notes": "Full dataset used.",
+                }
+                facts_bundle = _build_facts_bundle(
+                    fresh_df, fresh_profile, dataset_id=dataset_id, dataset_hash=str(meta.get("file_hash", ""))
+                )
+                _save_json(_facts_path(dataset_id), facts_bundle)
+                spec = _build_dashboard_spec(dataset_id, fresh_profile, facts_bundle)
+                version_id = _save_dashboard_version(dataset_id, spec)
+                spec["version"] = version_id
+                _save_json(_dashboard_spec_path(dataset_id), spec)
+                meta["artifacts"]["facts"] = str(_facts_path(dataset_id))
+                meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
+                meta["status"] = "auto_analyzed"
+                _save_meta(dataset_id, meta)
+                _append_audit(dataset_id, "auto_run_completed", actor, {"via": "upload", "version": version_id})
+                result["auto_analyzed"] = True
+                result["dashboard_version"] = version_id
+        except Exception as exc:
+            result["auto_run_warning"] = str(exc)
+
+    return result
 
 
 @app.get("/sessions/{dataset_id}/profile", response_model=ProfileResponse)
@@ -5363,7 +5521,7 @@ def profile_dataset(
     if response is not None:
         response.headers["ETag"] = _etag_for(dataset_id, "profile", file_hash, schema_hash=schema_hash)
 
-    mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
+    mask_enabled = bool(meta.get("pii_masking_enabled", True)) if mask_pii is None else bool(mask_pii)
     response_profile = _apply_profile_masking(profile, mask_enabled)
     return ProfileResponse(dataset_id=dataset_id, profile=response_profile)
 
@@ -6095,10 +6253,20 @@ def get_semantic_layer(
         profile = _build_profile(_read_uploaded_file(meta))
         _save_json(profile_path, profile)
 
-    mask_enabled = bool(meta.get("pii_masking_enabled", False)) if mask_pii is None else bool(mask_pii)
-    response_profile = _apply_profile_masking(profile, mask_enabled)
-    semantic_layer = build_semantic_layer(response_profile)
-    return SemanticLayerResponse(dataset_id=dataset_id, semantic_layer=semantic_layer)
+    # No-leak: build governance from RAW profile so blocked fields carry
+    # original names (auditable), then mask displayable metrics/dimensions.
+    raw_layer = build_semantic_layer(profile)
+    mask_enabled = bool(meta.get("pii_masking_enabled", True)) if mask_pii is None else bool(mask_pii)
+    if not mask_enabled:
+        return SemanticLayerResponse(dataset_id=dataset_id, semantic_layer=raw_layer)
+    aliases = _pii_aliases(profile)
+    masked_layer = _mask_recursive(json.loads(json.dumps(raw_layer)), aliases)
+    # Preserve original blocked names for transparency + aliases for enforcement.
+    original_blocked = list(raw_layer.get("pii_blocked_fields", []))
+    masked_blocked = list(masked_layer.get("pii_blocked_fields", []))
+    merged = sorted(set(original_blocked + masked_blocked))
+    masked_layer["pii_blocked_fields"] = merged
+    return SemanticLayerResponse(dataset_id=dataset_id, semantic_layer=masked_layer)
 
 
 @app.get("/sessions/{dataset_id}/facts")
@@ -6129,7 +6297,7 @@ def generate_facts(
     cache_key = _cache_key(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
     cached = cache.get(cache_key)
     if cached and not force:
-        if meta.get("pii_masking_enabled", False):
+        if meta.get("pii_masking_enabled", True):
             profile_for_mask = _load_profile_if_exists(dataset_id) or {}
             aliases = _pii_aliases(profile_for_mask)
             if aliases:
@@ -6143,7 +6311,7 @@ def generate_facts(
         facts_bundle = _load_json(facts_path)
         if facts_bundle.get("dataset_hash") == file_hash:
             cache.set(cache_key, facts_bundle)
-            if meta.get("pii_masking_enabled", False):
+            if meta.get("pii_masking_enabled", True):
                 profile_for_mask = _load_profile_if_exists(dataset_id) or {}
                 aliases = _pii_aliases(profile_for_mask)
                 if aliases:
@@ -6240,7 +6408,7 @@ def generate_facts(
     cache.set(cache_key, facts_bundle)
     if response is not None:
         response.headers["ETag"] = _etag_for(dataset_id, "facts", file_hash, schema_hash=schema_hash, params=mode)
-    if meta.get("pii_masking_enabled", False):
+    if meta.get("pii_masking_enabled", True):
         pii_columns = profile.get("pii_candidates", [])
         aliases = {column: f"pii_field_{index + 1}" for index, column in enumerate(pii_columns)}
         masked_bundle = _mask_recursive(json.loads(json.dumps(facts_bundle)), aliases)
@@ -6378,6 +6546,8 @@ def generate_dashboard_spec(
     else:
         spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
 
+    version_id = _save_dashboard_version(dataset_id, spec)
+    spec["version"] = version_id
     _save_json(_dashboard_spec_path(dataset_id), spec)
     cache.set(cache_key, spec)
     meta["artifacts"]["profile"] = str(profile_path)
@@ -6385,7 +6555,9 @@ def generate_dashboard_spec(
     meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
     meta["status"] = "dashboard_spec_generated"
     _save_meta(dataset_id, meta)
-    _append_audit(dataset_id, "dashboard_spec_generated", actor, {"use_llm": use_llm, "template": template})
+    _append_audit(
+        dataset_id, "dashboard_spec_generated", actor, {"use_llm": use_llm, "template": template, "version": version_id}
+    )
     if response is not None:
         response.headers["ETag"] = _etag_for(
             dataset_id, "dashboard_spec", file_hash, schema_hash=schema_hash, params=str(use_llm)
@@ -6405,6 +6577,194 @@ def get_dashboard(
         raise HTTPException(status_code=404, detail="Dashboard spec not generated yet.")
     spec = _load_json(spec_path)
     return {"dataset_id": dataset_id, "dashboard_html": _render_dashboard_html(spec), "spec_version": spec.get("version")}
+
+
+@app.get("/sessions/{dataset_id}/dashboard-versions")
+def list_dashboard_versions(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    return {"dataset_id": dataset_id, "versions": _list_dashboard_versions(dataset_id)}
+
+
+@app.post("/sessions/{dataset_id}/dashboard-versions/{version}/restore")
+def restore_dashboard_version(
+    dataset_id: str,
+    version: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    meta, actor, _ = _authorized_session_context(dataset_id, action="write", x_api_key=x_api_key, x_user_role=x_user_role)
+    src = _dashboard_versions_dir(dataset_id) / f"{version}.json"
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="Dashboard version not found.")
+    spec = _load_json(src)
+    _save_json(_dashboard_spec_path(dataset_id), spec)
+    meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
+    meta["status"] = "dashboard_spec_generated"
+    _save_meta(dataset_id, meta)
+    _append_audit(dataset_id, "dashboard_version_restored", actor, {"version": version})
+    return {"dataset_id": dataset_id, "restored_version": version, "dashboard_spec": spec}
+
+
+def _share_tokens_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "share_tokens.json"
+
+
+def _load_share_tokens(dataset_id: str) -> list[dict[str, Any]]:
+    path = _share_tokens_path(dataset_id)
+    if not path.exists():
+        return []
+    try:
+        data = _load_json(path)
+        tokens = data.get("tokens", [])
+        return tokens if isinstance(tokens, list) else []
+    except Exception:
+        return []
+
+
+@app.post("/sessions/{dataset_id}/share")
+def create_share_link(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    # Share links are always masked - no sensitive export via link.
+    meta, actor, _ = _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    tokens = _load_share_tokens(dataset_id)
+    token = uuid.uuid4().hex[:16]
+    entry = {"token": token, "created_at": _utc_now_iso(), "created_by": actor, "masked": True}
+    tokens.append(entry)
+    _save_json(_share_tokens_path(dataset_id), {"tokens": tokens[-20:]})
+    _append_audit(dataset_id, "share_link_created", actor, {"token_prefix": token[:6]})
+    return {"dataset_id": dataset_id, "share_token": token, "masked": True}
+
+
+@app.get("/sessions/{dataset_id}/shared")
+def get_shared_dashboard(
+    dataset_id: str,
+    token: str = Query(...),
+) -> dict[str, Any]:
+    # Public link access: token-gated, always PII-masked, read-only.
+    tokens = _load_share_tokens(dataset_id)
+    if not any(str(t.get("token")) == token for t in tokens):
+        raise HTTPException(status_code=403, detail="Invalid share token.")
+    try:
+        meta = _load_meta(dataset_id)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    spec_path = _dashboard_spec_path(dataset_id)
+    if not spec_path.exists():
+        raise HTTPException(status_code=404, detail="Dashboard spec not generated yet.")
+    spec = _load_json(spec_path)
+    profile = _load_json(_profile_path(dataset_id)) if _profile_path(dataset_id).exists() else {}
+    if profile.get("pii_candidates"):
+        aliases = {c: f"pii_field_{i+1}" for i, c in enumerate(profile["pii_candidates"])}
+        spec = _mask_recursive(json.loads(json.dumps(spec)), aliases)
+    facts_path = _facts_path(dataset_id)
+    facts_bundle: dict[str, Any] | None = None
+    if facts_path.exists():
+        try:
+            facts_bundle = _load_json(facts_path)
+            if profile.get("pii_candidates"):
+                facts_bundle = _mask_recursive(json.loads(json.dumps(facts_bundle)), aliases)
+        except Exception:
+            facts_bundle = None
+    return {"dataset_id": dataset_id, "masked": True, "dashboard_spec": spec, "facts_bundle": facts_bundle}
+
+
+@app.post("/sessions/{dataset_id}/auto-run")
+def auto_run_pipeline(
+    dataset_id: str,
+    template: str = Query(default="health_core"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    """Automatic engine: profile -> facts -> dashboard-spec -> anomalies in one call.
+
+    Small datasets run synchronously for zero-friction UX. Large datasets
+    return queued job ids so the frontend can poll without blocking.
+    All derived artifacts respect pii_masking_enabled (default True).
+    """
+    meta, actor, _ = _authorized_session_context(dataset_id, action="compute", x_api_key=x_api_key, x_user_role=x_user_role)
+    if not meta.get("file"):
+        raise HTTPException(status_code=400, detail="No file uploaded for this session.")
+    df = _read_uploaded_file(meta)
+    rows, cols = df.shape
+    file_hash = meta.get("file_hash") or _dataset_signature(meta)
+    meta["file_hash"] = file_hash
+    schema_hash = _compute_schema_hash(df)
+    meta["schema_hash"] = schema_hash
+
+    # 1. Profile (always sync, fast)
+    profile = _build_profile(df)
+    _save_json(_profile_path(dataset_id), profile)
+
+    # 2. Facts: sync if small, async job if large
+    needs_async = rows > SMALL_ROW_MAX or cols > MID_COL_MAX
+    facts_job_id: str | None = None
+    facts_bundle: dict[str, Any] | None = None
+    if needs_async:
+        seed = _seed_from_dataset_hash(file_hash)
+        queued = _queue_facts_job(
+            dataset_id, actor, "sample", seed,
+            file_hash=file_hash, schema_hash=schema_hash, force=False, audit_action="auto_run_queued",
+        )
+        facts_job_id = str(queued.get("job_id"))
+    else:
+        data_coverage = {
+            "mode": "full", "rows_total": rows, "rows_used": rows,
+            "sampling_method": "uniform", "seed": None, "bias_notes": "Full dataset used.",
+        }
+        profile["data_coverage"] = data_coverage
+        facts_bundle = _build_facts_bundle(df, profile, dataset_id=dataset_id, dataset_hash=file_hash)
+        _save_json(_facts_path(dataset_id), facts_bundle)
+        _save_json(_profile_path(dataset_id), profile)
+
+    # 3. Dashboard spec (sync from profile/facts when available)
+    dashboard_version: str | None = None
+    if facts_bundle is not None:
+        spec = _build_dashboard_spec(dataset_id, profile, facts_bundle)
+        dashboard_version = _save_dashboard_version(dataset_id, spec)
+        spec["version"] = dashboard_version
+        _save_json(_dashboard_spec_path(dataset_id), spec)
+
+    # 4. Anomalies (sync, cheap)
+    anomaly_count = 0
+    try:
+        anomalies = _build_anomaly_analysis(df, profile, limit=6)
+        _save_json(_anomaly_path(dataset_id), anomalies)
+        anomaly_count = int(anomalies.get("anomaly_count", 0))
+    except Exception:
+        anomalies = None
+
+    meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
+    if (_facts_path(dataset_id)).exists():
+        meta["artifacts"]["facts"] = str(_facts_path(dataset_id))
+    if (_dashboard_spec_path(dataset_id)).exists():
+        meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
+    if (_anomaly_path(dataset_id)).exists():
+        meta["artifacts"]["anomaly_analysis"] = str(_anomaly_path(dataset_id))
+    meta["status"] = "auto_analyzed" if facts_bundle is not None else "auto_queued"
+    _save_meta(dataset_id, meta)
+    _append_audit(
+        dataset_id, "auto_run_completed", actor,
+        {"rows": rows, "cols": cols, "async": needs_async, "anomaly_count": anomaly_count,
+         "dashboard_version": dashboard_version, "facts_job_id": facts_job_id},
+    )
+    return {
+        "dataset_id": dataset_id,
+        "status": meta["status"],
+        "rows": rows, "cols": cols,
+        "async": needs_async,
+        "facts_job_id": facts_job_id,
+        "dashboard_version": dashboard_version,
+        "anomaly_count": anomaly_count,
+        "pii_masking_enabled": bool(meta.get("pii_masking_enabled", True)),
+        "pii_candidates": profile.get("pii_candidates", []),
+    }
 
 
 def _execute_governed_ask(

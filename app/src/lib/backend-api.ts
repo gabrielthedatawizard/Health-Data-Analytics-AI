@@ -811,17 +811,78 @@ export function deleteSession(datasetId: string, userId: string) {
   );
 }
 
-export async function uploadDataset(datasetId: string, file: File, userId: string) {
+export async function uploadDataset(
+  datasetId: string,
+  file: File,
+  userId: string,
+  options?: { sheetName?: string; autoRun?: boolean }
+) {
   const form = new FormData();
   form.append('file', file);
   form.append('uploaded_by', userId || 'react_user');
+  const params = new URLSearchParams();
+  if (options?.sheetName) params.set('sheet_name', options.sheetName);
+  if (options?.autoRun) params.set('auto_run', 'true');
+  const suffix = params.toString() ? `?${params.toString()}` : '';
   return apiRequest<Record<string, unknown>>(
-    `/sessions/${datasetId}/upload`,
+    `/sessions/${datasetId}/upload${suffix}`,
     {
       method: 'POST',
       body: form,
     },
     { userId, timeoutMs: 120000 }
+  );
+}
+
+export interface AutoRunResponse {
+  dataset_id: string;
+  status: string;
+  rows: number;
+  cols: number;
+  async: boolean;
+  facts_job_id?: string | null;
+  dashboard_version?: string | null;
+  anomaly_count: number;
+  pii_masking_enabled: boolean;
+  pii_candidates: string[];
+}
+
+export function autoRunPipeline(datasetId: string, userId: string, template = 'health_core') {
+  return apiRequest<AutoRunResponse>(
+    `/sessions/${datasetId}/auto-run?template=${encodeURIComponent(template)}`,
+    { method: 'POST' },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export interface DashboardVersionItem {
+  version: string;
+  saved_at: string;
+  title: string;
+  chart_count: number;
+}
+
+export function listDashboardVersions(datasetId: string, userId: string) {
+  return apiRequest<{ dataset_id: string; versions: DashboardVersionItem[] }>(
+    `/sessions/${datasetId}/dashboard-versions`,
+    undefined,
+    { userId }
+  );
+}
+
+export function restoreDashboardVersion(datasetId: string, version: string, userId: string) {
+  return apiRequest<{ dataset_id: string; restored_version: string; dashboard_spec: Record<string, unknown> }>(
+    `/sessions/${datasetId}/dashboard-versions/${encodeURIComponent(version)}/restore`,
+    { method: 'POST' },
+    { userId }
+  );
+}
+
+export function createShareLink(datasetId: string, userId: string) {
+  return apiRequest<{ dataset_id: string; share_token: string; masked: boolean }>(
+    `/sessions/${datasetId}/share`,
+    { method: 'POST' },
+    { userId }
   );
 }
 
