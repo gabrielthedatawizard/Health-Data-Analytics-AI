@@ -56,7 +56,8 @@ S3_BUCKET = os.getenv("S3_BUCKET", "").strip() or None
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or None
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()] or ["*"]
 
-MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+PROFILE_SAMPLE_MAX_ROWS = 100_000
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx"}
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 PII_KEYWORDS = (
@@ -240,6 +241,45 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityHeadersMiddleware)
+
+
+def _security_posture() -> dict[str, Any]:
+    env = os.getenv("ENV", "dev").lower()
+    is_prod = env in {"prod", "production"}
+    cors_wildcard = len(CORS_ORIGINS) == 1 and CORS_ORIGINS[0] == "*"
+    return {
+        "env": env,
+        "is_prod": is_prod,
+        "jwt_enforced": bool(JWT_SECRET),
+        "cors_wildcard": cors_wildcard,
+        "cors_origins": ["*"] if cors_wildcard else CORS_ORIGINS,
+        "pii_masking_default": True,
+        "audit_hash_chained": True,
+        "s3_mirror": bool(S3_BUCKET),
+        "data_dir": str(DATA_DIR),
+        "fail_closed": (not is_prod) or (bool(JWT_SECRET) and not cors_wildcard),
+        "guidance": (
+            "OK"
+            if ((not is_prod) or (bool(JWT_SECRET) and not cors_wildcard))
+            else "Set JWT_SECRET and CORS_ORIGINS to non-wildcard in production (ENV=production)."
+        ),
+    }
+
+
+@app.on_event("startup")
+def _fail_closed_prod_check() -> None:
+    posture = _security_posture()
+    logger.info(json.dumps({"event": "security_posture", **{k: v for k, v in posture.items() if k != "cors_origins"}}))
+    if posture["is_prod"] and not posture["fail_closed"]:
+        # Fail-closed: refuse insecure prod boot rather than leak data.
+        raise RuntimeError(f"Insecure production config: {posture['guidance']}")
+
+
+@app.get("/system/security")
+def get_security_posture() -> dict[str, Any]:
+    posture = _security_posture()
+    # Never leak secret values.
+    return posture
 
 
 _METRICS: dict[str, Any] = {
@@ -2190,6 +2230,32 @@ def _get_llm_client() -> LLMClient:
     return _llm_client
 
 
+def _build_profile_fast(df: pd.DataFrame) -> dict[str, Any]:
+    """Perf: sample very large frames for interactive profiling.
+
+    Full scans (duplicated/IQR/nunique) OOM on >100k rows. Sample
+    deterministically and flag profile_sampled so facts/auto-run can note
+    sampling vs full coverage. Small frames use exact _build_profile.
+    """
+    if len(df) <= PROFILE_SAMPLE_MAX_ROWS:
+        profile = _build_profile(df)
+        profile["profile_sampled"] = False
+        return profile
+    seed = _seed_from_dataset_hash(str(df.shape))
+    sampled = _deterministic_sample(df, PROFILE_SAMPLE_MAX_ROWS, seed)
+    profile = _build_profile(sampled)
+    profile["profile_sampled"] = True
+    profile["profile_sample_note"] = (
+        f"Profiled {len(sampled)} of {len(df)} rows for interactive speed; facts use sampled/full coverage separately."
+    )
+    # Preserve true shape for UX.
+    shape = profile.get("shape") if isinstance(profile.get("shape"), dict) else {}
+    shape["rows"] = int(len(df))
+    shape["cols"] = int(df.shape[1])
+    profile["shape"] = shape
+    return profile
+
+
 def _detect_csv_encoding(content: bytes) -> str:
     last_error: Exception | None = None
     for encoding in CSV_ENCODINGS:
@@ -2272,7 +2338,11 @@ def _cache_key(dataset_id: str, artifact: str, file_hash: str, schema_hash: str 
 def _seed_from_dataset_hash(dataset_hash: str) -> int:
     if not dataset_hash:
         return 42
-    return int(dataset_hash[:8], 16)
+    try:
+        return int(dataset_hash[:8], 16)
+    except ValueError:
+        # Non-hex inputs (e.g. shape tuples) fall back to hashed seed.
+        return int(hashlib.sha256(dataset_hash.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def _deterministic_sample(df: pd.DataFrame, max_rows: int, seed: int) -> pd.DataFrame:
@@ -4204,51 +4274,92 @@ def _apply_cleaning_actions(df: pd.DataFrame, actions: list[str]) -> pd.DataFram
 
 
 def _safe_answer_from_facts(question: str, facts_bundle: dict[str, Any]) -> tuple[str, list[str], str, float, str]:
+    """Smarter deterministic fallback (no LLM): cautious, cited, with limitations."""
     question_lower = question.lower()
-    insight_facts = facts_bundle.get("insight_facts", [])
-    data_coverage = str((facts_bundle.get("data_coverage") or {}).get("mode", "sample"))
+    insight_facts = facts_bundle.get("insight_facts", []) or []
+    coverage_info = facts_bundle.get("data_coverage") or {}
+    data_coverage = str(coverage_info.get("mode", "sample"))
+    coverage_note = " (sampled coverage — validate before final reporting)" if data_coverage == "sample" else " (full coverage)"
+    quality = facts_bundle.get("quality", {}) or {}
+    qscore = quality.get("score")
+
+    def _caution() -> str:
+        return " This association may indicate operational variation, not causation."
 
     trend_fact = next((fact for fact in insight_facts if fact.get("type") == "trend"), None)
-    if trend_fact and any(token in question_lower for token in ("trend", "change", "increase", "decrease")):
-        payload = trend_fact.get("value", {})
+    if trend_fact and any(token in question_lower for token in ("trend", "change", "increase", "decrease", "month", "over time", "forecast", "growth")):
+        payload = trend_fact.get("value", {}) if isinstance(trend_fact.get("value"), dict) else {}
         pct = payload.get("pct_change")
         latest = payload.get("latest_period_value")
         previous = payload.get("previous_period_value")
+        metric = str(payload.get("metric", "metric"))
         if isinstance(latest, (float, int)) and isinstance(previous, (float, int)):
             if pct is not None:
+                direction = "increased" if float(pct) > 0 else "decreased" if float(pct) < 0 else "held steady"
                 answer = (
-                    f"The most recent period is {float(latest):.2f} vs {float(previous):.2f} "
-                    f"({float(pct):.2f}% change)."
+                    f"{metric} {direction} from {float(previous):.2f} to {float(latest):.2f} "
+                    f"({float(pct):.2f}% change) in the latest period.{coverage_note}{_caution()}"
                 )
             else:
-                answer = f"The most recent period is {float(latest):.2f} vs {float(previous):.2f}."
+                answer = f"{metric} moved from {float(previous):.2f} to {float(latest):.2f}.{coverage_note}{_caution()}"
         else:
-            answer = "A trend fact exists, but comparable periods were not fully available."
+            answer = "A trend fact exists, but comparable periods were not fully available. Run full coverage facts for confirmation."
         return answer, [str(trend_fact.get("id", ""))], "Medium", 1.0, data_coverage
 
-    if any(token in question_lower for token in ("missing", "completeness", "quality")):
-        quality = facts_bundle.get("quality", {})
-        issues = quality.get("issues", [])
+    seg_fact = next((f for f in insight_facts if isinstance(f.get("value"), dict) and str(f.get("value", {}).get("metric", "")).startswith("top_")), None)
+    if seg_fact and any(token in question_lower for token in ("top", "best", "highest", "segment", "district", "region", "facility", "compare", "leader")):
+        val = seg_fact.get("value", {})
+        answer = (
+            f"Top {val.get('segment_field')} by {val.get('metric')} is {val.get('segment')} at {val.get('value')}.{coverage_note}{_caution()}"
+        )
+        return answer, [str(seg_fact.get("id", ""))], "Medium", 1.0, data_coverage
+
+    corr_fact = next((f for f in insight_facts if isinstance(f.get("value"), dict) and str(f.get("value", {}).get("metric", "")) == "pair_correlation"), None)
+    if corr_fact and any(token in question_lower for token in ("correlat", "relat", "associated", "link")):
+        val = corr_fact.get("value", {})
+        r = float(val.get("value", 0.0))
+        strength = "strong" if abs(r) >= 0.7 else "moderate" if abs(r) >= 0.4 else "weak"
+        answer = (
+            f"{val.get('x')} and {val.get('y')} show {strength} Pearson correlation (r={r:.2f}). "
+            f"This is associated variation, not proof of causation.{coverage_note}"
+        )
+        return answer, [str(corr_fact.get("id", ""))], "Medium", 1.0, data_coverage
+
+    if any(token in question_lower for token in ("missing", "completeness", "quality", "duplicate", "pii", "limit")):
+        issues = quality.get("issues", []) or []
         if issues:
             issue = issues[0]
-            columns = ", ".join(issue.get("columns", [])[:5]) or "N/A"
-            answer = f"Primary quality issue: {issue.get('code')} ({issue.get('severity')}). Columns: {columns}."
+            columns = ", ".join((issue.get("columns") or [])[:5]) or "N/A"
+            answer = (
+                f"Primary quality flag: {issue.get('code')} ({issue.get('severity')}). {issue.get('message')} "
+                f"Columns: {columns}. Quality score {qscore}.{coverage_note} Address missingness before executive reporting."
+            )
             coverage = 1.0
         else:
-            answer = f"Quality score is {quality.get('score')} and no major issues were flagged."
+            answer = f"Quality score is {qscore} with no major flags.{coverage_note}"
             coverage = 0.7
         return answer, [], "Medium", coverage, data_coverage
 
-    kpis = facts_bundle.get("kpis", [])
-    if any(token in question_lower for token in ("rows", "columns", "size", "shape")) and kpis:
+    kpis = facts_bundle.get("kpis", []) or []
+    if any(token in question_lower for token in ("rows", "columns", "size", "shape", "how many", "dataset")) and kpis:
         rows = next((kpi for kpi in kpis if kpi.get("id") == "kpi_rows"), None)
         cols = next((kpi for kpi in kpis if kpi.get("id") == "kpi_cols"), None)
         if rows and cols:
-            answer = f"Dataset has {rows.get('value')} rows and {cols.get('value')} columns."
+            answer = f"Dataset has {rows.get('value')} rows and {cols.get('value')} columns. Quality {qscore}.{coverage_note}"
             refs = list(rows.get("facts_refs", [])) + list(cols.get("facts_refs", []))
             return answer, [str(value) for value in refs if isinstance(value, str)], "High", 1.0, data_coverage
 
-    return ("No matching precomputed fact was found for this question.", [], "Low", 0.0, data_coverage)
+    # Default: executive summary from strongest available facts (still grounded).
+    if trend_fact is not None:
+        fid = str(trend_fact.get("id", ""))
+        return (
+            f"Top evidence is a time trend ({fid}) with quality {qscore}.{coverage_note} Ask about trend, top segment, or quality for detail.{_caution()}",
+            [fid], "Low", 0.5, data_coverage,
+        )
+    if seg_fact is not None:
+        fid = str(seg_fact.get("id", ""))
+        return (f"Top evidence is a segment comparison ({fid}).{coverage_note}", [fid], "Low", 0.5, data_coverage)
+    return ("No matching precomputed fact was found for this question. Run full facts, then ask about trend, top segment, correlation, or quality.", [], "Low", 0.0, data_coverage)
 
 
 def _facts_context_for_llm(facts_bundle: dict[str, Any]) -> dict[str, Any]:
@@ -5718,7 +5829,7 @@ async def upload_file(
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (max 30MB).")
+        raise HTTPException(status_code=400, detail="File too large (max 50MB). Use sampling or compress to CSV.")
 
     file_meta: dict[str, Any] = {
         "filename": filename,
@@ -5860,7 +5971,7 @@ def profile_dataset(
     if cached:
         profile = cached
     else:
-        profile = _build_profile(df)
+        profile = _build_profile_fast(df)
         cache.set(cache_key, profile)
 
     _save_json(_profile_path(dataset_id), profile)

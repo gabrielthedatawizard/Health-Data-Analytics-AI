@@ -22,7 +22,7 @@ import { cn } from '@/lib/utils';
 import { useAnalytics } from '@/lib/analytics-context';
 import type { DatasetRecord, SampleDatasetKind } from '@/lib/ai-engine';
 
-const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 interface DataUploadProps {
   onViewChange: (view: ViewType) => void;
@@ -66,7 +66,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
       if (files.length === 0) return;
       for (const file of files) {
         if (file.size > MAX_UPLOAD_BYTES) {
-          const msg = `${file.name} exceeds 30MB backend limit.`;
+          const msg = `${file.name} exceeds 50MB backend limit. Compress to CSV or sample.`;
           setActionMessage(msg);
           toast.error(msg);
           continue;
@@ -220,7 +220,7 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
               className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 text-sm"
             />
           </div>
-          <p className="mt-2 text-xs text-muted-foreground">Max 30MB • CSV/XLSX • PII masked by default • Auto-analysis runs on upload</p>
+          <p className="mt-2 text-xs text-muted-foreground">Max 50MB • CSV/XLSX • PII masked by default • Auto-analysis runs on upload</p>
         </div>
       </div>
 
