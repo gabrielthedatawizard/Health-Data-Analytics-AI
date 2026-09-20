@@ -1,0 +1,83 @@
+services:
+  - type: redis
+    name: healthai-redis
+    plan: starter
+    maxmemoryPolicy: noeviction
+
+  - type: web
+    name: healthai-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: UVICORN_WORKERS
+        value: 2
+      - key: DATA_DIR
+        value: /var/data/data_store
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: healthai-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: healthai-redis
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: healthai-redis
+          property: connectionString
+      - key: CORS_ORIGINS
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: AI_PROVIDER
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_DEPLOYMENT
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+    disk:
+      name: healthai-data
+      mountPath: /var/data
+      sizeGB: 5
+
+  - type: worker
+    name: healthai-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    dockerCommand: celery -A backend.celery_app.celery_app worker --loglevel=INFO --concurrency=2
+    envVars:
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: healthai-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: healthai-redis
+          property: connectionString
+      - key: DATA_DIR
+        value: /var/data/data_store
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: healthai-api
+          envVarKey: JWT_SECRET
+    disk:
+      name: healthai-data
+      mountPath: /var/data
+      sizeGB: 5

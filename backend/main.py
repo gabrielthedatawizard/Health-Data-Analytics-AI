@@ -220,10 +220,26 @@ _llm_client: LLMClient | None = None
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    # Browsers reject wildcard + credentials; only send credentials for explicit origins.
+    allow_credentials=not (len(CORS_ORIGINS) == 1 and CORS_ORIGINS[0] == "*"),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if os.getenv("ENV", "dev").lower() in {"prod", "production"}:
+            response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 _METRICS: dict[str, Any] = {
@@ -1001,6 +1017,47 @@ def _facts_path(dataset_id: str) -> Path:
 
 def _anomaly_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "anomaly_analysis.json"
+
+
+def _auto_insights_path(dataset_id: str) -> Path:
+    return _dataset_path(dataset_id) / "auto_insights.json"
+
+
+def _build_auto_insights(
+    profile: dict[str, Any],
+    facts_bundle: dict[str, Any] | None,
+    anomalies: dict[str, Any] | None,
+    forecast_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Deterministic proactive insights (no LLM, no hallucination).
+
+    Surfaces trend, top segment, quality flags, anomalies and forecast
+    direction as ready-to-render cards with fact references.
+    """
+    cards: list[dict[str, Any]] = []
+    if facts_bundle:
+        for fact in (facts_bundle.get("insight_facts") or [])[:6]:
+            fid = str(fact.get("id", ""))
+            ftype = str(fact.get("type", ""))
+            val = fact.get("value") if isinstance(fact.get("value"), dict) else {}
+            if ftype == "trend":
+                metric = str(val.get("metric", "metric"))
+                pct = val.get("pct_change")
+                direction = "increased" if isinstance(pct, (int, float)) and pct > 0 else "decreased" if isinstance(pct, (int, float)) and pct < 0 else "moved"
+                text = f"{metric} {direction} {pct:.2f}% latest vs prior." if isinstance(pct, (int, float)) else f"{metric} trend available."
+                cards.append({"kind": "trend", "title": f"{metric} trend", "text": text, "fact_ids": [fid], "severity": "info"})
+            elif ftype == "comparison" and str(val.get("metric", "")).startswith("top_"):
+                cards.append({"kind": "segment", "title": "Top segment", "text": f"{val.get('segment_field')} leader {val.get('segment')} at {val.get('value')}.", "fact_ids": [fid], "severity": "info"})
+    for issue in (profile.get("quality_issues") or (facts_bundle.get("quality", {}).get("issues") if facts_bundle else []) or [])[:3]:
+        if isinstance(issue, dict):
+            cards.append({"kind": "quality", "title": str(issue.get("code", "Quality")), "text": str(issue.get("message", "")), "fact_ids": [], "severity": str(issue.get("severity", "medium"))})
+    if anomalies:
+        for item in (anomalies.get("anomalies") or [])[:4]:
+            if isinstance(item, dict):
+                cards.append({"kind": "anomaly", "title": str(item.get("title", "Anomaly")), "text": str(item.get("summary", "")), "fact_ids": [], "severity": str(item.get("severity", "medium"))})
+    if forecast_summary:
+        cards.append({"kind": "forecast", "title": "Forecast outlook", "text": str(forecast_summary.get("summary", "Forecast available.")), "fact_ids": [], "severity": "info"})
+    return {"generated_at": _utc_now_iso(), "card_count": len(cards), "cards": cards[:10]}
 
 
 def _cohort_path(dataset_id: str) -> Path:
@@ -7029,14 +7086,36 @@ def auto_run_pipeline(
         spec["version"] = dashboard_version
         _save_json(_dashboard_spec_path(dataset_id), spec)
 
-    # 4. Anomalies (sync, cheap)
+    # 4. Anomalies (sync, cheap) + best-effort forecast + proactive cards
     anomaly_count = 0
+    anomalies: dict[str, Any] | None = None
     try:
         anomalies = _build_anomaly_analysis(df, profile, limit=6)
         _save_json(_anomaly_path(dataset_id), anomalies)
         anomaly_count = int(anomalies.get("anomaly_count", 0))
     except Exception:
         anomalies = None
+
+    forecast_summary: dict[str, Any] | None = None
+    try:
+        time_cands = _time_candidates(profile)
+        num_cands = _numeric_metric_candidates(profile)
+        if time_cands and num_cands and len(df) >= 12:
+            fr = _build_forecast_run(
+                df, profile,
+                ForecastTrainRequest(time_field=time_cands[0], metric_field=num_cands[0], horizon=3, aggregation="sum"),
+                dataset_hash=file_hash,
+            )
+            forecast_summary = {"summary": str(fr.get("summary", "")), "champion": str(fr.get("champion_model", ""))}
+    except Exception:
+        forecast_summary = None
+
+    auto_insights: dict[str, Any] | None = None
+    try:
+        auto_insights = _build_auto_insights(profile, facts_bundle, anomalies, forecast_summary)
+        _save_json(_auto_insights_path(dataset_id), auto_insights)
+    except Exception:
+        auto_insights = None
 
     meta["artifacts"]["profile"] = str(_profile_path(dataset_id))
     if (_facts_path(dataset_id)).exists():
@@ -7045,12 +7124,15 @@ def auto_run_pipeline(
         meta["artifacts"]["dashboard_spec"] = str(_dashboard_spec_path(dataset_id))
     if (_anomaly_path(dataset_id)).exists():
         meta["artifacts"]["anomaly_analysis"] = str(_anomaly_path(dataset_id))
+    if (_auto_insights_path(dataset_id)).exists():
+        meta["artifacts"]["auto_insights"] = str(_auto_insights_path(dataset_id))
     meta["status"] = "auto_analyzed" if facts_bundle is not None else "auto_queued"
     _save_meta(dataset_id, meta)
     _append_audit(
         dataset_id, "auto_run_completed", actor,
         {"rows": rows, "cols": cols, "async": needs_async, "anomaly_count": anomaly_count,
-         "dashboard_version": dashboard_version, "facts_job_id": facts_job_id},
+         "dashboard_version": dashboard_version, "facts_job_id": facts_job_id,
+         "insight_cards": int((auto_insights or {}).get("card_count", 0))},
     )
     return {
         "dataset_id": dataset_id,
@@ -7060,9 +7142,23 @@ def auto_run_pipeline(
         "facts_job_id": facts_job_id,
         "dashboard_version": dashboard_version,
         "anomaly_count": anomaly_count,
+        "insight_cards": int((auto_insights or {}).get("card_count", 0)),
         "pii_masking_enabled": bool(meta.get("pii_masking_enabled", True)),
         "pii_candidates": profile.get("pii_candidates", []),
     }
+
+
+@app.get("/sessions/{dataset_id}/auto-insights")
+def get_auto_insights(
+    dataset_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    _authorized_session_context(dataset_id, action="read", x_api_key=x_api_key, x_user_role=x_user_role)
+    path = _auto_insights_path(dataset_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Auto-insights not generated yet. Run POST auto-run.")
+    return {"dataset_id": dataset_id, **_load_json(path)}
 
 
 def _execute_governed_ask(

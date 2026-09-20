@@ -16,11 +16,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /app/data_store
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      JWT_SECRET: ${JWT_SECRET:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AI_PROVIDER: ${AI_PROVIDER:-azure}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
@@ -44,6 +49,9 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /app/data_store
+      S3_BUCKET: ${S3_BUCKET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AI_PROVIDER: ${AI_PROVIDER:-azure}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}

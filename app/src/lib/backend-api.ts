@@ -886,6 +886,22 @@ export function createShareLink(datasetId: string, userId: string) {
   );
 }
 
+export interface AutoInsightCard {
+  kind: string;
+  title: string;
+  text: string;
+  fact_ids: string[];
+  severity: string;
+}
+
+export function getAutoInsights(datasetId: string, userId: string) {
+  return apiRequest<{ dataset_id: string; generated_at: string; card_count: number; cards: AutoInsightCard[] }>(
+    `/sessions/${datasetId}/auto-insights`,
+    undefined,
+    { userId }
+  );
+}
+
 export function importConnector(
   userId: string,
   payload: { source: string; url?: string; username?: string; password?: string; dataset_name?: string }

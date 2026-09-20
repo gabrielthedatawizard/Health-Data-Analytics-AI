@@ -39,12 +39,19 @@ import {
   BACKEND_USER_STORAGE_KEY,
   autoRunPipeline,
   createShareLink,
+  generateReport,
+  getAutoInsights,
   getDashboardSpec,
+  getJobStatus,
   getReviewQueue,
   getSystemStatus,
+  listDashboardVersions,
   listJobs,
+  restoreDashboardVersion,
   retryJob,
+  type AutoInsightCard,
   type BackendUserRole,
+  type DashboardVersionItem,
   type JobStatus,
   type ReviewQueueItem,
   type SystemStatusResponse,
@@ -178,6 +185,9 @@ export function Dashboard({ onViewChange }: DashboardProps) {
   const [governedSpec, setGovernedSpec] = useState<Record<string, any> | null>(null);
   const [governedSpecError, setGovernedSpecError] = useState<string | null>(null);
   const [autoRunning, setAutoRunning] = useState(false);
+  const [autoCards, setAutoCards] = useState<AutoInsightCard[]>([]);
+  const [versions, setVersions] = useState<DashboardVersionItem[]>([]);
+  const [reportBusy, setReportBusy] = useState(false);
 
   const sortedDatasets = useMemo(
     () => [...datasets].sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated)),
@@ -334,13 +344,21 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       try {
         const actor =
           (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
-        const specResp = await getDashboardSpec(latestDataset.id, actor);
+        const [specResp, insightsResp, versionsResp] = await Promise.all([
+          getDashboardSpec(latestDataset.id, actor),
+          getAutoInsights(latestDataset.id, actor).catch(() => null),
+          listDashboardVersions(latestDataset.id, actor).catch(() => null),
+        ]);
         if (!active) return;
         setGovernedSpec(specResp.dashboard_spec as Record<string, any>);
         setGovernedSpecError(null);
+        setAutoCards(insightsResp?.cards ?? []);
+        setVersions(versionsResp?.versions ?? []);
       } catch (error) {
         if (!active) return;
         setGovernedSpec(null);
+        setAutoCards([]);
+        setVersions([]);
         setGovernedSpecError(error instanceof Error ? error.message : 'No governed spec yet');
       }
     }
@@ -357,10 +375,16 @@ export function Dashboard({ onViewChange }: DashboardProps) {
     setAutoRunning(true);
     try {
       const result = await autoRunPipeline(latestDataset.id, actor);
-      toast.success(`Auto-analysis ${result.status}: ${result.anomaly_count} anomalies, PII masked`);
+      toast.success(`Auto-analysis ${result.status}: ${(result as any).anomaly_count ?? 0} anomalies, ${(result as any).insight_cards ?? 0} cards, PII masked`);
       try {
-        const specResp = await getDashboardSpec(latestDataset.id, actor);
+        const [specResp, insightsResp, versionsResp] = await Promise.all([
+          getDashboardSpec(latestDataset.id, actor),
+          getAutoInsights(latestDataset.id, actor).catch(() => null),
+          listDashboardVersions(latestDataset.id, actor).catch(() => null),
+        ]);
         setGovernedSpec(specResp.dashboard_spec as Record<string, any>);
+        if (insightsResp) setAutoCards(insightsResp.cards ?? []);
+        if (versionsResp) setVersions(versionsResp.versions ?? []);
       } catch {
         // spec may still be queued for large files
       }
@@ -369,6 +393,45 @@ export function Dashboard({ onViewChange }: DashboardProps) {
       toast.error(error instanceof Error ? error.message : 'Auto-run failed');
     } finally {
       setAutoRunning(false);
+    }
+  }
+
+  async function handleGenerateReport() {
+    if (!latestDataset) return;
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    setReportBusy(true);
+    try {
+      const queued = await generateReport(latestDataset.id, actor);
+      const jobId = (queued as any).job_id as string;
+      toast.info(`Report queued (${jobId.slice(0, 8)}…) — polling`);
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const job = await getJobStatus(jobId, actor);
+        if (job.status === 'succeeded') {
+          toast.success('Report ready — open AI Analyst for PDF/HTML links');
+          break;
+        }
+        if (job.status === 'failed') throw new Error(job.error?.message || 'Report failed');
+      }
+      await refreshOperatorPanels();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Report failed');
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
+  async function handleRestoreVersion(version: string) {
+    if (!latestDataset) return;
+    const actor =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(BACKEND_USER_STORAGE_KEY) : null) || 'react_user';
+    try {
+      const res = await restoreDashboardVersion(latestDataset.id, version, actor);
+      setGovernedSpec(res.dashboard_spec as Record<string, any>);
+      toast.success(`Restored ${version}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Restore failed');
     }
   }
 
@@ -600,6 +663,10 @@ export function Dashboard({ onViewChange }: DashboardProps) {
               {autoRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
               {autoRunning ? 'Auto-running…' : 'Auto-run latest'}
             </Button>
+            <Button variant="outline" className="gap-2" onClick={() => void handleGenerateReport()} disabled={!latestDataset || reportBusy || !governedSpec}>
+              {reportBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <BarChart3 className="h-4 w-4" />}
+              {reportBusy ? 'Queuing…' : 'Generate report'}
+            </Button>
             <Button variant="outline" className="gap-2" onClick={() => void handleShareLatest()} disabled={!latestDataset || !governedSpec}>
               <Shield className="h-4 w-4" />
               Copy masked share link
@@ -622,6 +689,35 @@ export function Dashboard({ onViewChange }: DashboardProps) {
                   <p className="mt-1 text-xs text-muted-foreground">Grounded • {String((kpi.facts_refs as string[])?.[0] ?? 'fact')}</p>
                 </CardContent>
               </Card>
+            ))}
+          </div>
+        )}
+        {autoCards.length > 0 && (
+          <div className="mt-4 space-y-2">
+            <p className="text-sm font-medium text-foreground">Proactive alerts (deterministic, no LLM)</p>
+            <div className="grid gap-3 md:grid-cols-2">
+              {autoCards.slice(0, 4).map((card, idx) => (
+                <Card key={`${card.kind}-${idx}`} className="border-border bg-background/80">
+                  <CardContent className="p-4">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline">{card.kind}</Badge>
+                      <Badge variant="outline">{card.severity}</Badge>
+                    </div>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{card.title}</p>
+                    <p className="mt-1 text-sm text-muted-foreground">{card.text}</p>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+        {versions.length > 0 && (
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">Versions: {versions.length}</span>
+            {versions.slice(0, 5).map((v) => (
+              <Button key={v.version} variant="ghost" size="sm" onClick={() => void handleRestoreVersion(v.version)}>
+                Restore {v.version.slice(0, 12)} ({v.chart_count} charts)
+              </Button>
             ))}
           </div>
         )}
