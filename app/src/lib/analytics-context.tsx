@@ -69,6 +69,7 @@ interface AnalyticsContextValue {
   insights: InsightRecord[];
   aiEnvironment: AIEnvironmentState;
   activeUpload: WorkspaceUploadState | null;
+  refreshWorkspace: () => Promise<void>;
   uploadFile: (
     file: File,
     onProgress?: UploadProgressHandler,
@@ -1273,12 +1274,17 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
     setActiveUpload(null);
   }, []);
 
+  const refreshWorkspace = useCallback(async () => {
+    await refreshDatasets();
+  }, [refreshDatasets]);
+
   const value = useMemo<AnalyticsContextValue>(
     () => ({
       datasets,
       insights,
       aiEnvironment,
       activeUpload,
+      refreshWorkspace,
       uploadFile,
       addSampleDataset,
       removeDataset,
@@ -1306,6 +1312,7 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
       flagInsight,
       insights,
       loadDatasetPreview,
+      refreshWorkspace,
       removeDataset,
       renameDataset,
       setInsightFeedback,

@@ -46,13 +46,16 @@ function datasetTypeIcon(type: DatasetRecord['type']) {
 
 export function DataUpload({ onViewChange }: DataUploadProps) {
   const { t, formatTime } = useI18n();
-  const { datasets, uploadFile, removeDataset, analyzeDataset, addSampleDataset, aiEnvironment, activeUpload, dismissActiveUpload } =
+  const { datasets, uploadFile, removeDataset, analyzeDataset, addSampleDataset, refreshWorkspace, aiEnvironment, activeUpload, dismissActiveUpload } =
     useAnalytics();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [sheetName, setSheetName] = useState('');
+  const [connectorUrl, setConnectorUrl] = useState('');
+  const [connectorName, setConnectorName] = useState('');
+  const [connectorBusy, setConnectorBusy] = useState(false);
 
   const sortedDatasets = useMemo(() => {
     return [...datasets].sort((left, right) => right.uploadedAt.localeCompare(left.uploadedAt));
@@ -347,6 +350,46 @@ export function DataUpload({ onViewChange }: DataUploadProps) {
           </Card>
         </button>
       </div>
+
+      <Card className="glass-card">
+        <CardContent className="space-y-3 p-5">
+          <h4 className="font-medium text-foreground">Live connector — DHIS2 / JSON URL (no fake data)</h4>
+          <p className="text-xs text-muted-foreground">Fetches a JSON array or DHIS2 analytics payload into a governed session with PII masking on. Postgres/MySQL return guidance to export CSV.</p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input
+              value={connectorUrl}
+              onChange={(e) => setConnectorUrl(e.target.value)}
+              placeholder="https://dhis2.example/api/analytics.json?..."
+              className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 text-sm"
+            />
+            <input
+              value={connectorName}
+              onChange={(e) => setConnectorName(e.target.value)}
+              placeholder="Dataset name (optional)"
+              className="h-9 w-48 rounded-md border border-input bg-transparent px-3 text-sm"
+            />
+            <Button
+              disabled={!connectorUrl.trim() || connectorBusy}
+              onClick={() => {
+                setConnectorBusy(true);
+                import('@/lib/backend-api').then(({ importConnector }) => {
+                  const actor = localStorage.getItem('healthai_backend_user_id') || 'react_user';
+                  return importConnector(actor, { source: 'dhis2', url: connectorUrl.trim(), dataset_name: connectorName.trim() || undefined });
+                }).then((res) => {
+                  toast.success(`Connector imported ${(res as any).rows} rows → ${(res as any).dataset_id.slice(0, 8)}`);
+                  setConnectorUrl('');
+                  return refreshWorkspace();
+                }).then(() => onViewChange('datasets'))
+                .catch((e) => toast.error(e instanceof Error ? e.message : 'Connector import failed'))
+                .finally(() => setConnectorBusy(false));
+              }}
+            >
+              {connectorBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+              Import
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       <div>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">

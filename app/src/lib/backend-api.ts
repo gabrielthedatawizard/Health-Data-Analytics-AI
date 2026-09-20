@@ -886,6 +886,25 @@ export function createShareLink(datasetId: string, userId: string) {
   );
 }
 
+export function importConnector(
+  userId: string,
+  payload: { source: string; url?: string; username?: string; password?: string; dataset_name?: string }
+) {
+  return apiRequest<{ dataset_id: string; rows: number; cols: number; source: string }>(
+    '/connectors/import',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    { userId, timeoutMs: 120000 }
+  );
+}
+
+export function issueToken(actor: string, role?: string) {
+  return apiRequest<{ access_token: string; token_type: string; actor: string; role: string }>(
+    '/auth/token',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor, role }) },
+    { timeoutMs: 30000 }
+  );
+}
+
 export function getProfile(datasetId: string, userId: string) {
   return apiRequest<ProfileResponse>(`/sessions/${datasetId}/profile`, undefined, { userId });
 }

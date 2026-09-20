@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import html
 import io
 import json
+import logging
+import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,10 +17,18 @@ from typing import Any
 
 import pandas as pd
 import plotly.express as px
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Response as FastAPIResponse, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger("healthai")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper() if hasattr(os.getenv("LOG_LEVEL", "INFO"), "upper") else "INFO")
 
 try:
     from pypdf import PdfReader
@@ -36,8 +48,13 @@ from backend.semantic_layer import (
     validate_and_resolve_query_plan,
 )
 
-DATA_DIR = Path("data_store")
+DATA_DIR = Path(os.getenv("DATA_DIR", "data_store"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# S3-ready: when S3_BUCKET is set, raw uploads are mirrored via boto3 if
+# available; local data_store remains the source of truth (fallback).
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip() or None
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or None
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()] or ["*"]
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx"}
@@ -202,12 +219,105 @@ _llm_client: LLMClient | None = None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this in production
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_METRICS: dict[str, Any] = {
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "requests_total": 0,
+    "requests_by_path": {},
+    "errors_total": 0,
+    "total_latency_ms": 0.0,
+}
+_RATE_BUCKETS: dict[str, list[float]] = {}
+RATE_LIMITS = {
+    # path prefix -> (max_requests, window_seconds)
+    "/sessions/": (120, 60),
+    "/ask": (60, 60),
+    "/upload": (30, 60),
+    "/report": (30, 60),
+}
+
+
+def _check_rate_limit(key: str, limit: int, window: float) -> bool:
+    now = time.monotonic()
+    bucket = _RATE_BUCKETS.setdefault(key, [])
+    cutoff = now - window
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    return True
+
+
+class ObservabilityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        start = time.monotonic()
+        # Rate limit sensitive prefixes per client IP + actor.
+        client_ip = request.client.host if request.client else "unknown"
+        actor_hint = request.headers.get("X-API-Key", "")[:32]
+        path = request.url.path
+        limited = False
+        for prefix, (limit, window) in RATE_LIMITS.items():
+            if prefix in path and (request.method in {"POST", "PUT", "PATCH"} or prefix == "/sessions/"):
+                rl_key = f"{prefix}:{client_ip}:{actor_hint}"
+                if not _check_rate_limit(rl_key, limit, window):
+                    limited = True
+                    break
+        if limited:
+            return Response(content=json.dumps({"detail": "Rate limit exceeded. Retry shortly."}), media_type="application/json", status_code=429, headers={"X-Request-ID": request_id})
+        try:
+            response = await call_next(request)
+            latency_ms = (time.monotonic() - start) * 1000
+            _METRICS["requests_total"] += 1
+            _METRICS["total_latency_ms"] += latency_ms
+            by_path = _METRICS["requests_by_path"]
+            by_path[path] = by_path.get(path, 0) + 1
+            if response.status_code >= 500:
+                _METRICS["errors_total"] += 1
+            response.headers["X-Request-ID"] = request_id
+            logger.info(json.dumps({
+                "event": "http_request", "request_id": request_id,
+                "method": request.method, "path": path,
+                "status": response.status_code, "latency_ms": round(latency_ms, 2),
+            }))
+            return response
+        except Exception as exc:
+            _METRICS["errors_total"] += 1
+            logger.info(json.dumps({"event": "http_error", "request_id": request_id, "path": path, "error": str(exc)[:300]}))
+            raise
+
+
+app.add_middleware(ObservabilityMiddleware)
 app.include_router(ai_analytics_router)
+
+
+@app.get("/metrics")
+def prometheus_metrics() -> PlainTextResponse:
+    total = int(_METRICS.get("requests_total", 0))
+    errors = int(_METRICS.get("errors_total", 0))
+    avg_lat = (_METRICS.get("total_latency_ms", 0.0) / total) if total else 0.0
+    lines = [
+        "# HELP healthai_requests_total Total HTTP requests",
+        "# TYPE healthai_requests_total counter",
+        f"healthai_requests_total {total}",
+        "# HELP healthai_errors_total Total 5xx/errors",
+        "# TYPE healthai_errors_total counter",
+        f"healthai_errors_total {errors}",
+        "# HELP healthai_latency_avg_ms Average latency ms",
+        "# TYPE healthai_latency_avg_ms gauge",
+        f"healthai_latency_avg_ms {avg_lat:.2f}",
+    ]
+    for path, count in sorted(_METRICS.get("requests_by_path", {}).items())[:50]:
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", path)[:80]
+        lines.append(f'healthai_path_requests{{path="{safe}"}} {count}')
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 class CreateSessionRequest(BaseModel):
@@ -869,6 +979,18 @@ def _document_chunks_path(document_id: str) -> Path:
     return _document_path(document_id) / "chunks.json"
 
 
+def _mirror_to_s3(local_path: Path, key: str) -> None:
+    if not S3_BUCKET:
+        return
+    try:
+        import boto3  # type: ignore
+
+        s3 = boto3.client("s3")
+        s3.upload_file(str(local_path), S3_BUCKET, key)
+    except Exception as exc:
+        logger.info(json.dumps({"event": "s3_mirror_failed", "key": key, "error": str(exc)[:200]}))
+
+
 def _profile_path(dataset_id: str) -> Path:
     return _dataset_path(dataset_id) / "profile.json"
 
@@ -1474,6 +1596,61 @@ def _role_from_identity(actor: str, explicit_role: str | None = None) -> str:
 
 def _permissions_for_role(role: str) -> list[str]:
     return list(ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["analyst"]))
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _issue_jwt(actor: str, role: str, expires_minutes: int = 720) -> str:
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET not configured.")
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps({
+        "sub": actor, "role": role,
+        "exp": int((datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)).timestamp()),
+        "iat": int(datetime.now(timezone.utc).timestamp()),
+    }).encode()).decode().rstrip("=")
+    sig = base64.urlsafe_b64encode(hmac.new(JWT_SECRET.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()).decode().rstrip("=")
+    return f"{header}.{payload}.{sig}"
+
+
+def _verify_jwt(token: str) -> dict[str, Any] | None:
+    if not JWT_SECRET:
+        return None
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        expected = base64.urlsafe_b64encode(
+            hmac.new(JWT_SECRET.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
+        ).decode().rstrip("=")
+        if not hmac.compare_digest(expected, sig_b64):
+            return None
+        payload = json.loads(_b64url_decode(payload_b64))
+        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _require_privileged_jwt(authorization: str | None, required: str = "reviewer") -> dict[str, Any] | None:
+    """When JWT_SECRET is set, privileged actions require Bearer JWT.
+
+    Returns verified payload, or None when JWT is not enforced (no secret).
+    Raises 401/403 when enforced but missing/invalid/insufficient.
+    """
+    if not JWT_SECRET:
+        return None
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer JWT required for this privileged action.")
+    payload = _verify_jwt(authorization.removeprefix("Bearer ").strip())
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired JWT.")
+    role = str(payload.get("role", "viewer"))
+    if _ROLE_RANK.get(role, 0) < _ROLE_RANK.get(required, 2):
+        raise HTTPException(status_code=403, detail=f"JWT role {role} insufficient (need {required}).")
+    return payload
 
 
 def _session_owner(meta: dict[str, Any]) -> str:
@@ -4928,6 +5105,116 @@ def get_auth_context(
     return AuthContextResponse(actor=actor, role=role, permissions=permissions)
 
 
+class TokenRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=128)
+    role: str | None = None
+
+
+@app.post("/auth/token")
+def issue_token(payload: TokenRequest) -> dict[str, Any]:
+    # Issues HMAC JWT when JWT_SECRET is configured. Role is capped at
+    # identity-inferred rank (no escalation via token request).
+    actor = payload.actor.strip()
+    inferred = _identity_inferred_role(actor)
+    requested = _normalize_role(payload.role) or inferred
+    if _ROLE_RANK.get(requested, 0) > _ROLE_RANK.get(inferred, 0):
+        requested = inferred
+    token = _issue_jwt(actor, requested)
+    return {"access_token": token, "token_type": "bearer", "actor": actor, "role": requested}
+
+
+class ConnectorImportRequest(BaseModel):
+    source: str = Field(description="dhis2|json_url|postgres (postgres returns guidance)")
+    url: str | None = Field(default=None, description="DHIS2 analytics JSON URL or generic JSON array URL")
+    username: str | None = None
+    password: str | None = None
+    dataset_name: str | None = None
+    timeout_seconds: int = 30
+
+
+@app.post("/connectors/import")
+def import_connector(
+    payload: ConnectorImportRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+) -> dict[str, Any]:
+    """Real connector (automatic engine): fetch remote JSON array -> governed session.
+
+    Supports DHIS2 analytics JSON and any JSON-array URL. Postgres/MySQL return
+    actionable guidance (no driver in MVP) instead of fake sample data.
+    """
+    actor, role, permissions = _resolve_auth_context(x_api_key, x_user_role)
+    if "sessions:create" not in permissions:
+        raise HTTPException(status_code=403, detail=f"{role} is not allowed to create sessions.")
+    source = (payload.source or "").strip().lower()
+    if source in {"postgres", "mysql"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Direct DB connectors need DATABASE_URL allowlisting. Export CSV from the DB or set S3_BUCKET + presigned URL, then upload.",
+        )
+    if source not in {"dhis2", "json_url", "json"}:
+        raise HTTPException(status_code=400, detail="Unsupported source. Use dhis2|json_url.")
+    if not payload.url:
+        raise HTTPException(status_code=400, detail="url is required for dhis2|json_url import.")
+    import urllib.request
+
+    req = urllib.request.Request(payload.url, headers={"User-Agent": "HealthAI-connector/1.0"})
+    if payload.username and payload.password:
+        creds = base64.b64encode(f"{payload.username}:{payload.password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+    try:
+        with urllib.request.urlopen(req, timeout=max(5, min(120, payload.timeout_seconds))) as resp:
+            raw = resp.read()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Connector fetch failed: {exc}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Connector did not return JSON: {exc}") from exc
+    # Normalize: list | {rows: [...]} | {data: [...]} | DHIS2 {headers, rows, metaData}
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        rows = [r for r in data if isinstance(r, dict)][:5000]
+    elif isinstance(data, dict) and isinstance(data.get("rows"), list) and isinstance(data.get("headers"), list):
+        headers = [str(h.get("name") or h.get("column") or f"col_{i}") for i, h in enumerate(data["headers"])]
+        for r in data["rows"][:5000]:
+            if isinstance(r, list):
+                rows.append({headers[i] if i < len(headers) else f"col_{i}": (r[i] if i < len(r) else None) for i in range(max(len(headers), len(r)))})
+    elif isinstance(data, dict):
+        for key in ("data", "records", "results", "items"):
+            if isinstance(data.get(key), list):
+                rows = [r for r in data[key] if isinstance(r, dict)][:5000]
+                break
+    if not rows:
+        raise HTTPException(status_code=502, detail="No tabular rows found at connector URL.")
+    df = pd.DataFrame(rows)
+    dataset_id = str(uuid.uuid4())
+    session_dir = _dataset_path(dataset_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    now = _utc_now_iso()
+    name = (payload.dataset_name or f"{source}_import").strip() or f"{source}_import"
+    raw_path = session_dir / "raw.csv"
+    df.to_csv(raw_path, index=False)
+    meta = {
+        "dataset_id": dataset_id, "created_at": now, "updated_at": now, "status": "uploaded",
+        "created_by": actor, "user_id": actor, "display_name": name,
+        "description": f"Imported from {source} connector ({payload.url[:120]})",
+        "pii_masking_enabled": True, "allow_sensitive_export": False,
+        "sensitive_export_approval": _default_sensitive_export_approval(),
+        "file": {"filename": f"{name}.csv", "extension": ".csv", "size_bytes": int(raw_path.stat().st_size),
+                 "raw_path": str(raw_path), "uploaded_at": now, "uploaded_by": actor, "connector": source},
+        "file_hash": _dataset_signature({"file": {"raw_path": str(raw_path)}}),
+        "artifacts": {},
+    }
+    _save_json(_meta_path(dataset_id), meta)
+    _append_audit(dataset_id, "connector_imported", actor, {"source": source, "rows": len(df)})
+    try:
+        _mirror_to_s3(raw_path, f"{dataset_id}/raw.csv")
+    except Exception:
+        pass
+    return {"dataset_id": dataset_id, "rows": len(df), "cols": int(df.shape[1]), "source": source}
+
+
 @app.get("/documents")
 def list_documents(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -5312,7 +5599,9 @@ def decide_sensitive_export_approval(
     payload: SensitiveExportApprovalDecision,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> dict[str, Any]:
+    _require_privileged_jwt(authorization, required="reviewer")
     meta, actor, _ = _authorized_session_context(
         dataset_id,
         action="review_sensitive_export",
@@ -5398,6 +5687,11 @@ async def upload_file(
     file_meta["raw_path"] = str(raw_path)
     file_meta["uploaded_at"] = _utc_now_iso()
     file_meta["uploaded_by"] = actor
+    # S3-ready mirror (best-effort, local remains source of truth).
+    try:
+        _mirror_to_s3(raw_path, f"{dataset_id}/{stored_name}")
+    except Exception:
+        pass
 
     preserved_artifacts: dict[str, str] = {}
     if _saved_investigations_path(dataset_id).exists():
@@ -5918,7 +6212,9 @@ def promote_ml_run(
     request: ModelPromotionRequest,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> ModelRegistryEntry:
+    _require_privileged_jwt(authorization, required="reviewer")
     meta, actor, _ = _authorized_session_context(dataset_id, action="promote_ml", x_api_key=x_api_key, x_user_role=x_user_role)
     runs = _load_ml_runs(dataset_id)
     selected = next((item for item in runs if str(item.get("run_id")) == run_id), None)
@@ -6123,7 +6419,9 @@ def review_workflow_action(
     request: WorkflowDecisionRequest,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_user_role: str | None = Header(default=None, alias="X-User-Role"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> WorkflowActionRecord:
+    _require_privileged_jwt(authorization, required="reviewer")
     meta, actor, _ = _authorized_session_context(dataset_id, action="review_workflow", x_api_key=x_api_key, x_user_role=x_user_role)
     actions = _load_workflow_actions(dataset_id)
     index = _workflow_action_index(actions, action_id)
