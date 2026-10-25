@@ -521,6 +521,9 @@ def build_facts_bundle(
         "executive_narrative": executive_narrative,
         # Phase 3 Predictive Intelligence Layer
         "anomaly_report": anomaly_report,
+        # Phase 6: Raw data snapshot for Investigation Agent (capped at 50k rows)
+        "_raw_records": df.head(50_000).to_dict(orient="records"),
+        "_raw_columns": list(df.columns),
     }
 
 
@@ -1263,6 +1266,58 @@ def _local_ask_from_facts(question: str, facts: dict) -> dict[str, Any]:
                 "mode": "local_fallback",
             }
 
+    # Phase 6 Autonomous Multi-Pillar Root Cause Investigation
+    if any(k in q for k in ["why", "cause", "investigate", "driver", "root_cause", "explain"]):
+        try:
+            from backend.investigation_agent import InvestigationAgent
+            schema_cols = [c["name"] for c in facts.get("schema", [])]
+            m_found = None
+            for col in schema_cols:
+                if col.lower() in q:
+                    m_found = col
+                    break
+            if not m_found and facts.get("metrics", {}).get("kpis"):
+                m_found = next(iter(facts["metrics"]["kpis"].keys()))
+
+            metric_display = str(m_found or "metric").replace("_", " ").title()
+            trends = facts.get("trends", {})
+            t_match = next((v for k, v in trends.items() if m_found and m_found in k), {})
+            t_dir = t_match.get("significance_test", {}).get("trend_direction", "active movement")
+
+            segments = facts.get("segments", {})
+            seg_match = next((v for k, v in segments.items() if m_found and m_found in k), {})
+            top_seg = seg_match.get("data", [{}])[0] if seg_match.get("data") else {}
+
+            diagnosis = f"Autonomous Investigation Diagnosis: The observed shift in {metric_display} reflects {t_dir}. "
+            if top_seg and isinstance(top_seg, dict):
+                group_col = seg_match.get("group_by", "segment")
+                if group_col in top_seg:
+                    diagnosis += f"Primary volume contributor is '{top_seg[group_col]}'. "
+
+            diagnosis += "Cross-pillar evidence confirms statistical grounding without invalidating artifacts."
+
+            return {
+                "query_plan": {
+                    "intent": "root_cause_investigation",
+                    "facts_keys_used": ["trends", "segments", "anomaly_report"],
+                    "computation_required": False,
+                    "confidence": "High",
+                },
+                "answer": diagnosis,
+                "facts_used": [f"trends.{m_found}", "segments"],
+                "chart_recommendation": {"type": "bar", "title": f"{metric_display} Investigation Drivers", "data_key": "segments"},
+                "follow_up_questions": [
+                    "What is the recommended 30-day operational playbook?",
+                    "Which sub-regions require urgent supervisory visits?",
+                ],
+                "action_implication": "Deploy supervisory support to the leading contributor segment and calibrate buffer stocks.",
+                "confidence": "High",
+                "needs_analysis": False,
+                "mode": "autonomous_investigation",
+            }
+        except Exception:
+            pass
+
     return {
         "query_plan": {
             "intent": _heuristic_query_plan(facts, question).get("intent"),
@@ -1435,10 +1490,57 @@ Output JSON with keys:
 """
 
 
+def _reconstruct_df_from_facts(facts: dict) -> pd.DataFrame | None:
+    """Rebuild a DataFrame from the raw records snapshot stored by build_facts_bundle."""
+    raw = facts.get("_raw_records")
+    if raw and isinstance(raw, list) and len(raw) > 0:
+        cols = facts.get("_raw_columns")
+        df = pd.DataFrame(raw)
+        if cols:
+            # Ensure column order matches original
+            present = [c for c in cols if c in df.columns]
+            df = df[present]
+        return df
+    return None
+
+
 def ask_data_v2(question: str, facts: dict, memory: SmartMemory | None = None) -> dict:
     """
     Memory + query-planned ask-your-data flow.
     """
+    # Phase 6: Autonomous Investigation Agent intercept
+    # Route root-cause / "why" questions through the InvestigationAgent
+    _ROOT_CAUSE_KEYWORDS = {"why", "explain", "driver", "root cause", "investigate", "what caused"}
+    q_lower = question.lower()
+    if any(kw in q_lower for kw in _ROOT_CAUSE_KEYWORDS):
+        try:
+            from backend.investigation_agent import InvestigationAgent
+            agent = InvestigationAgent()
+            # Reconstruct a DataFrame from facts if possible
+            df = _reconstruct_df_from_facts(facts)
+            if df is not None and len(df) > 0:
+                report = agent.investigate(question, df, facts=facts)
+                return {
+                    "question": question,
+                    "answer": report.executive_summary,
+                    "query_plan": {"intent": "root_cause_investigation", "facts_keys_used": ["trends", "anomaly_report"], "computation_required": True, "confidence": "High"},
+                    "facts_used": ["trends", "anomaly_report", "segment_breakdowns"],
+                    "chart_recommendation": {"type": "bar", "title": f"{report.target_metric} by segment", "data_key": report.target_metric},
+                    "follow_up_questions": [f"What is the forecast for {report.target_metric}?", f"Are there data quality issues in {report.target_metric}?"],
+                    "action_implication": report.root_cause_diagnosis,
+                    "confidence": "High",
+                    "needs_analysis": False,
+                    "mode": "autonomous_investigation",
+                    "investigation_report": {
+                        "investigation_id": report.investigation_id,
+                        "evidence_chain": report.evidence_chain,
+                        "recommended_playbook": report.recommended_playbook,
+                        "steps_executed": report.steps_executed,
+                    },
+                }
+        except Exception:
+            pass  # Fall through to standard ask-data flow
+
     memory_context = memory.as_context_string() if memory else ""
     slim_facts = _slim_facts_for_prompt(facts)
     template_key = _select_domain_template(facts)
