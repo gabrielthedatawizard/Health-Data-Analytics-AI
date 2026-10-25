@@ -881,6 +881,16 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
         if (!active) return;
         const message = error instanceof Error ? error.message : 'Could not load governed datasets.';
         markEnvironmentError(message);
+        // If backend was sleeping, retry connecting in 6s once awake
+        window.setTimeout(() => {
+          if (active) {
+            refreshDatasets()
+              .then(() => {
+                if (active) markEnvironmentReady();
+              })
+              .catch(() => {});
+          }
+        }, 6000);
       });
 
     return () => {

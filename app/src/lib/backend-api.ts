@@ -657,39 +657,60 @@ export async function apiRequest<T>(
     timeoutMs?: number;
     userId?: string;
     userRole?: BackendUserRole;
+    retries?: number;
   }
 ): Promise<T> {
   const url = apiUrl(path);
-  const controller = new AbortController();
-  const timeoutMs = options?.timeoutMs ?? 60000;
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-  const headers = new Headers(init?.headers ?? {});
-  const resolvedUserId = options?.userId?.trim() || storedBackendUserId();
-  const resolvedUserRole = options?.userRole || storedBackendUserRole();
-  if (resolvedUserId) {
-    headers.set('X-API-Key', resolvedUserId);
-  }
-  if (resolvedUserRole) {
-    headers.set('X-User-Role', resolvedUserRole);
-  }
+  const timeoutMs = options?.timeoutMs ?? 120000;
+  const maxRetries = options?.retries ?? (init?.method === 'GET' || path === '/sessions' ? 2 : 1);
+  let attempt = 0;
 
-  try {
-    const response = await fetch(url, {
-      ...init,
-      headers,
-      signal: controller.signal,
-    });
-    return await parseResponse<T>(response);
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error(`Request timed out for ${url}.`);
+  while (true) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    const headers = new Headers(init?.headers ?? {});
+    const resolvedUserId = options?.userId?.trim() || storedBackendUserId();
+    const resolvedUserRole = options?.userRole || storedBackendUserRole();
+    if (resolvedUserId) {
+      headers.set('X-API-Key', resolvedUserId);
     }
-    if (error instanceof Error) {
-      throw new Error(`Could not reach API at ${url}: ${error.message}`);
+    if (resolvedUserRole) {
+      headers.set('X-User-Role', resolvedUserRole);
     }
-    throw new Error(`Could not reach API at ${url}.`);
-  } finally {
-    window.clearTimeout(timeout);
+
+    try {
+      const response = await fetch(url, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      return await parseResponse<T>(response);
+    } catch (error) {
+      attempt += 1;
+      const isAbort = error instanceof DOMException && error.name === 'AbortError';
+      const isNetworkError =
+        error instanceof TypeError &&
+        (error.message.includes('fetch') || error.message.includes('network') || error.message.includes('Failed to fetch'));
+
+      if (attempt <= maxRetries && (isNetworkError || isAbort)) {
+        await new Promise((resolve) => window.setTimeout(resolve, 3000));
+        continue;
+      }
+
+      if (isAbort) {
+        throw new Error(`Request timed out for ${url} (server may be waking up from sleep).`);
+      }
+      if (error instanceof Error) {
+        const coldStartHint =
+          error.message.includes('Failed to fetch')
+            ? ' (the server may be waking up from sleep, please try again in a moment)'
+            : '';
+        throw new Error(`Could not reach API at ${url}: ${error.message}${coldStartHint}`);
+      }
+      throw new Error(`Could not reach API at ${url}.`);
+    } finally {
+      window.clearTimeout(timeout);
+    }
   }
 }
 
@@ -777,16 +798,16 @@ export function createSession(
         ...(payload ?? {}),
       }),
     },
-    { userId }
+    { userId, timeoutMs: 120000, retries: 2 }
   );
 }
 
 export function getSession(datasetId: string, userId: string) {
-  return apiRequest<SessionMeta>(`/sessions/${datasetId}`, undefined, { userId });
+  return apiRequest<SessionMeta>(`/sessions/${datasetId}`, undefined, { userId, timeoutMs: 60000, retries: 2 });
 }
 
 export function listSessions(userId: string) {
-  return apiRequest<{ sessions: SessionSummary[] }>('/sessions', undefined, { userId });
+  return apiRequest<{ sessions: SessionSummary[] }>('/sessions', undefined, { userId, timeoutMs: 90000, retries: 2 });
 }
 
 export function updateSession(datasetId: string, userId: string, payload: { display_name?: string; description?: string }) {
