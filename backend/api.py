@@ -382,6 +382,266 @@ def run_pipeline_direct(file_path: str, question: str | None = None) -> dict[str
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+# ───────────────────────────────────────────────────────────────
+# Phase 1 — Deep Data Understanding Endpoints
+# ───────────────────────────────────────────────────────────────
+
+@router.get("/api/v1/sessions/{session_id}/schema-intelligence")
+def schema_intelligence(session_id: str) -> dict[str, Any]:
+    """Deep column analysis: semantic types, units, hierarchies, temporal patterns."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    facts = sess["facts"]
+    return {
+        "session_id": session_id,
+        "data_dictionary": facts.get("data_dictionary"),
+        "star_schema": facts.get("star_schema"),
+    }
+
+
+@router.get("/api/v1/sessions/{session_id}/data-relationships")
+def data_relationships(session_id: str) -> dict[str, Any]:
+    """Entity-relationship graph: topology, hierarchies, functional dependencies."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    facts = sess["facts"]
+    return {
+        "session_id": session_id,
+        "topology": facts.get("topology"),
+        "star_schema": facts.get("star_schema"),
+    }
+
+
+@router.get("/api/v1/sessions/{session_id}/quality-diagnosis")
+def quality_diagnosis(session_id: str) -> dict[str, Any]:
+    """Root-cause quality analysis: missingness, data entry errors, imputation strategies."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    facts = sess["facts"]
+    return {
+        "session_id": session_id,
+        "quality_report_card": facts.get("quality_report_card"),
+        "quality": facts.get("quality", {}),
+    }
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase 2 — Statistical Reasoning Endpoints
+# ───────────────────────────────────────────────────────────────
+
+@router.get("/api/v1/sessions/{session_id}/statistical-tests")
+def statistical_tests(session_id: str) -> dict[str, Any]:
+    """Significance tests on key metrics: trend tests, changepoints, effect sizes."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    facts = sess["facts"]
+    # Extract significance tests from trends
+    stat_results = {}
+    for key, trend in facts.get("trends", {}).items():
+        if "significance_test" in trend:
+            stat_results[key] = {
+                "significance_test": trend["significance_test"],
+                "changepoints": trend.get("changepoints", []),
+            }
+    return {
+        "session_id": session_id,
+        "statistical_results": stat_results,
+        "executive_narrative": facts.get("executive_narrative", ""),
+    }
+
+
+class CompareRequest(BaseModel):
+    metric: str
+    segment_column: str
+
+
+@router.post("/api/v1/sessions/{session_id}/compare")
+def statistical_comparison(session_id: str, body: CompareRequest) -> dict[str, Any]:
+    """Statistical comparison between segments for a specific metric."""
+    sess = _assert_session_with_data(session_id)
+    df = sess["df"]
+    try:
+        from backend.statistical_engine import StatisticalEngine
+        engine = StatisticalEngine()
+        if body.segment_column not in df.columns or body.metric not in df.columns:
+            raise HTTPException(status_code=400, detail="Invalid column names.")
+        groups = {
+            name: group[body.metric].dropna().values
+            for name, group in df.groupby(body.segment_column)
+        }
+        result = engine.test_group_difference(list(groups.values()))
+        return {"session_id": session_id, "metric": body.metric, "segment_column": body.segment_column, "result": result}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Statistical engine not available.")
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase 3 — Predictive Intelligence Endpoints
+# ───────────────────────────────────────────────────────────────
+
+class ForecastRequest(BaseModel):
+    metric: str
+    horizon: int = 6
+
+
+@router.post("/api/v1/sessions/{session_id}/forecast")
+def forecast_metric(session_id: str, body: ForecastRequest) -> dict[str, Any]:
+    """Time series forecasting for a specific metric."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    # Check if forecast already exists in trends
+    trends = sess["facts"].get("trends", {})
+    for key, trend in trends.items():
+        if trend.get("metric") == body.metric and "forecast" in trend:
+            return {"session_id": session_id, "metric": body.metric, "forecast": trend["forecast"]}
+    # Generate fresh forecast
+    try:
+        from backend.forecasting_engine import ForecastingEngine
+        engine = ForecastingEngine()
+        df = sess["df"]
+        series = df[body.metric].dropna().values.tolist() if body.metric in df.columns else []
+        if len(series) < 4:
+            raise HTTPException(status_code=400, detail=f"Not enough data points for '{body.metric}' (need >= 4).")
+        result = engine.auto_forecast(series, horizon=body.horizon)
+        return {"session_id": session_id, "metric": body.metric, "forecast": result}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Forecasting engine not available.")
+
+
+@router.get("/api/v1/sessions/{session_id}/anomalies")
+def anomaly_detection(session_id: str) -> dict[str, Any]:
+    """Anomaly detection results: statistical outliers, clinical impossibilities, drift."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    return {
+        "session_id": session_id,
+        "anomaly_report": sess["facts"].get("anomaly_report", {}),
+    }
+
+
+class ScenarioRequest(BaseModel):
+    metric: str
+    change_pct: float = 10.0
+    scenario_type: str = "optimistic"
+
+
+@router.post("/api/v1/sessions/{session_id}/scenario")
+def scenario_analysis(session_id: str, body: ScenarioRequest) -> dict[str, Any]:
+    """What-if scenario analysis for a metric."""
+    sess = _assert_session_with_data(session_id)
+    try:
+        from backend.forecasting_engine import ForecastingEngine
+        engine = ForecastingEngine()
+        df = sess["df"]
+        series = df[body.metric].dropna().values.tolist() if body.metric in df.columns else []
+        if len(series) < 4:
+            raise HTTPException(status_code=400, detail=f"Not enough data for '{body.metric}'.")
+        base = engine.auto_forecast(series, horizon=6)
+        scenarios = engine.scenario_analysis(series, change_pct=body.change_pct)
+        return {"session_id": session_id, "metric": body.metric, "baseline": base, "scenarios": scenarios}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Forecasting engine not available.")
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase 4 — Feedback & Learning Endpoints
+# ───────────────────────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    surface: str = "ask_data"
+    target_id: str = ""
+    rating: str = "positive"
+    correction: str = ""
+    question: str = ""
+    ai_answer: str = ""
+
+
+@router.post("/api/v1/sessions/{session_id}/feedback")
+def capture_feedback(session_id: str, body: FeedbackRequest) -> dict[str, Any]:
+    """Capture analyst corrections and ratings for feedback-driven improvement."""
+    _assert_session(session_id)
+    try:
+        from backend.feedback_loop import FeedbackLoop
+        fb = FeedbackLoop()
+        if body.correction and body.question:
+            fb.capture_correction(body.question, body.ai_answer, body.correction)
+        fb.capture_rating(body.surface, body.target_id, body.rating)
+        return {"session_id": session_id, "status": "captured", "surface": body.surface, "rating": body.rating}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Feedback loop not available.")
+
+
+@router.get("/api/v1/sessions/{session_id}/suggestions")
+def ai_suggestions(session_id: str) -> dict[str, Any]:
+    """AI-suggested analyses based on dataset profile and knowledge base."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    try:
+        from backend.knowledge_base import AnalyticsKnowledgeBase
+        kb = AnalyticsKnowledgeBase()
+        suggestions = kb.suggest_analysis(sess["facts"])
+        return {"session_id": session_id, "suggestions": suggestions}
+    except (ImportError, Exception):
+        # Fallback: return basic suggestions from facts
+        facts = sess["facts"]
+        numeric_metrics = list(facts.get("metrics", {}).get("kpis", {}).keys())[:5]
+        return {
+            "session_id": session_id,
+            "suggestions": [f"Analyze trend in {m}" for m in numeric_metrics],
+        }
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase 6 — Autonomous Analytics Endpoints
+# ───────────────────────────────────────────────────────────────
+
+class InvestigateRequest(BaseModel):
+    question: str
+
+
+@router.post("/api/v1/sessions/{session_id}/investigate")
+def launch_investigation(session_id: str, body: InvestigateRequest) -> dict[str, Any]:
+    """Launch an autonomous multi-step investigation."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    try:
+        from backend.investigation_agent import InvestigationAgent
+        agent = InvestigationAgent()
+        report = agent.investigate(body.question, sess["df"], facts=sess["facts"])
+        return {
+            "session_id": session_id,
+            "investigation_id": report.investigation_id,
+            "question": report.question,
+            "target_metric": report.target_metric,
+            "executive_summary": report.executive_summary,
+            "root_cause_diagnosis": report.root_cause_diagnosis,
+            "evidence_chain": report.evidence_chain,
+            "recommended_playbook": report.recommended_playbook,
+            "steps_executed": report.steps_executed,
+        }
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Investigation agent not available.")
+
+
+@router.get("/api/v1/sessions/{session_id}/proactive-scan")
+def proactive_scan(session_id: str) -> dict[str, Any]:
+    """Proactive intelligence scan: emerging issues, target breaches, early warnings."""
+    sess = _assert_session_with_data(session_id)
+    _ensure_facts(sess, session_id)
+    try:
+        from backend.proactive_intelligence import ProactiveIntelligence
+        pi = ProactiveIntelligence()
+        scan = pi.scan_dataset(sess["df"], facts=sess["facts"])
+        briefing = pi.generate_executive_briefing([scan])
+        return {
+            "session_id": session_id,
+            "scan_results": scan,
+            "executive_briefing": briefing,
+        }
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Proactive intelligence not available.")
+
+
 def _assert_session(session_id: str) -> dict[str, Any]:
     if session_id not in _SESSIONS:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
