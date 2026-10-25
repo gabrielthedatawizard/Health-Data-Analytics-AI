@@ -811,6 +811,16 @@ def recommend_charts(facts: dict) -> list[dict]:
             "priority": 2,
         })
 
+    # Phase 4: Feedback Loop Chart Adaptation
+    try:
+        from backend.feedback_loop import FeedbackLoop
+        fb = FeedbackLoop()
+        for r in recs:
+            m_hint = r.get("value_col") or r.get("title", "")
+            r["chart_type"] = fb.get_adjusted_chart_recommendation(str(m_hint), r["chart_type"])
+    except Exception:
+        pass
+
     return sorted(recs, key=lambda x: x["priority"])
 
 
@@ -1111,6 +1121,23 @@ def _local_insights_from_facts(facts: dict, query_plan: dict[str, Any] | None = 
     )
     confidence = "Medium" if metrics else "Low"
 
+    follow_up_questions = [
+        "Which district contributed most to the latest trend change?",
+        "Which metric has the highest outlier rate?",
+        "Should this be rerun on filtered segments?",
+    ]
+    # Phase 4: Enrich from Analytics Knowledge Base learned archetypes
+    try:
+        from backend.knowledge_base import AnalyticsKnowledgeBase
+        kb = AnalyticsKnowledgeBase()
+        col_names = [c["name"] for c in facts.get("schema", [])]
+        kb_sugg = kb.suggest_analyses_for_dataset(col_names)
+        for sq in kb_sugg.get("suggested_questions", []):
+            if sq not in follow_up_questions:
+                follow_up_questions.append(sq)
+    except Exception:
+        pass
+
     return {
         "executive_summary": summary,
         "key_findings": key_findings,
@@ -1119,11 +1146,7 @@ def _local_insights_from_facts(facts: dict, query_plan: dict[str, Any] | None = 
         "data_quality_notes": data_quality_notes,
         "limitations": limitations,
         "confidence": confidence,
-        "follow_up_questions": [
-            "Which district contributed most to the latest trend change?",
-            "Which metric has the highest outlier rate?",
-            "Should this be rerun on filtered segments?",
-        ],
+        "follow_up_questions": follow_up_questions[:5],
         "query_plan": query_plan or _heuristic_query_plan(facts),
         "mode": "local_fallback",
     }
@@ -1453,6 +1476,18 @@ Facts bundle:
     except ClaudeUnavailableError:
         parsed = _local_ask_from_facts(question, facts)
         parsed["question"] = question
+
+        # Phase 4: Feedback Loop - Apply Learned Human-in-the-Loop Corrections
+        try:
+            from backend.feedback_loop import FeedbackLoop
+            fb = FeedbackLoop()
+            applicable = fb.get_applicable_corrections(question)
+            if applicable and isinstance(parsed.get("answer"), str):
+                parsed["answer"] = fb.apply_learned_corrections(parsed["answer"], applicable)
+                parsed["feedback_corrections_applied"] = len(applicable)
+        except Exception:
+            pass
+
         if memory and parsed.get("confidence") in ("High", "Medium"):
             facts_used = parsed.get("facts_used", [])
             memory.save_query(
@@ -1464,10 +1499,18 @@ Facts bundle:
         return parsed
 
     parsed = _safe_json_parse(raw)
-    if not isinstance(parsed, dict):
-        return {"answer": raw, "confidence": "Low", "facts_used": [], "needs_analysis": True}
-
     parsed["question"] = question
+
+    # Phase 4: Feedback Loop - Apply Learned Human-in-the-Loop Corrections
+    try:
+        from backend.feedback_loop import FeedbackLoop
+        fb = FeedbackLoop()
+        applicable = fb.get_applicable_corrections(question)
+        if applicable and isinstance(parsed.get("answer"), str):
+            parsed["answer"] = fb.apply_learned_corrections(parsed["answer"], applicable)
+            parsed["feedback_corrections_applied"] = len(applicable)
+    except Exception:
+        pass
 
     if memory and parsed.get("answer") and parsed.get("confidence") in ("High", "Medium"):
         facts_used = parsed.get("facts_used", [])
