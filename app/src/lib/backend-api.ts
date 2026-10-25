@@ -830,7 +830,7 @@ export async function uploadDataset(
       method: 'POST',
       body: form,
     },
-    { userId, timeoutMs: 120000 }
+    { userId, timeoutMs: 300000 }
   );
 }
 

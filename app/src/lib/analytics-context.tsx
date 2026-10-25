@@ -931,9 +931,11 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
           message: 'Uploading dataset to backend',
         });
         // Automatic engine: backend warms profile + small-file analysis inline.
+        // For files > 5MB, don't block the upload socket with inline profiling; let autoRunPipeline handle it below.
+        const shouldInlineAutoRun = (options?.autoAnalyze !== false) && file.size <= 5 * 1024 * 1024;
         await uploadBackendDataset(datasetId, file, backendUserId, {
           sheetName: options?.sheetName,
-          autoRun: options?.autoAnalyze !== false,
+          autoRun: shouldInlineAutoRun,
         });
         uploadCommitted = true;
 

@@ -2506,7 +2506,8 @@ def _infer_column_type(series: pd.Series) -> str:
         non_null = series.dropna()
         if non_null.empty:
             return "string"
-        parsed = pd.to_datetime(non_null.astype(str), errors="coerce")
+        sample = non_null.head(100)
+        parsed = pd.to_datetime(sample.astype(str), errors="coerce")
         if parsed.notna().mean() >= 0.8:
             return "datetime"
         return "string"
