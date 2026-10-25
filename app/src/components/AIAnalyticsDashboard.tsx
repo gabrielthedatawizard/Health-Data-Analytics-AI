@@ -18,6 +18,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
+import { AutonomousIntelligenceSection } from '@/components/AutonomousIntelligenceSection';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -2804,6 +2805,8 @@ export function AIAnalyticsDashboard() {
           </div>
         ) : null}
       </section>
+
+      <AutonomousIntelligenceSection datasetId={datasetId} canCompute={canCompute} />
 
       <section className="rounded-2xl border border-border bg-card p-4 sm:p-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
