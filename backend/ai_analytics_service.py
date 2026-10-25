@@ -492,6 +492,14 @@ def build_facts_bundle(
     except Exception:
         pass
 
+    # Phase 3: Anomaly Detection Intelligence & Reporting Pathologies
+    anomaly_report = {}
+    try:
+        from backend.anomaly_engine import AnomalyEngine
+        anomaly_report = AnomalyEngine.generate_anomaly_report(df, numeric_cols=numeric_cols)
+    except Exception:
+        pass
+
     return {
         "dataset_id": dataset_id,
         "session_id": session_id,
@@ -511,6 +519,8 @@ def build_facts_bundle(
         "quality_report_card": profile.get("quality_intelligence", {}).get("report_card"),
         # Phase 2 Statistical Reasoning & Interpretation Layer
         "executive_narrative": executive_narrative,
+        # Phase 3 Predictive Intelligence Layer
+        "anomaly_report": anomaly_report,
     }
 
 
@@ -605,6 +615,28 @@ def _compute_trends(
                     is_significant=is_sig,
                     percent_change=pct_chg,
                 )
+            except Exception:
+                pass
+
+            # Phase 3: Automated Time-Series Forecasting
+            try:
+                from backend.forecasting_engine import ForecastingEngine
+                fc_res = ForecastingEngine.auto_forecast(
+                    series=vals_list,
+                    horizon=6,
+                    dates=dates_list,
+                    metric_name=num_col,
+                )
+                trend_record["forecast"] = {
+                    "model": fc_res.model_name,
+                    "model_description": fc_res.model_description,
+                    "horizon": fc_res.horizon,
+                    "predictions": fc_res.predictions,
+                    "seasonality": fc_res.seasonality,
+                    "accuracy_metrics": fc_res.accuracy_metrics,
+                    "scenarios": fc_res.scenarios,
+                    "explanation": fc_res.explanation,
+                }
             except Exception:
                 pass
 
@@ -1153,6 +1185,61 @@ def _local_ask_from_facts(question: str, facts: dict) -> dict[str, Any]:
             "mode": "local_fallback",
         }
 
+    # Phase 3 Predictive & Forecasting Answers
+    if any(k in q for k in ["forecast", "predict", "projection", "future", "next"]) and trends:
+        for t_k, t_v in trends.items():
+            if "forecast" in t_v:
+                fc = t_v["forecast"]
+                preds = fc.get("predictions", [])
+                end_p = preds[-1]["predicted_value"] if preds else "N/A"
+                exp = fc.get("explanation", "")
+                m_name = t_v.get("metric", t_k)
+                return {
+                    "query_plan": {
+                        "intent": "forecasting",
+                        "facts_keys_used": [f"trends.{t_k}.forecast"],
+                        "computation_required": False,
+                        "confidence": "High",
+                    },
+                    "answer": f"Forecast for {m_name} projects reaching {end_p} over the next {fc.get('horizon', 6)} periods.\n\n{exp}",
+                    "facts_used": [f"trends.{t_k}.forecast.predictions"],
+                    "chart_recommendation": {"type": "line", "title": f"{m_name} Forecast Projection", "data_key": f"trends.{t_k}.forecast"},
+                    "follow_up_questions": [
+                        "What is the confidence interval range?",
+                        "What are the optimistic and pessimistic scenarios?",
+                    ],
+                    "action_implication": "Use projected trajectory to adjust operational capacity and supply buffers.",
+                    "confidence": "High",
+                    "needs_analysis": False,
+                    "mode": "local_fallback",
+                }
+
+    # Phase 3 Anomaly & Data Audit Answers
+    if any(k in q for k in ["anomaly", "anomalies", "outlier", "suspicious", "drift", "audit", "pathology"]):
+        anom_rep = facts.get("anomaly_report", {})
+        if anom_rep and anom_rep.get("total_anomalies", 0) > 0:
+            recs = anom_rep.get("records", [])
+            top_rec = recs[0] if recs else {}
+            return {
+                "query_plan": {
+                    "intent": "anomaly_detection",
+                    "facts_keys_used": ["anomaly_report"],
+                    "computation_required": False,
+                    "confidence": "High",
+                },
+                "answer": f"{anom_rep.get('executive_summary', '')} Primary flag: row {top_rec.get('row_index', 'N/A')} ({top_rec.get('severity', 'high')} severity) - {top_rec.get('hypothesis', '')}",
+                "facts_used": ["anomaly_report.records", "anomaly_report.risk_index"],
+                "chart_recommendation": {"type": "table", "title": "Priority Anomalies", "data_key": "anomaly_report.records"},
+                "follow_up_questions": [
+                    "What recommended actions should be taken for critical entries?",
+                    "Are there facility-specific reporting pathologies?",
+                ],
+                "action_implication": top_rec.get("action", "Conduct targeted data reconciliation at flagged facilities."),
+                "confidence": "High",
+                "needs_analysis": False,
+                "mode": "local_fallback",
+            }
+
     return {
         "query_plan": {
             "intent": _heuristic_query_plan(facts, question).get("intent"),
@@ -1176,6 +1263,24 @@ def _local_ask_from_facts(question: str, facts: dict) -> dict[str, Any]:
 
 def _local_proactive_radar(facts: dict) -> dict[str, Any]:
     alerts: list[dict[str, str]] = []
+
+    # Phase 3: Prioritize Critical & High Anomaly Intelligence
+    anom_rep = facts.get("anomaly_report", {})
+    if anom_rep and anom_rep.get("records"):
+        for anom in anom_rep["records"][:3]:
+            sev = "critical" if anom.get("severity") == "critical" else "warning"
+            alerts.append(
+                {
+                    "type": "anomaly",
+                    "severity": sev,
+                    "title": f"{anom.get('type', 'anomaly').replace('_', ' ').title()} (Row {anom.get('row_index')})",
+                    "detail": anom.get("hypothesis", ""),
+                    "fact_key": f"anomaly_report.records[{anom.get('row_index')}]",
+                    "recommended_action": anom.get("action", ""),
+                    "chart_type": "table",
+                }
+            )
+
     quality = facts.get("quality", {})
     missing = quality.get("missingness", {}).get("overall_pct")
     if isinstance(missing, (int, float)) and missing > 0.1:
@@ -1380,6 +1485,9 @@ def ask_data(question: str, facts: dict, memory: SmartMemory | None = None) -> d
     return ask_data_v2(question, facts, memory=memory)
 
 
+ask_question = ask_data
+
+
 def run_proactive_radar(facts: dict, memory: SmartMemory | None = None) -> dict:
     """
     Proactively scan facts and surface critical findings.
@@ -1433,6 +1541,9 @@ Facts bundle to scan:
         parsed.setdefault("scanned_at", datetime.now(timezone.utc).isoformat())
         return parsed
     return {"alerts": [], "raw": raw, "scanned_at": datetime.now(timezone.utc).isoformat()}
+
+
+get_proactive_radar = run_proactive_radar
 
 
 def build_cohort_analysis(df: pd.DataFrame, facts: dict, memory: SmartMemory | None = None) -> dict:
