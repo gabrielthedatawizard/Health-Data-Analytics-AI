@@ -333,13 +333,36 @@ PII_PATTERNS = re.compile(
 
 def profile_dataset(df: pd.DataFrame) -> dict:
     """
-    Returns full profile: schema, missingness, duplicates, quality score.
+    Returns full profile: schema, missingness, duplicates, quality score,
+    enriched with Phase 1 Deep Schema Intelligence, Relationship Graph, and Quality Diagnostics.
     """
     schema = _infer_schema(df)
     missingness = _compute_missingness(df)
     dup_count = int(df.duplicated().sum())
     pii_flags = {col: bool(PII_PATTERNS.search(col)) for col in df.columns}
     quality_score = _quality_score(df, missingness, dup_count)
+
+    # Phase 1: Deep Data Understanding Engine
+    schema_intel: dict = {}
+    try:
+        from backend.schema_intelligence import analyze_schema
+        schema_intel = analyze_schema(df)
+    except Exception as exc:
+        schema_intel = {"status": "error", "message": str(exc)}
+
+    rel_graph: dict = {}
+    try:
+        from backend.data_graph import build_data_relationship_graph
+        rel_graph = build_data_relationship_graph(df)
+    except Exception as exc:
+        rel_graph = {"status": "error", "message": str(exc)}
+
+    quality_intel: dict = {}
+    try:
+        from backend.quality_intelligence import analyze_data_quality
+        quality_intel = analyze_data_quality(df)
+    except Exception as exc:
+        quality_intel = {"status": "error", "message": str(exc)}
 
     return {
         "schema": schema,
@@ -352,6 +375,10 @@ def profile_dataset(df: pd.DataFrame) -> dict:
         "quality_score": quality_score,
         "row_count": len(df),
         "column_count": len(df.columns),
+        # Phase 1 Deep Understanding Enhancements
+        "schema_intelligence": schema_intel,
+        "relationship_graph": rel_graph,
+        "quality_intelligence": quality_intel,
     }
 
 
@@ -458,6 +485,11 @@ def build_facts_bundle(
         "outliers": outliers,
         "correlations": correlations,
         "health_context": health_context,
+        # Phase 1 Deep Data Understanding Layer
+        "data_dictionary": profile.get("schema_intelligence", {}).get("data_dictionary"),
+        "star_schema": profile.get("relationship_graph", {}).get("star_schema"),
+        "topology": profile.get("relationship_graph", {}).get("topology"),
+        "quality_report_card": profile.get("quality_intelligence", {}).get("report_card"),
     }
 
 

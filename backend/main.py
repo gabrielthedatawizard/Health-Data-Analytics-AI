@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import contextvars
+
 import pandas as pd
 import plotly.express as px
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, Response as FastAPIResponse, UploadFile
@@ -22,6 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
+
+_request_jwt: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("request_jwt", default=None)
 
 logger = logging.getLogger("healthai")
 if not logger.handlers:
@@ -273,6 +277,13 @@ def _fail_closed_prod_check() -> None:
     if posture["is_prod"] and not posture["fail_closed"]:
         # Fail-closed: refuse insecure prod boot rather than leak data.
         raise RuntimeError(f"Insecure production config: {posture['guidance']}")
+    try:
+        from backend.db import init_pg_schema
+
+        if init_pg_schema():
+            logger.info(json.dumps({"event": "pg_init_ok"}))
+    except Exception as exc:
+        logger.info(json.dumps({"event": "pg_init_skip", "error": str(exc)[:200]}))
 
 
 @app.get("/system/security")
@@ -280,6 +291,16 @@ def get_security_posture() -> dict[str, Any]:
     posture = _security_posture()
     # Never leak secret values.
     return posture
+
+
+@app.get("/system/db-status")
+def get_db_status() -> dict[str, Any]:
+    from backend.db import pg_status
+
+    status = pg_status()
+    status["data_dir"] = str(DATA_DIR)
+    status["s3_bucket"] = S3_BUCKET
+    return status
 
 
 _METRICS: dict[str, Any] = {
@@ -350,6 +371,36 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             raise
 
 
+PUBLIC_PATHS = {"/", "/health", "/metrics", "/system/security", "/system/db-status", "/auth/token", "/docs", "/openapi.json", "/redoc"}
+
+
+class JwtEnforcementMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        _request_jwt.set(None)
+        path = request.url.path
+        is_public = path in PUBLIC_PATHS or path.endswith("/shared") or path.startswith("/docs") or path.startswith("/redoc")
+        authz = request.headers.get("Authorization", "")
+        payload = None
+        if authz.startswith("Bearer ") and JWT_SECRET:
+            payload = _verify_jwt(authz.removeprefix("Bearer ").strip())
+            if payload:
+                _request_jwt.set(payload)
+        env = os.getenv("ENV", "dev").lower()
+        is_prod = env in {"prod", "production"}
+        if is_prod and JWT_SECRET and not is_public:
+            # Prod JWT-everywhere: missing/invalid Bearer -> 401, no spoof fallback.
+            if not payload:
+                return Response(
+                    content=json.dumps({"detail": "Bearer JWT required in production."}),
+                    media_type="application/json", status_code=401,
+                )
+        try:
+            return await call_next(request)
+        finally:
+            _request_jwt.set(None)
+
+
+app.add_middleware(JwtEnforcementMiddleware)
 app.add_middleware(ObservabilityMiddleware)
 app.include_router(ai_analytics_router)
 
@@ -1227,10 +1278,34 @@ def _load_meta(dataset_id: str) -> dict[str, Any]:
 def _save_meta(dataset_id: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = _utc_now_iso()
     _save_json(_meta_path(dataset_id), meta)
+    # Postgres index mirror (best-effort; FS remains source of truth).
+    try:
+        from backend.db import mirror_session_meta as _pg_mirror
+
+        _pg_mirror(dataset_id, meta)
+    except Exception:
+        pass
 
 
 def _iter_accessible_sessions(actor: str, permissions: list[str]) -> list[tuple[str, dict[str, Any]]]:
-    items: list[tuple[str, dict[str, Any]]] = []
+    # Fast path: Postgres index when configured (O(index) vs O(n) FS scan).
+    try:
+        from backend.db import pg_session_ids_for_actor as _pg_ids
+
+        read_all = "sessions:read_all" in permissions or "admin:all" in permissions
+        ids = _pg_ids(actor, read_all=read_all)
+        if ids is not None:
+            items: list[tuple[str, dict[str, Any]]] = []
+            for dataset_id in ids:
+                try:
+                    meta = _load_json(_meta_path(dataset_id))
+                    items.append((dataset_id, meta))
+                except Exception:
+                    continue
+            return items
+    except Exception:
+        pass
+    items = []
     for child in sorted(DATA_DIR.iterdir(), reverse=True):
         if not child.is_dir():
             continue
@@ -1695,13 +1770,18 @@ def _permissions_for_role(role: str) -> list[str]:
     return list(ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["analyst"]))
 
 
+def _current_jwt_secret() -> str | None:
+    return os.getenv("JWT_SECRET", "").strip() or JWT_SECRET or None
+
+
 def _b64url_decode(data: str) -> bytes:
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
 
 
 def _issue_jwt(actor: str, role: str, expires_minutes: int = 720) -> str:
-    if not JWT_SECRET:
+    secret = _current_jwt_secret()
+    if not secret:
         raise HTTPException(status_code=500, detail="JWT_SECRET not configured.")
     header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
     payload = base64.urlsafe_b64encode(json.dumps({
@@ -1714,12 +1794,13 @@ def _issue_jwt(actor: str, role: str, expires_minutes: int = 720) -> str:
 
 
 def _verify_jwt(token: str) -> dict[str, Any] | None:
-    if not JWT_SECRET:
+    secret = _current_jwt_secret()
+    if not secret:
         return None
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")
         expected = base64.urlsafe_b64encode(
-            hmac.new(JWT_SECRET.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
+            hmac.new(secret.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
         ).decode().rstrip("=")
         if not hmac.compare_digest(expected, sig_b64):
             return None
@@ -1737,7 +1818,7 @@ def _require_privileged_jwt(authorization: str | None, required: str = "reviewer
     Returns verified payload, or None when JWT is not enforced (no secret).
     Raises 401/403 when enforced but missing/invalid/insufficient.
     """
-    if not JWT_SECRET:
+    if not _current_jwt_secret():
         return None
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Bearer JWT required for this privileged action.")
@@ -1762,6 +1843,17 @@ def _resolve_auth_context(
     actor_query: str | None = None,
     role_query: str | None = None,
 ) -> tuple[str, str, list[str]]:
+    # JWT-bound identity wins over spoofable headers when middleware verified it.
+    try:
+        jwt_payload = _request_jwt.get()
+    except Exception:
+        jwt_payload = None
+    if jwt_payload:
+        actor = str(jwt_payload.get("sub") or "anonymous")
+        role = str(jwt_payload.get("role") or "viewer")
+        if role not in VALID_USER_ROLES:
+            role = "viewer"
+        return actor, role, _permissions_for_role(role)
     actor = _actor_from_header(x_api_key, fallback=actor_query.strip() if actor_query and actor_query.strip() else fallback_actor)
     role = _role_from_identity(actor, explicit_role=(x_user_role or role_query))
     return actor, role, _permissions_for_role(role)
@@ -5825,36 +5917,73 @@ async def upload_file(
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Only .csv and .xlsx files are supported in MVP.")
 
-    content = await file.read()
-    if not content:
+    # Chunked streaming ingest: constant RAM, fail-fast on 50MB limit.
+    stored_name = f"raw{extension}"
+    raw_path = session_dir / stored_name
+    hasher = hashlib.sha256()
+    total_bytes = 0
+    first_chunk: bytes = b""
+    try:
+        with raw_path.open("wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    try:
+                        handle.close()
+                        raw_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=400, detail="File too large (max 50MB). Use sampling or compress to CSV.")
+                handle.write(chunk)
+                hasher.update(chunk)
+                if len(first_chunk) < 1024 * 1024:
+                    first_chunk += chunk[: 1024 * 1024 - len(first_chunk)]
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+    if total_bytes == 0:
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (max 50MB). Use sampling or compress to CSV.")
 
     file_meta: dict[str, Any] = {
         "filename": filename,
         "extension": extension,
-        "size_bytes": len(content),
+        "size_bytes": total_bytes,
+        "sha256_streamed": True,
     }
 
     try:
         if extension == ".csv":
-            encoding = _detect_csv_encoding(content)
+            # Encoding sniff from first MB only (low RAM).
+            encoding = _detect_csv_encoding(first_chunk + b"\n")
             file_meta["encoding"] = encoding
         else:
-            sheets, selected_sheet = _validate_excel_sheet(content, sheet_name)
+            # Excel validation needs full bytes; re-read streamed file (disk, not RAM-doubled).
+            sheets, selected_sheet = _validate_excel_sheet(raw_path.read_bytes(), sheet_name)
             file_meta["sheets"] = sheets
             file_meta["sheet_name"] = selected_sheet
     except Exception as exc:
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail=f"File validation failed: {exc}") from exc
 
-    stored_name = f"raw{extension}"
-    raw_path = session_dir / stored_name
-    with raw_path.open("wb") as handle:
-        handle.write(content)
     file_meta["raw_path"] = str(raw_path)
     file_meta["uploaded_at"] = _utc_now_iso()
     file_meta["uploaded_by"] = actor
+    try:
+        file_meta["sha256"] = hasher.hexdigest()
+    except Exception:
+        pass
     # S3-ready mirror (best-effort, local remains source of truth).
     try:
         _mirror_to_s3(raw_path, f"{dataset_id}/{stored_name}")
@@ -5885,14 +6014,18 @@ async def upload_file(
     meta["artifacts"] = preserved_artifacts
     meta["allow_sensitive_export"] = False
     meta["sensitive_export_approval"] = _default_sensitive_export_approval()
-    meta["file_hash"] = _dataset_signature(meta)
+    # Reuse streamed hash (no re-read); fallback to disk hash.
+    try:
+        meta["file_hash"] = hasher.hexdigest()
+    except Exception:
+        meta["file_hash"] = _dataset_signature(meta)
     cache.invalidate_prefix(f"cache:{CACHE_VERSION}:{dataset_id}:")
     _save_meta(dataset_id, meta)
     _append_audit(
         dataset_id,
         "file_uploaded",
         actor,
-        {"filename": filename, "extension": extension, "size_bytes": len(content)},
+        {"filename": filename, "extension": extension, "size_bytes": total_bytes, "streamed": True},
     )
 
     result: dict[str, Any] = {
