@@ -414,7 +414,8 @@ def _classify_column(series: pd.Series, name: str) -> str:
         except Exception:
             pass
 
-    if series.nunique() / max(len(series), 1) < 0.05:
+    unique_cnt = series.nunique()
+    if unique_cnt <= 20 or (unique_cnt / max(len(series), 1) < 0.05):
         return "categorical"
     return "text"
 
@@ -473,6 +474,24 @@ def build_facts_bundle(
     correlations = _compute_correlations(df, numeric_cols)
     health_context = _detect_health_context(df)
 
+    # Phase 2: Synthesize Global Executive Narrative
+    executive_narrative = ""
+    try:
+        from backend.interpretation_engine import InterpretationEngine
+        interp_eng = InterpretationEngine()
+        top_metric = numeric_cols[0] if numeric_cols else None
+        if top_metric:
+            t_data = None
+            t_key = f"{top_metric}_monthly"
+            if t_key in trends and "significance_test" in trends[t_key]:
+                t_data = trends[t_key]["significance_test"]
+            executive_narrative = interp_eng.generate_statistical_narrative(
+                metric=top_metric,
+                trend_res=t_data,
+            )
+    except Exception:
+        pass
+
     return {
         "dataset_id": dataset_id,
         "session_id": session_id,
@@ -490,6 +509,8 @@ def build_facts_bundle(
         "star_schema": profile.get("relationship_graph", {}).get("star_schema"),
         "topology": profile.get("relationship_graph", {}).get("topology"),
         "quality_report_card": profile.get("quality_intelligence", {}).get("report_card"),
+        # Phase 2 Statistical Reasoning & Interpretation Layer
+        "executive_narrative": executive_narrative,
     }
 
 
@@ -536,13 +557,58 @@ def _compute_trends(
                 .rename(columns={"_month": "date", num_col: "value"})
             )
             monthly["date"] = monthly["date"].dt.strftime("%Y-%m-%d")
-            trends[f"{num_col}_monthly"] = {
+            vals_list = monthly["value"].tolist()
+            dates_list = monthly["date"].tolist()
+
+            trend_record = {
                 "time_grain": "month",
                 "time_column": time_col,
                 "metric": num_col,
                 "series": monthly.to_dict(orient="records"),
-                "pct_change_last_2": _pct_change_last2(monthly["value"].tolist()),
+                "pct_change_last_2": _pct_change_last2(vals_list),
             }
+
+            # Phase 2: Inferential Statistical Trend & Changepoint Detection
+            try:
+                from backend.statistical_engine import StatisticalEngine
+                trend_stat = StatisticalEngine.test_trend_significance(vals_list)
+                changepoints = StatisticalEngine.detect_changepoints(vals_list, labels=dates_list)
+                trend_record["significance_test"] = {
+                    "is_significant": trend_stat.is_significant,
+                    "p_value": trend_stat.p_value,
+                    "trend_direction": trend_stat.trend_direction,
+                    "slope": trend_stat.slope,
+                    "tau": trend_stat.tau_or_r,
+                }
+                trend_record["changepoints"] = [
+                    {
+                        "period": cp.period_label,
+                        "direction": cp.direction,
+                        "percent_change": cp.percent_change,
+                        "confidence": cp.confidence,
+                    }
+                    for cp in changepoints
+                ]
+            except Exception:
+                pass
+
+            # Phase 2: Contextual Interpretation & Clinical Urgency
+            try:
+                from backend.interpretation_engine import InterpretationEngine
+                interp_eng = InterpretationEngine()
+                trend_dir = trend_record.get("significance_test", {}).get("trend_direction", "stable")
+                is_sig = trend_record.get("significance_test", {}).get("is_significant", False)
+                pct_chg = trend_record.get("pct_change_last_2") or 0.0
+                trend_record["clinical_severity"] = interp_eng.assess_trend_severity(
+                    col_name=num_col,
+                    trend_direction=trend_dir,
+                    is_significant=is_sig,
+                    percent_change=pct_chg,
+                )
+            except Exception:
+                pass
+
+            trends[f"{num_col}_monthly"] = trend_record
     except Exception as e:
         trends["_error"] = str(e)
     return trends
@@ -571,11 +637,29 @@ def _compute_segments(
                 .round(4)
             )
             seg.columns = [str(c) for c in seg.columns]
-            segments[key] = {
+            seg_record = {
                 "group_by": cat_col,
                 "metric": num_col,
                 "data": seg.to_dict(orient="records"),
             }
+
+            # Phase 2: Inferential Group Difference & Effect Size
+            try:
+                from backend.statistical_engine import StatisticalEngine
+                diff_test = StatisticalEngine.test_group_difference(df, num_col, cat_col)
+                seg_record["statistical_significance"] = {
+                    "test_used": diff_test.test_used,
+                    "is_significant": diff_test.is_significant,
+                    "p_value": diff_test.p_value,
+                    "effect_size": diff_test.effect_size,
+                    "effect_size_metric": diff_test.effect_size_metric,
+                    "practical_significance": diff_test.practical_significance,
+                    "interpretation": diff_test.interpretation,
+                }
+            except Exception:
+                pass
+
+            segments[key] = seg_record
     return segments
 
 
