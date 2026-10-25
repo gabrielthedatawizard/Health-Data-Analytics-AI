@@ -1377,3 +1377,172 @@ export function factsJsonUrl(datasetId: string): string {
 export function datasetCsvUrl(datasetId: string): string {
   return authenticatedUrl(`/sessions/${datasetId}/export/csv`);
 }
+
+// ───────────────────────────────────────────────────────────────
+// Phase 1-6 Intelligence APIs
+// ───────────────────────────────────────────────────────────────
+
+export interface SchemaIntelligenceResponse {
+  session_id: string;
+  data_dictionary?: Record<string, unknown>;
+  star_schema?: Record<string, unknown>;
+}
+
+export interface DataRelationshipsResponse {
+  session_id: string;
+  topology?: Record<string, unknown>;
+  star_schema?: Record<string, unknown>;
+}
+
+export interface QualityDiagnosisResponse {
+  session_id: string;
+  quality_report_card?: Record<string, unknown>;
+  quality?: Record<string, unknown>;
+}
+
+export interface StatisticalTestsResponse {
+  session_id: string;
+  statistical_results?: Record<string, unknown>;
+  executive_narrative?: string;
+}
+
+export interface SegmentComparisonResponse {
+  session_id: string;
+  metric: string;
+  segment_column: string;
+  result: Record<string, unknown>;
+}
+
+export interface ForecastMetricResponse {
+  session_id: string;
+  metric: string;
+  forecast: Record<string, unknown>;
+}
+
+export interface IntelligenceAnomaliesResponse {
+  session_id: string;
+  anomaly_report: Record<string, unknown>;
+}
+
+export interface ScenarioAnalysisResponse {
+  session_id: string;
+  metric: string;
+  baseline: Record<string, unknown>;
+  scenarios: Record<string, unknown>;
+}
+
+export interface FeedbackCaptureResponse {
+  session_id: string;
+  status: string;
+  surface: string;
+  rating: string;
+}
+
+export interface AISuggestionsResponse {
+  session_id: string;
+  suggestions: string[];
+}
+
+export interface InvestigationResponse {
+  session_id: string;
+  investigation_id: string;
+  question: string;
+  target_metric?: string;
+  executive_summary: string;
+  root_cause_diagnosis: Record<string, unknown>;
+  evidence_chain: Array<Record<string, unknown>>;
+  recommended_playbook: string[];
+  steps_executed: Array<Record<string, unknown>>;
+}
+
+export interface ProactiveScanResponse {
+  session_id: string;
+  scan_results: Record<string, unknown>;
+  executive_briefing: string;
+}
+
+export function getSchemaIntelligence(sessionId: string) {
+  return apiRequest<SchemaIntelligenceResponse>(`/api/v1/sessions/${sessionId}/schema-intelligence`);
+}
+
+export function getDataRelationships(sessionId: string) {
+  return apiRequest<DataRelationshipsResponse>(`/api/v1/sessions/${sessionId}/data-relationships`);
+}
+
+export function getQualityDiagnosis(sessionId: string) {
+  return apiRequest<QualityDiagnosisResponse>(`/api/v1/sessions/${sessionId}/quality-diagnosis`);
+}
+
+export function getStatisticalTests(sessionId: string) {
+  return apiRequest<StatisticalTestsResponse>(`/api/v1/sessions/${sessionId}/statistical-tests`);
+}
+
+export function compareSegments(sessionId: string, metric: string, segmentColumn: string) {
+  return apiRequest<SegmentComparisonResponse>(`/api/v1/sessions/${sessionId}/compare`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ metric, segment_column: segmentColumn }),
+  });
+}
+
+export function getForecastMetric(sessionId: string, metric: string, horizon = 6) {
+  return apiRequest<ForecastMetricResponse>(`/api/v1/sessions/${sessionId}/forecast`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ metric, horizon }),
+  });
+}
+
+export function getIntelligenceAnomalies(sessionId: string) {
+  return apiRequest<IntelligenceAnomaliesResponse>(`/api/v1/sessions/${sessionId}/anomalies`);
+}
+
+export function runScenarioAnalysis(sessionId: string, metric: string, changePct = 10.0, scenarioType = 'optimistic') {
+  return apiRequest<ScenarioAnalysisResponse>(`/api/v1/sessions/${sessionId}/scenario`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ metric, change_pct: changePct, scenario_type: scenarioType }),
+  });
+}
+
+export function captureAnalystFeedback(
+  sessionId: string,
+  payload: {
+    surface?: string;
+    target_id?: string;
+    rating?: string;
+    correction?: string;
+    question?: string;
+    ai_answer?: string;
+  }
+) {
+  return apiRequest<FeedbackCaptureResponse>(`/api/v1/sessions/${sessionId}/feedback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      surface: payload.surface || 'ask_data',
+      target_id: payload.target_id || '',
+      rating: payload.rating || 'positive',
+      correction: payload.correction || '',
+      question: payload.question || '',
+      ai_answer: payload.ai_answer || '',
+    }),
+  });
+}
+
+export function getAISuggestions(sessionId: string) {
+  return apiRequest<AISuggestionsResponse>(`/api/v1/sessions/${sessionId}/suggestions`);
+}
+
+export function launchInvestigation(sessionId: string, question: string) {
+  return apiRequest<InvestigationResponse>(`/api/v1/sessions/${sessionId}/investigate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  });
+}
+
+export function getProactiveScan(sessionId: string) {
+  return apiRequest<ProactiveScanResponse>(`/api/v1/sessions/${sessionId}/proactive-scan`);
+}
+
